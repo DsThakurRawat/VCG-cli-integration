@@ -1,0 +1,23 @@
+name: unpack-source
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack audited source and remove misnamed upload files
+        run: |
+          set -e
+          f=$(ls [0-9]*-vci.tgz | head -1)
+          tar xzf "$f"
+          git rm -f --ignore-unmatch -- 3-.gitignore 4-ACCEPTANCE.md 5-CHANGELOG.md 6-Cargo.lock 7-Cargo.toml 8-LICENSE 9-NOTICE 10-audit.toml 11-install.sh 12-package-centos7.sh 13-setup-virtuoso-tmux.sh
+          git rm -f -- "$f"
+          git mv -f .github/2-dependabot.yml .github/dependabot.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add audited Virtuoso integration source"
+          git push
