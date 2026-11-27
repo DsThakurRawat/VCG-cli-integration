@@ -38,6 +38,9 @@ TOKEN = "ab" * 32
 STX = b"\x02"
 
 
+from tests import _fcntl_stub as _fcntl_stub_module
+
+
 def _resources() -> Path:
     return Path(__file__).parents[1] / "src/virtuoso_bridge/virtuoso/basic/resources"
 
@@ -127,9 +130,7 @@ def _import_daemon(monkeypatch, tmp_path, *, reply_tags=False):
         monkeypatch.setenv("RB_REPLY_TAGS", "1")
     else:
         monkeypatch.delenv("RB_REPLY_TAGS", raising=False)
-    fcntl_stub = types.SimpleNamespace(
-        fcntl=lambda *args, **kwargs: 0, F_GETFL=3, F_SETFL=4
-    )
+    fcntl_stub = _fcntl_stub_module.fcntl_stub()
     monkeypatch.setitem(sys.modules, "fcntl", fcntl_stub)
     stdin_stub = types.SimpleNamespace(
         fileno=lambda: 0,

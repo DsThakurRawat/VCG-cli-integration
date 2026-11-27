@@ -38,7 +38,17 @@ in academic use).
    wrote the real `/tmp/virtuoso-ai-bridge.lock.quarantine`, which
    quarantined both bridges on the host (and made later tests in the same
    run fail on the leaked marker).
-5. This directory is excluded from the repo's comment-budget gate
+5. Test-suite hygiene so `tests/` runs green in CI (`../.github/workflows/python.yml`):
+   `tests/conftest.py` skips tests that need upstream's unvendored `tools/`
+   or `scripts/` (only while the file is absent, with the path as the
+   reason); `tests/_fcntl_stub.py` replaces the four ad-hoc `fcntl` stubs and
+   keeps the real `flock`, so the fork's cross-bridge lock works when the
+   daemons are imported in-process.
+6. `src/virtuoso_bridge/transport/tunnel.py`: generated local-setup files are
+   made 0600 and missing state/work directories are created 0700 at every
+   level (`Path.mkdir(parents=True)` only applies `mode` to the leaf), so
+   local mode works under the common Linux umask 0002.
+7. This directory is excluded from the repo's comment-budget gate
    (`../scripts/check-comment-budget.py`), the same way `resources/` is:
    vendored code keeps upstream's comment surface.
 
@@ -50,7 +60,7 @@ Get them from the upstream repo if needed.
 
 ## Updating
 
-Re-copy from a newer upstream commit, re-apply modifications 1-4 (or port them if
+Re-copy from a newer upstream commit, re-apply modifications 1-6 (or port them if
 the files changed), run `tests/` plus
 `../tests/python/test_vai_lock_integration.py`, then update the base commit
 above.

@@ -70,3 +70,37 @@ def macos_bsdtar(real_tar_detection) -> str:
     if tar_command is None or not transfer._is_macos_bsdtar(tar_command):
         pytest.skip("requires macOS with bsdtar as the local tar")
     return tar_command
+
+
+# virtuoso-cli-integration: upstream's tools/ and scripts/ were not vendored.
+# Tests that need one of them are skipped (with the missing path as the
+# reason) only while that file is absent, so restoring a file re-enables them.
+_ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
+_UNVENDORED_MODULES = {
+    "test_netlist_and_traffic_scripts.py": "scripts/track_traffic.py",
+    "test_signoff_preview.py": "tools/signoff.py",
+}
+_UNVENDORED_NEEDLES = {
+    "skill_exec": "tools/skill_exec.py",
+    "fix-symlinks": "scripts/fix-symlinks.sh",
+    "FIX_SYMLINKS": "scripts/fix-symlinks.sh",
+    "fix_symlinks": "scripts/fix-symlinks.sh",
+}
+collect_ignore = [name for name, dep in _UNVENDORED_MODULES.items() if not (_ROOT / dep).exists()]
+
+
+def pytest_collection_modifyitems(config, items):
+    import inspect
+    missing = {needle: dep for needle, dep in _UNVENDORED_NEEDLES.items() if not (_ROOT / dep).exists()}
+    if not missing:
+        return
+    for item in items:
+        fn = getattr(item, "function", None)
+        try:
+            source = inspect.getsource(fn) if fn else ""
+        except (OSError, TypeError):
+            source = ""
+        for needle, dep in missing.items():
+            if needle in source or needle in item.name:
+                item.add_marker(pytest.mark.skip(reason="needs %s, which is not vendored in this repo" % dep))
+                break

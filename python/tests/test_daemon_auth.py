@@ -40,6 +40,9 @@ WRONG_TOKEN = "cd" * 32
 # ---------------------------------------------------------------------------
 
 
+from tests import _fcntl_stub as _fcntl_stub_module
+
+
 class _AuthDaemon:
     """RAMIC-wire daemon implementing the token auth contract.
 
@@ -1348,9 +1351,7 @@ def _import_py3_daemon(monkeypatch, tmp_path, nonce_cache_max=None):
     """Import the actual ramic_bridge_daemon_3.py with fcntl/stdin stubbed."""
     import types
 
-    fcntl_stub = types.SimpleNamespace(
-        fcntl=lambda *args, **kwargs: 0, F_GETFL=3, F_SETFL=4
-    )
+    fcntl_stub = _fcntl_stub_module.fcntl_stub()
     monkeypatch.setitem(sys.modules, "fcntl", fcntl_stub)
     # pytest's captured stdin has no fileno(); the daemon only needs one at
     # import time (non-blocking setup), never during these checks.

@@ -268,9 +268,28 @@ def _validate_state(state: Any) -> dict[str, Any]:
     return state
 
 
+def _mkdir_private(directory: Path) -> None:
+    """virtuoso-cli-integration: Path.mkdir(mode=, parents=True) applies mode
+    only to the leaf; missing ancestors got 0777 & ~umask (0775 under the
+    common umask 0002), which the ancestor checks then reject. Create every
+    missing level 0700 and leave existing directories untouched."""
+    missing = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for level in reversed(missing):
+        try:
+            level.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+
+
 def _write_private_json(path: Path, value: dict) -> None:
     """Publish one complete private state without discarding its predecessor."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _mkdir_private(path.parent)
     if os.name == "posix":
         if path.parent.is_symlink() or path.parent.stat().st_uid != os.geteuid():
             raise ValueError("State directory must belong to this user and not be a symlink")
@@ -446,6 +465,14 @@ def _remote_port_occupancy_cmd(port: int) -> str:
 # ---------------------------------------------------------------------------
 # SSHClient
 # ---------------------------------------------------------------------------
+
+
+def _make_private(path) -> None:
+    """virtuoso-cli-integration: generated setup files are 0600 whatever the
+    umask, so the private-file checks that read them back (ramic_deploy,
+    state readers) also pass under the common Linux umask 0002."""
+    if os.name == "posix":
+        os.chmod(path, 0o600)
 
 class SSHClient:
     """Manages SSH tunnel and remote RAMIC daemon deployment.
@@ -1193,7 +1220,7 @@ class SSHClient:
             work_dir = state_dir() / f"local_{self._profile}"
         else:
             work_dir = state_dir() / "local"
-        work_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _mkdir_private(work_dir)
 
         # Copy daemon and IL files into the work directory
         local_daemon = work_dir / daemon_local.name
@@ -1203,14 +1230,19 @@ class SSHClient:
         local_setup = work_dir / "virtuoso_setup.il"
         local_identity = work_dir / "daemon_identity.txt"
 
-        shutil.copy2(daemon_local, local_daemon)
-        shutil.copy2(recovery_local, local_recovery)
-        shutil.copy2(owner_local, local_owner)
-        shutil.copy2(registry_local, work_dir / registry_local.name)
-        shutil.copy2(_find_ramic_helper("ramic_paths.py"), work_dir / "ramic_paths.py")
+        for source, target in (
+            (daemon_local, local_daemon),
+            (recovery_local, local_recovery),
+            (owner_local, local_owner),
+            (registry_local, work_dir / registry_local.name),
+            (_find_ramic_helper("ramic_paths.py"), work_dir / "ramic_paths.py"),
+        ):
+            shutil.copy2(source, target)
+            _make_private(target)
 
         il_content = il_local.read_text(encoding="utf-8")
         local_il.write_text(il_content, encoding="utf-8")
+        _make_private(local_il)
 
         setup_content = _generate_virtuoso_setup_il(
             str(local_daemon),
@@ -1226,6 +1258,7 @@ class SSHClient:
             local_setup.read_text(encoding="utf-8") if local_setup.is_file() else "",
         )
         local_setup.write_text(setup_content, encoding="utf-8")
+        _make_private(local_setup)
         local_identity.unlink(missing_ok=True)
 
         self._remote_setup_done = True
