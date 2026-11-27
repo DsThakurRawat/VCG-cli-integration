@@ -5784,6 +5784,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_gate_blocks_file_dir_and_dangling_symlink_markers() {
+        let has_flock = std::process::Command::new("sh")
+            .args(["-c", "command -v flock"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !has_flock {
+            eprintln!("skipping shell gate test: flock(1) is not installed on this host");
+            return;
+        }
         let base = std::env::temp_dir().join(format!("vai-gate-test-{}", std::process::id()));
         let lock = base.join("lock");
         let marker = format!("{}.quarantine", lock.to_string_lossy());

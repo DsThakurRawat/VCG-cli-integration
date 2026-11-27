@@ -500,9 +500,13 @@ def _audit(tool: str, args, error, started: float) -> None:
             "error": None if error is None else _clip(str(error), _AUDIT_ERROR_LIMIT),
             "ms": int((time.monotonic() - started) * 1000),
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        if not path.parent.exists():
+            os.makedirs(str(path.parent), mode=0o700, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(path), flags, 0o600)
         try:
+            if os.name == "posix" and os.fstat(fd).st_mode & 0o077:
+                os.fchmod(fd, 0o600)
             os.write(fd, (json.dumps(entry, default=str) + "\n").encode("utf-8"))
         finally:
             os.close(fd)

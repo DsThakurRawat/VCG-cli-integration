@@ -90,6 +90,9 @@ Both bridges are MCP servers, started through one launcher:
 - `.github/workflows/ci.yml`: fmt/clippy, `cargo test`, `cargo build`
   (+daemon), cargo audit, Windows native-ssh build, comment budget.
 - `.github/workflows/integration.yml`: cross-platform integration matrix.
+- `.github/workflows/fake-virtuoso.yml`: sandboxed end-to-end run of both
+  real daemons, CLIs and MCP servers against a stand-in CIW
+  (`tests/fake_virtuoso/`, bubblewrap).
 - `.github/workflows/python.yml`: installs the vendored `python/` package
   and runs `tests/python/` (functional cross-process flock tests over the
   shipped daemon code) plus `compileall` over the vendored package.

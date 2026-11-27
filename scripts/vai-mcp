@@ -7,7 +7,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 CONF_DIR="${VAI_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/virtuoso-ai}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/virtuoso-ai"
-FULL_CAPS="schematic,maestro,window,cell,simulation,transaction,library,admin"
+SAFE_CAPS="schematic,maestro,window,cell,simulation,transaction,library"
+FULL_CAPS="$SAFE_CAPS,admin"
 SAFE_DENY="evaluate,load_file"
 
 usage() {
@@ -18,7 +19,8 @@ usage: vai-mcp <vcli|bridge|doctor>
   doctor   check both sides and print the effective settings
 settings (env, or in \$VAI_CONFIG_DIR/{vcli,bridge}.env; default dir $CONF_DIR):
   VAI_MODE=full|safe   full (default): raw SKILL allowed on both servers
-                       safe: no raw SKILL (vcli without admin, bridge without $SAFE_DENY)
+                       safe: no raw SKILL, enforced even over inherited settings
+                       (admin stripped from VCLI_CAPABILITY, $SAFE_DENY always denied)
   VAI_LOCK_FILE        cross-bridge lock (default /tmp/virtuoso-ai-bridge.lock)
   VAI_AUDIT_LOG        shared audit log (default $STATE_DIR/audit.jsonl; "off" disables)
   VCLI_BIN, VAI_PYTHON override binary / interpreter discovery
@@ -47,17 +49,60 @@ common() {
     esac
 }
 
+is_fork_vcli() {
+    LC_ALL=C grep -qaF "VAI_LOCK_FILE" "$1" &&
+        LC_ALL=C grep -qaF "VCIpcDataHandler" "$1" &&
+        ! LC_ALL=C grep -qaF "RBIpcDataHandler" "$1"
+}
+
 find_vcli() {
     local c
-    for c in "${VCLI_BIN:-}" "$REPO/target/release/vcli" "$REPO/target/debug/vcli"; do
-        [[ -n "$c" && -x "$c" ]] && { echo "$c"; return 0; }
-    done
-    if c="$(command -v vcli 2>/dev/null)"; then
-        log "using vcli from PATH ($c); make sure it is THIS repo's namespaced build, not upstream vcli"
-        echo "$c"
-        return 0
+    if [[ -n "${VCLI_BIN:-}" ]]; then
+        if [[ -x "$VCLI_BIN" ]] && is_fork_vcli "$VCLI_BIN"; then
+            echo "$VCLI_BIN"
+            return 0
+        fi
+        log "VCLI_BIN=$VCLI_BIN is not this repo's namespaced vcli build (missing VC*/VAI_LOCK_FILE markers); refusing it"
+        return 1
     fi
+    for c in "$REPO/target/release/vcli" "$REPO/target/debug/vcli" "$(command -v vcli 2>/dev/null || true)"; do
+        [[ -n "$c" && -x "$c" ]] || continue
+        if is_fork_vcli "$c"; then
+            echo "$c"
+            return 0
+        fi
+        log "skipping $c: not this repo's namespaced vcli build (upstream vcli would collide with bridge-lite)"
+    done
     return 1
+}
+
+strip_admin() {
+    local p out=()
+    IFS=, read -ra parts <<< "$1"
+    for p in "${parts[@]}"; do
+        p="${p//[[:space:]]/}"
+        [[ -z "$p" || "${p,,}" == admin ]] && continue
+        out+=("$p")
+    done
+    (IFS=,; echo "${out[*]}")
+}
+
+effective_caps() {
+    local caps
+    if [[ "$VAI_MODE" == full ]]; then
+        echo "${VCLI_CAPABILITY:-$FULL_CAPS}"
+        return
+    fi
+    caps="$(strip_admin "${VCLI_CAPABILITY:-$SAFE_CAPS}")"
+    echo "${caps:-$SAFE_CAPS}"
+}
+
+effective_deny() {
+    if [[ "$VAI_MODE" == safe ]]; then
+        echo "$SAFE_DENY${VAI_DENY_TOOLS:+,$VAI_DENY_TOOLS}"
+    else
+        echo "${VAI_DENY_TOOLS:-}"
+    fi
 }
 
 find_python() {
@@ -73,9 +118,8 @@ run_vcli() {
     common
     local bin
     bin="$(find_vcli)" || { log "vcli not found: run ./install.sh --user or cargo build --release in $REPO"; exit 1; }
-    if [[ "$VAI_MODE" == full ]]; then
-        export VCLI_CAPABILITY="${VCLI_CAPABILITY:-$FULL_CAPS}"
-    fi
+    VCLI_CAPABILITY="$(effective_caps)"
+    export VCLI_CAPABILITY
     exec "$bin" mcp serve
 }
 
@@ -83,9 +127,8 @@ run_bridge() {
     load_env bridge
     common
     export RB_REPLY_TAGS="${RB_REPLY_TAGS:-1}"
-    if [[ "$VAI_MODE" == safe ]]; then
-        export VAI_DENY_TOOLS="${VAI_DENY_TOOLS:-$SAFE_DENY}"
-    fi
+    VAI_DENY_TOOLS="$(effective_deny)"
+    export VAI_DENY_TOOLS
     local py
     py="$(find_python)" || { log "virtuoso_bridge not importable: run 'uv venv python/.venv && uv pip install --python python/.venv/bin/python ./python' in $REPO"; exit 1; }
     exec "$py" "$REPO/python/mcp_server.py"
@@ -102,10 +145,12 @@ doctor() {
     echo "mode          $VAI_MODE"
     echo "config dir    $CONF_DIR (vcli.env: $(has "$CONF_DIR/vcli.env"), bridge.env: $(has "$CONF_DIR/bridge.env"))"
     if bin="$(find_vcli 2>/dev/null)"; then
-        echo "vcli          ok   $bin ($("$bin" --version 2>/dev/null | head -1))"
+        echo "vcli          ok   $bin ($("$bin" --version 2>/dev/null | head -1), verified fork build)"
     else
-        echo "vcli          MISSING  (./install.sh --user, or cargo build --release)"
+        echo "vcli          NOT READY  no verified fork build found (./install.sh --user, or cargo build --release; upstream vcli is rejected)"
     fi
+    echo "vcli caps     $(effective_caps)"
+    echo "bridge deny   $(effective_deny)"
     if py="$(find_python)"; then
         echo "bridge-lite   ok   $py"
     else
@@ -113,7 +158,13 @@ doctor() {
     fi
     echo "lock file     $VAI_LOCK_FILE ($(check touch "$VAI_LOCK_FILE"))"
     echo "audit log     $VAI_AUDIT_LOG"
-    echo "live checks   virtuoso-bridge status   |   vcli skill exec 'getCurrentTime()'"
+    if [[ -e "$VAI_LOCK_FILE.quarantine" || -L "$VAI_LOCK_FILE.quarantine" ]]; then
+        echo "quarantine    ACTIVE  $VAI_LOCK_FILE.quarantine: $(head -c 300 "$VAI_LOCK_FILE.quarantine" 2>/dev/null)"
+        echo "              both bridges refuse work; remove it only after confirming the CIW is idle"
+    else
+        echo "quarantine    none"
+    fi
+    echo "live checks   virtuoso-bridge eval '1+2'   |   VCLI_CAPABILITY=admin vcli skill exec 'getCurrentTime()'"
 }
 
 case "${1:-}" in

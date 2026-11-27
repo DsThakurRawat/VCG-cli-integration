@@ -24,8 +24,10 @@ scripts/vai-mcp doctor                  # both sides should say "ok"
 The launcher finds `vcli` in `target/release`, `target/debug`, then `PATH`
 (override with `VCLI_BIN`), and a Python that can import `virtuoso_bridge`
 in `python/.venv`, `.venv`, then `python3` (override with `VAI_PYTHON`).
-Upstream (un-namespaced) vcli on `PATH` would collide with bridge-lite in
-the CIW, so prefer this repo's build.
+Every vcli candidate must be this fork's build (it carries the namespaced
+`VC*` SKILL and `VAI_LOCK_FILE`); upstream vcli would collide with
+bridge-lite in the CIW and is rejected, and `doctor` reports it NOT READY.
+A `VCLI_BIN` that fails the check is refused, never silently replaced.
 
 ## 2. Configure each bridge separately
 
@@ -50,7 +52,7 @@ Also accepted there (or in the agent's `env` block): `VAI_MODE`,
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `VAI_MODE` | `full` | `full`: raw SKILL on both servers (vcli gets `admin`), so the agent can do anything SKILL can. `safe`: vcli without `admin`, bridge without `evaluate`/`load_file`. |
+| `VAI_MODE` | `full` | `full`: raw SKILL on both servers (vcli gets `admin`), so the agent can do anything SKILL can. `safe`: enforced over anything inherited: `admin` is stripped from `VCLI_CAPABILITY` (from the shell or `vcli.env`) and `evaluate,load_file` are always added to `VAI_DENY_TOOLS`. |
 | `VAI_LOCK_FILE` | `/tmp/virtuoso-ai-bridge.lock` | Must match the value in the Virtuoso session's environment. Per-session path if several sessions share a host. |
 | `VAI_AUDIT_LOG` | `~/.local/state/virtuoso-ai/audit.jsonl` | `off` disables. File is created mode 0600. |
 | `RB_REPLY_TAGS` | `1` (bridge) | Reply-tag framing; keeps replies in step after timeouts. |
@@ -128,6 +130,16 @@ prompt / rules file. Its rules matter more than the tool list.
 ```sh
 scripts/vai-mcp doctor
 python -m pytest tests/python/test_agent_layer.py
+tests/fake_virtuoso/run-sandboxed        # full end-to-end, needs bwrap
 ```
+
+`run-sandboxed` starts a stand-in CIW (`tests/fake_virtuoso/`) that hosts
+both real daemons and answers with a small built-in SKILL evaluator, then
+drives the real CLIs, the real MCP servers through `scripts/vai-mcp`, the
+lock, the timeout quarantine and the audit log against it. It runs inside
+bubblewrap: read-only root, private `/tmp`, throwaway `HOME`, no network
+beyond loopback, so it never touches your real lock, tokens or config. It
+proves the plumbing, not Cadence: SKILL semantics, OpenAccess, the GUI and
+design data still need `ACCEPTANCE.md` on a licensed session.
 
 Live behaviour is checked by the "Agent layer" steps in `ACCEPTANCE.md`.

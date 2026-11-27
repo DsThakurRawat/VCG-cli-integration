@@ -25,6 +25,21 @@ All notable changes to this project will be documented in this file.
 - Shared agent audit log: both MCP servers append every tool call to
   `$VAI_AUDIT_LOG` (JSONL, mode 0600); `scripts/vai-audit [-f]` shows it.
 - Added "Agent layer" steps 10-17 to `ACCEPTANCE.md`.
+- Sandboxed end-to-end suite (`tests/fake_virtuoso/`, CI job
+  `fake-virtuoso.yml`): a stand-in CIW hosts both real daemons; the real
+  CLIs and MCP servers, the cross-bridge lock, kill -9 recovery, the
+  timeout quarantine, safe mode and the audit log are exercised inside
+  bubblewrap.
+- Fixed: vcli's `skill.exec`/`skill.load` RPC (and so MCP `skill_exec` /
+  `skill_load`) reported a failed SKILL evaluation as success with empty
+  output; it is now an error carrying the SKILL message.
+- Fixed (vendored bridge-lite): local mode never sent the bridge token from
+  the CLI `eval` or MCP paths, so every call was refused.
+- Launcher: safe mode is enforced over inherited `VCLI_CAPABILITY` /
+  `VAI_DENY_TOOLS`; only verified fork builds of vcli are started; audit
+  logs are forced to 0600, never followed through symlinks, in a 0700 dir.
+- Fixed tests: the shell quarantine-gate test skips where `flock(1)` is
+  missing (macOS) instead of failing.
 
 ## [Unreleased]
 

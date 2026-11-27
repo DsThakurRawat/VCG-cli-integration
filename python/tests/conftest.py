@@ -19,6 +19,15 @@ def _isolated_connection_state(monkeypatch, tmp_path, request):
 
 
 @pytest.fixture(autouse=True)
+def _private_cross_bridge_lock(monkeypatch, tmp_path_factory):
+    """virtuoso-cli-integration: daemons started by tests must never take the
+    host-wide cross-bridge lock or write its quarantine marker, or running
+    this suite on a lab host would quarantine the live Virtuoso session."""
+    root = tmp_path_factory.mktemp("vai_lock")
+    monkeypatch.setenv("VAI_LOCK_FILE", str(root / "virtuoso-ai-bridge.lock"))
+
+
+@pytest.fixture(autouse=True)
 def _private_remote_daemon_cache(monkeypatch, tmp_path_factory):
     """Keep the remote-daemon token cache out of the real home directory."""
     root = tmp_path_factory.mktemp("remote_daemons")

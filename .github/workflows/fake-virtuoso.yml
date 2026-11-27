@@ -1,0 +1,34 @@
+name: Fake Virtuoso end-to-end
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  e2e:
+    name: Sandboxed end-to-end (both bridges, fake CIW)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Install vendored bridge-lite
+        run: |
+          python -m venv python/.venv
+          python/.venv/bin/pip install ./python pytest
+      - name: Build vcli, vtui and virtuoso-daemon
+        run: cargo build --features daemon --bins
+      - name: Agent-layer tests (including vcli safe mode)
+        run: VCLI_BIN="$PWD/target/debug/vcli" python/.venv/bin/python -m pytest tests/python -v
+      - name: Sandboxed end-to-end against the fake Virtuoso
+        run: VAI_SKIP_BUILD=1 tests/fake_virtuoso/run-sandboxed

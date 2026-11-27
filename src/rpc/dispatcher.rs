@@ -153,6 +153,20 @@ fn reject_undeclared_params(method: &str, params: &Value) -> Result<()> {
     )))
 }
 
+fn skill_failure(r: &crate::models::VirtuosoResult) -> Result<()> {
+    if r.ok() {
+        return Ok(());
+    }
+    let detail = if r.errors.is_empty() {
+        r.output.trim().to_string()
+    } else {
+        r.errors.join("; ")
+    };
+    Err(VirtuosoError::Execution(format!(
+        "SKILL evaluation failed: {detail}"
+    )))
+}
+
 impl RpcDispatcher {
     pub fn new(ctx: CommandContext) -> Self {
         Self { ctx }
@@ -1057,11 +1071,13 @@ impl RpcDispatcher {
                 let code = json_str(params.get("code"), "code")?;
                 let timeout = params.get("timeout").and_then(|v| v.as_u64());
                 let r = client.execute_skill(&code, timeout)?;
+                skill_failure(&r)?;
                 Ok(serde_json::json!({ "output": r.output.trim() }))
             }
             "load" => {
                 let path = json_str(params.get("path"), "path")?;
                 let r = client.load_il(&path, false)?;
+                skill_failure(&r)?;
                 Ok(serde_json::json!({
                     "status": "ok", "output": r.output.trim(),
                     "loaded_path": r.metadata.get("loaded_path")
@@ -1330,6 +1346,23 @@ fn json_f64(value: Option<&Value>, field: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_failure_maps_only_failed_results() {
+        let mut r = crate::models::VirtuosoResult {
+            status: crate::models::ExecutionStatus::Success,
+            output: "3".into(),
+            errors: vec![],
+            warnings: vec![],
+            execution_time: None,
+            metadata: Default::default(),
+        };
+        assert!(skill_failure(&r).is_ok());
+        r.status = crate::models::ExecutionStatus::Error;
+        r.errors = vec!["*Error* eval: undefined function - noSuchFunction".into()];
+        let msg = skill_failure(&r).unwrap_err().to_string();
+        assert!(msg.contains("undefined function - noSuchFunction"), "{msg}");
+    }
     use crate::models::VirtuosoResult;
     use crate::rpc::schema::{standard_schema, RpcSchema};
 

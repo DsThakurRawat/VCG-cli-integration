@@ -78,20 +78,62 @@ pub fn record(tool: &str, args: &Value, error: Option<&str>, ms: u128) {
     write_line(&path, &entry(tool, args, error, ms));
 }
 
+fn create_private_dir(dir: &std::path::Path) {
+    if dir.as_os_str().is_empty() || dir.exists() {
+        return;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    let _ = builder.create(dir);
+}
+
+#[cfg(unix)]
+fn ensure_private(f: &std::fs::File, path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = f.metadata() else {
+        return false;
+    };
+    if meta.permissions().mode() & 0o077 == 0 {
+        return true;
+    }
+    match f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "[vai-audit] {} is readable by others and cannot be made private ({e}); not writing",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_private(_f: &std::fs::File, _path: &std::path::Path) -> bool {
+    true
+}
+
 fn write_line(path: &PathBuf, value: &Value) {
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        create_private_dir(dir);
     }
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     match opts.open(path) {
         Ok(mut f) => {
-            let _ = f.write_all(format!("{value}\n").as_bytes());
+            if ensure_private(&f, path) {
+                let _ = f.write_all(format!("{value}\n").as_bytes());
+            }
         }
         Err(e) => eprintln!("[vai-audit] cannot write {}: {e}", path.display()),
     }
@@ -155,6 +197,35 @@ mod tests {
             Some(v) => std::env::set_var("VAI_AUDIT_LOG", v),
             None => std::env::remove_var("VAI_AUDIT_LOG"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_line_tightens_loose_permissions_and_refuses_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_line(&path, &entry("a", &serde_json::json!({}), None, 1));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+
+        let target = dir.path().join("elsewhere");
+        let link = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_line(&link, &entry("b", &serde_json::json!({}), None, 1));
+        assert!(!target.exists(), "audit must not follow a symlink");
+
+        let fresh = dir.path().join("new").join("deeper").join("audit.jsonl");
+        write_line(&fresh, &entry("c", &serde_json::json!({}), None, 1));
+        let dmode = std::fs::metadata(fresh.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dmode, 0o700);
     }
 
     #[test]
