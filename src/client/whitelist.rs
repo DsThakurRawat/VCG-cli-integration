@@ -62,10 +62,8 @@ fn default_dangerous() -> Vec<WhitelistEntry> {
     vec![
         // Shell invocations
         WhitelistEntry::Substring("system("),
-        WhitelistEntry::SubstringWithAllowlist {
-            pattern: "sh(",
-            allowlist: &["hiFlush"],
-        },
+        WhitelistEntry::FunctionName("sh"),
+        WhitelistEntry::FunctionName("csh"),
         WhitelistEntry::Substring("csh "),
         WhitelistEntry::Substring("exec("),
         WhitelistEntry::Substring("pipe("),
@@ -211,6 +209,10 @@ mod tests {
         assert!(wl().check(r#"hiFlush(sh("rm -rf /"))"#).is_some());
         assert!(wl().check(r#"hiflush(sh("id"))"#).is_some());
         assert!(wl().check(r#"hiShell(sh("rm -rf /"))"#).is_some());
+        assert!(wl().check(r#"x = 1 hiFlush()"#).is_none());
+        assert!(wl().check(r#"let((r) r = sh("id") r)"#).is_some());
+        assert!(wl().check(r#"csh("ls")"#).is_some());
+        assert!(wl().check(r#"refresh(cv)"#).is_none());
         assert!(wl().check(r#"hishell(sh("id"))"#).is_some());
         assert!(wl().check("hiFlush()").is_none());
         assert!(wl().check("hiFlush(1 2)").is_none());

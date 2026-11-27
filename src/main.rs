@@ -2889,7 +2889,7 @@ fn dispatch_rpc(
             let params: serde_json::Value =
                 serde_json::from_str(&params).map_err(crate::error::VirtuosoError::Json)?;
             let client = crate::client::bridge::VirtuosoClient::from_context(ctx)?;
-            let api_key = std::env::var("VCLI_API_KEY").ok().filter(|k| !k.is_empty());
+            let api_key = crate::auth::caller_api_key();
             let request = crate::rpc::dispatcher::RpcRequest {
                 method,
                 params,

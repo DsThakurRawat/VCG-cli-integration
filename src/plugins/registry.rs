@@ -77,13 +77,23 @@ impl PluginRegistry {
     }
 
     /// Dispatch a plugin tool call.
+    pub fn owns_domain(&self, domain: &str) -> bool {
+        self.tools.iter().any(|t| t.domain == domain)
+    }
+
     pub fn dispatch(
         &self,
         domain: &str,
         op: &str,
         params: Value,
         client: &VirtuosoClient,
+        caps: &crate::capability::CapabilitySet,
     ) -> Result<Value> {
+        if !caps.allows_raw_skill() {
+            return Err(VirtuosoError::Execution(format!(
+                "plugin method '{domain}.{op}' renders raw SKILL and needs the admin capability"
+            )));
+        }
         let tool = self
             .tools
             .iter()
@@ -98,7 +108,7 @@ impl PluginRegistry {
 
         let skill = tool.render_skill(args)?;
         let result = client
-            .execute_skill_unchecked(&skill, None)?
+            .execute_skill_with_bypass(&skill, None, false)?
             .ok_or_exec(&format!("plugin {}.{}", domain, op))?;
 
         if result.output.trim().is_empty() {
@@ -149,5 +159,30 @@ impl PluginRegistry {
                 returns: "any".into(),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::capability::{Capability, CapabilitySet};
+
+    #[test]
+    fn plugin_dispatch_needs_admin_before_anything_is_sent() {
+        let registry = PluginRegistry { tools: Vec::new() };
+        let client = VirtuosoClient::new("127.0.0.1", 1, 1);
+        let no_admin = CapabilitySet::from_capabilities(&[Capability::Schematic]);
+        let err = registry
+            .dispatch("myplugin", "op", serde_json::json!({}), &client, &no_admin)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("admin capability"), "{err}");
+        let admin = CapabilitySet::from_capabilities(&[Capability::Admin]);
+        let err = registry
+            .dispatch("myplugin", "op", serde_json::json!({}), &client, &admin)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown plugin method"), "{err}");
+        assert!(!registry.owns_domain("myplugin"));
     }
 }

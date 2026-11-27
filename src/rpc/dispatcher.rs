@@ -153,6 +153,14 @@ fn reject_undeclared_params(method: &str, params: &Value) -> Result<()> {
     )))
 }
 
+fn permits_plugin_method(caps: &crate::capability::CapabilitySet, method: &str) -> bool {
+    let domain = method.split('.').next().unwrap_or("");
+    caps.allows_raw_skill()
+        && crate::plugins::PluginRegistry::get_global()
+            .map(|r| r.owns_domain(domain))
+            .unwrap_or(false)
+}
+
 fn skill_failure(r: &crate::models::VirtuosoResult) -> Result<()> {
     if r.ok() {
         return Ok(());
@@ -182,7 +190,7 @@ impl RpcDispatcher {
 
         let caps = check_auth(api_key.as_deref())?;
 
-        if !caps.permits_method(&method) {
+        if !caps.permits_method(&method) && !permits_plugin_method(&caps, &method) {
             return Err(VirtuosoError::Execution(format!(
                 "method '{}' not permitted: missing required capability",
                 method
@@ -190,7 +198,7 @@ impl RpcDispatcher {
         }
 
         let result = reject_undeclared_params(&method, &params)
-            .and_then(|()| Self::dispatch_inner(self, client, &method, params.clone()));
+            .and_then(|()| Self::dispatch_inner(self, client, &method, params.clone(), &caps));
 
         let result_str = match &result {
             Ok(v) => serde_json::to_string(v).unwrap_or_default(),
@@ -206,6 +214,7 @@ impl RpcDispatcher {
         client: &VirtuosoClient,
         method: &str,
         params: Value,
+        caps: &crate::capability::CapabilitySet,
     ) -> Result<Value> {
         let parts: Vec<&str> = method.splitn(2, '.').collect();
         if parts.len() != 2 {
@@ -268,7 +277,7 @@ impl RpcDispatcher {
             "libref" => Self::dispatch_libref(op, params),
             "sim" => self.dispatch_sim(client, op, params),
             _ => match crate::plugins::PluginRegistry::get_global() {
-                Ok(registry) => registry.dispatch(domain, op, params, client),
+                Ok(registry) => registry.dispatch(domain, op, params, client, caps),
                 Err(_) => Err(VirtuosoError::Execution(format!(
                     "unknown domain '{}' in method '{}'",
                     domain, method

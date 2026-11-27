@@ -65,7 +65,7 @@ def free_port():
 
 
 def start_vcli(ciw, daemon_bin, state_dir):
-    env = dict(os.environ, VC_SSH_PORT="22", VCLI_CAPABILITY="admin")
+    env = dict(os.environ, VC_SSH_PORT="22")
     proc = subprocess.Popen([daemon_bin, "127.0.0.1", "0"], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     port = None

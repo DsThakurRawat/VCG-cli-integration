@@ -112,8 +112,10 @@ impl McpServer {
         skills_dir: Option<PathBuf>,
     ) -> Self {
         let mut tools = tools::all_tools(&config.capabilities);
-        if let Ok(registry) = super::plugins::PluginRegistry::get_global() {
-            tools.extend(registry.mcp_tools());
+        if config.capabilities.allows_raw_skill() {
+            if let Ok(registry) = super::plugins::PluginRegistry::get_global() {
+                tools.extend(registry.mcp_tools());
+            }
         }
         let resources = skills_dir
             .as_deref()
@@ -312,7 +314,7 @@ impl McpServer {
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let client = VirtuosoClient::from_context(&self.ctx)?;
-        let api_key = std::env::var("VCLI_API_KEY").ok().filter(|k| !k.is_empty());
+        let api_key = crate::auth::caller_api_key();
         let request = crate::rpc::dispatcher::RpcRequest {
             method: tool.rpc_method.to_string(),
             params: arguments,

@@ -429,7 +429,7 @@ impl VirtuosoClient {
 
     fn require_raw_skill_access(&self) -> Result<()> {
         crate::auth::Auth::init();
-        crate::auth::check_auth(None)?;
+        crate::auth::check_auth(crate::auth::caller_api_key().as_deref())?;
 
         if let Some(warning) = self.check_capability("") {
             return Err(VirtuosoError::Execution(warning));
