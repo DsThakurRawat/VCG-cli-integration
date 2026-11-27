@@ -26,6 +26,9 @@ _RESOURCES = (
 )
 
 
+from tests import _fcntl_stub as _fcntl_stub_module
+
+
 def test_ciw_print_uses_format_string_for_percent_messages(monkeypatch) -> None:
     client = VirtuosoClient(host="127.0.0.1", port=9, timeout=5)
     sent: list[str] = []
@@ -158,7 +161,7 @@ def test_py27_resource_files_are_pure_ascii() -> None:
 def test_py27_daemon_except_handlers_format_non_ascii_without_dropping_socket(
     monkeypatch, tmp_path
 ) -> None:
-    fcntl_stub = SimpleNamespace(fcntl=lambda *args, **kwargs: 0, F_GETFL=3, F_SETFL=4)
+    fcntl_stub = _fcntl_stub_module.fcntl_stub()
     monkeypatch.setitem(sys.modules, "fcntl", fcntl_stub)
     monkeypatch.setattr(
         sys,
@@ -268,7 +271,7 @@ def test_py27_daemon_accept_and_signed_busy_rejection(monkeypatch, tmp_path) -> 
     import threading
     from virtuoso_bridge import daemon_auth
 
-    fcntl_stub = SimpleNamespace(fcntl=lambda *args, **kwargs: 0, F_GETFL=3, F_SETFL=4)
+    fcntl_stub = _fcntl_stub_module.fcntl_stub()
     monkeypatch.setitem(sys.modules, "fcntl", fcntl_stub)
     monkeypatch.setattr(
         sys,

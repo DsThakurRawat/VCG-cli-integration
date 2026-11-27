@@ -21,3 +21,17 @@ jobs:
         run: python -m compileall -q python/src
       - name: Cross-bridge lock tests
         run: python -m pytest tests/python -v
+      - name: Install bridge-lite test extras
+        run: pip install './python[dev]'
+      - name: Vendored bridge-lite suite (offline), default umask
+        working-directory: python
+        run: >-
+          python -m pytest tests -q -o addopts=
+          --ignore=tests/test_bridge_live.py --ignore=tests/test_bridge_live_gds.py
+          --ignore=tests/test_daemon_lifecycle_live.py
+      - name: Vendored bridge-lite suite (offline), umask 0002
+        working-directory: python
+        run: >-
+          umask 0002 && python -m pytest tests -q -o addopts=
+          --ignore=tests/test_bridge_live.py --ignore=tests/test_bridge_live_gds.py
+          --ignore=tests/test_daemon_lifecycle_live.py

@@ -22,10 +22,11 @@ _RESOURCES = (
 )
 
 
+from tests import _fcntl_stub as _fcntl_stub_module
+
+
 def _import_daemon(monkeypatch, tmp_path, filename):
-    fcntl_stub = types.SimpleNamespace(
-        fcntl=lambda *args, **kwargs: 0, F_GETFL=3, F_SETFL=4
-    )
+    fcntl_stub = _fcntl_stub_module.fcntl_stub()
     monkeypatch.setitem(sys.modules, "fcntl", fcntl_stub)
     monkeypatch.setattr(
         sys,
