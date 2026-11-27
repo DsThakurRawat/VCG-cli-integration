@@ -9,8 +9,6 @@
 //!
 //! Audit log is written to ~/.cache/virtuoso_bridge/logs/audit.log
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -151,19 +149,13 @@ impl AuditEntry {
 
     /// Write this audit entry to the audit log.
     pub fn write(&self) {
-        let path = audit_path();
         let line = serde_json::to_string(self).unwrap_or_default();
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", line);
-        }
+        crate::runtime_paths::append_private_line(&audit_path(), &line);
     }
 }
 
 fn audit_path() -> PathBuf {
-    use crate::runtime_paths;
-    let dir = runtime_paths::log_root();
-    let _ = fs::create_dir_all(&dir);
-    dir.join("audit.log")
+    crate::runtime_paths::log_root().join("audit.log")
 }
 
 /// Log an RPC call with result.
@@ -175,18 +167,23 @@ pub fn log_rpc(method: &str, params: &serde_json::Value, result: &str, session_i
 /// Middleware for RPC dispatcher — checks API key and returns capabilities.
 /// Returns Ok(CapabilitySet) if authorized, Err otherwise.
 pub fn check_auth(api_key: Option<&str>) -> Result<CapabilitySet, VirtuosoError> {
-    let auth = auth();
+    check_auth_with(auth(), api_key)
+}
 
+fn check_auth_with(auth: &Auth, api_key: Option<&str>) -> Result<CapabilitySet, VirtuosoError> {
     if !auth.is_enabled() {
         return Ok(auth.capabilities().clone());
     }
 
     let key = api_key
-        .map(String::from)
-        .or_else(|| std::env::var("VCLI_API_KEY").ok().filter(|k| !k.is_empty()));
-    let key = key.ok_or_else(|| VirtuosoError::Auth("API key required".into()))?;
-    auth.validate(&key)?;
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| VirtuosoError::Auth("API key required".into()))?;
+    auth.validate(key)?;
     Ok(auth.capabilities().clone())
+}
+
+pub fn caller_api_key() -> Option<String> {
+    std::env::var("VCLI_API_KEY").ok().filter(|k| !k.is_empty())
 }
 
 /// Get the global auth instance.
@@ -198,6 +195,30 @@ pub fn auth() -> &'static Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn auth_with_key(key: &str) -> Auth {
+        Auth {
+            api_key: Some(key.to_string()),
+            capabilities: CapabilitySet::from_capabilities(&[]),
+            failed_attempts: std::sync::atomic::AtomicU32::new(0),
+            lockout_until: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_auth_never_borrows_the_servers_own_key() {
+        let old = std::env::var_os("VCLI_API_KEY");
+        std::env::set_var("VCLI_API_KEY", "server-secret");
+        let auth = auth_with_key("server-secret");
+        assert!(check_auth_with(&auth, None).is_err());
+        assert!(check_auth_with(&auth, Some("")).is_err());
+        assert!(check_auth_with(&auth, Some("server-secret")).is_ok());
+        match old {
+            Some(v) => std::env::set_var("VCLI_API_KEY", v),
+            None => std::env::remove_var("VCLI_API_KEY"),
+        }
+    }
 
     #[test]
     fn constant_time_eq_same() {

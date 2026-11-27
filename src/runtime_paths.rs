@@ -192,6 +192,69 @@ pub fn legacy_state_file(profile: Option<&str>) -> PathBuf {
     cache_root().join(APP_DIR).join(name)
 }
 
+fn create_private_dir(dir: &Path) {
+    if dir.as_os_str().is_empty() || dir.exists() {
+        return;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    let _ = builder.create(dir);
+}
+
+#[cfg(unix)]
+fn ensure_private(f: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = f.metadata() else {
+        return false;
+    };
+    if meta.permissions().mode() & 0o077 == 0 {
+        return true;
+    }
+    match f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "[vai-audit] {} is readable by others and cannot be made private ({e}); not writing",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_private(_f: &std::fs::File, _path: &Path) -> bool {
+    true
+}
+
+pub fn append_private_line(path: &Path, line: &str) -> bool {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        create_private_dir(dir);
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    match opts.open(path) {
+        Ok(mut f) => {
+            ensure_private(&f, path) && f.write_all(format!("{line}\n").as_bytes()).is_ok()
+        }
+        Err(e) => {
+            eprintln!("[vai-audit] cannot write {}: {e}", path.display());
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

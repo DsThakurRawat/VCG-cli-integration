@@ -556,7 +556,7 @@ pub fn set_param(inst: &str, param: &str, value: &str) -> Result<Value> {
     let request = crate::rpc::dispatcher::RpcRequest {
         method: "schematic.set_param".into(),
         params: json!({ "inst": inst, "param": param, "value": value }),
-        api_key: std::env::var("VCLI_API_KEY").ok().filter(|k| !k.is_empty()),
+        api_key: crate::auth::caller_api_key(),
     };
     let ctx = crate::context::CommandContext::new(crate::config::Config::from_env()?, None)?;
     crate::rpc::dispatcher::RpcDispatcher::new(ctx).dispatch(&client, request)

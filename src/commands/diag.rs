@@ -61,7 +61,7 @@ pub fn cdslck(
     let req = crate::rpc::dispatcher::RpcRequest {
         method: "cell.read_path".into(),
         params: json!({ "lib": lib }),
-        api_key: std::env::var("VCLI_API_KEY").ok().filter(|k| !k.is_empty()),
+        api_key: crate::auth::caller_api_key(),
     };
     let resp = crate::rpc::dispatcher::RpcDispatcher::new(ctx.clone()).dispatch(&client, req)?;
     let lib_path = resp

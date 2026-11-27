@@ -220,7 +220,7 @@ procedure(VCStart()
 			VCSessionBase = sprintf(nil "%s-%s" hostname username)
 			; Start the daemon with port=0 (OS assigns free port).
 			; VCIpcErrHandler will parse PORT:N from stderr and write session file.
-			VCIpc = ipcBeginProcess(sprintf(nil "env VC_SSH_PORT=%d VCLI_CAPABILITY=admin %s %s 0" VCsshPort VCDPath host) "" 'VCIpcDataHandler 'VCIpcErrHandler 'VCIpcFinishHandler logpath)
+			VCIpc = ipcBeginProcess(sprintf(nil "env VC_SSH_PORT=%d %s %s 0" VCsshPort VCDPath host) "" 'VCIpcDataHandler 'VCIpcErrHandler 'VCIpcFinishHandler logpath)
 		)
 		printf("[RAMIC Bridge (%L)] start at (%s)\n" VCIpc getCurrentTime())
 	)
