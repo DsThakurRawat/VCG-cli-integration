@@ -87,6 +87,18 @@ if grep -q '__DAEMON_PATH__' "$IL_DEST"; then
 fi
 printf '    %s\n' "$IL_DEST"
 
+if [ -f "$SCRIPT_DIR/python/pyproject.toml" ]; then
+    if command -v uv >/dev/null 2>&1; then
+        printf '==> uv pip install ./python (vendored virtuoso-bridge-lite)\n'
+        ( cd "$SCRIPT_DIR" && uv pip install ./python ) || printf 'install.sh: warning: python install failed; install manually: uv pip install ./python\n' >&2
+    elif command -v pip >/dev/null 2>&1; then
+        printf '==> pip install ./python (vendored virtuoso-bridge-lite)\n'
+        ( cd "$SCRIPT_DIR" && pip install ./python ) || printf 'install.sh: warning: python install failed; install manually: pip install ./python\n' >&2
+    else
+        printf 'install.sh: note: no uv/pip found; install the Python bridge later with: pip install ./python\n' >&2
+    fi
+fi
+
 # --- done -------------------------------------------------------------------
 cat <<EOF
 

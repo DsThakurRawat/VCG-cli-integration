@@ -1438,9 +1438,6 @@ fn action_x11_cached(
         let cmds = build_xdotool_actions(&resolved, operation, *x, *y, *button, *text)?;
         let mut results = Vec::with_capacity(cmds.len());
         if operation == X11Operation::DragRel {
-            // A drag is mousedown + moves + mouseup: it must run under ONE
-            // lock hold. Locking each step separately would let the other
-            // bridge inject input between mousedown and mouseup.
             let mut guard = MouseButtonGuard::new(runner, &display_prefix, &resolved, *button);
             let joined = cmds
                 .into_iter()
@@ -1461,12 +1458,10 @@ fn action_x11_cached(
                 Duration::from_secs(*timeout_secs),
             )) {
                 Ok(out) => {
-                    guard.mark_released(); // full sequence incl. mouseup ran
+                    guard.mark_released();
                     results.push(out);
                 }
                 Err(err) => {
-                    // Sequence may have stopped mid-drag with the button down;
-                    // arm the guard so Drop issues a best-effort mouseup.
                     guard.arm();
                     return Err(VirtuosoError::Execution(format!(
                         "xdotool drag sequence failed: {}",
@@ -3053,10 +3048,6 @@ pub fn resolve_unique_window(
 }
 
 
-/// Wrap a Virtuoso-host shell command in the cross-bridge mutation lock
-/// (virtuoso-cli-integration). GUI input can change the design just as
-/// SKILL can, and it bypasses the SKILL interpreter, so it must take the
-/// same host lock the daemons use.
 fn vai_wrap(cmd: &str) -> String {
     format!(
         "flock {} -c {}",
@@ -4640,9 +4631,6 @@ mod tests {
             let mut cmds = self.commands.lock().unwrap();
             cmds.push(req.command.clone());
             drop(cmds);
-            // Atomic drag model: the whole mousedown..mouseup sequence is one
-            // locked command. Fail it; the guard's Drop must then issue a
-            // best-effort mouseup as a follow-up command.
             if req.command.contains("mousedown") {
                 Err(crate::transport::contract::TransportError::LocalIo(
                     "simulated mid-drag failure".into(),

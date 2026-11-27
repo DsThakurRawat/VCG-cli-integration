@@ -12,6 +12,40 @@ import time
 import errno
 import traceback
 
+
+# --- Cross-bridge mutation lock (virtuoso-cli-integration) ---
+# Serializes this daemon with a co-resident virtuoso-cli daemon (and its
+# xdotool GUI path) on the same Virtuoso session. Host-level flock, so the
+# kernel releases it if this daemon dies. Rationale: docs/decision-records/.
+_VAI_LOCK_PATH = os.environ.get("VAI_LOCK_FILE") or "/tmp/virtuoso-ai-bridge.lock"
+
+
+def _vai_lock_acquire():
+    try:
+        fd = os.open(_VAI_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        sys.stderr.write("[vai-lock] cannot open %s: %s; proceeding UNLOCKED\n"
+                         % (_VAI_LOCK_PATH, exc))
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        sys.stderr.write("[vai-lock] flock(%s) failed: %s; proceeding UNLOCKED\n"
+                         % (_VAI_LOCK_PATH, exc))
+        os.close(fd)
+        return None
+    return fd
+
+
+def _vai_lock_release(fd):
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+
 # Python 2.7 compatibility: try to import psutil, fallback to manual PID detection
 try:
     import psutil
@@ -169,29 +203,33 @@ def handle_external_connection(conn, addr):
         if hasattr(skill_code, 'encode'):  # Check if it's unicode
             skill_code = skill_code.encode('utf-8')
 
-        # Clear stdin buffer before writing (non-blocking read until empty)
+        _vai_fd = _vai_lock_acquire()
+        try:
+            # Clear stdin buffer before writing (non-blocking read until empty)
 
-        while True:
-            try:
-                ch = sys.stdin.read(1)
-                if not ch:  # No more data
-                    break
-            except IOError as e:
-                if e.errno == errno.EAGAIN or e.errno == errno.EWOULDBLOCK:
-                    break  # No data available
-                else:
-                    break  # Other error, stop clearing
+            while True:
+                try:
+                    ch = sys.stdin.read(1)
+                    if not ch:  # No more data
+                        break
+                except IOError as e:
+                    if e.errno == errno.EAGAIN or e.errno == errno.EWOULDBLOCK:
+                        break  # No data available
+                    else:
+                        break  # Other error, stop clearing
 
-        sys.stdout.write(skill_code)
-        sys.stdout.flush()
+            sys.stdout.write(skill_code)
+            sys.stdout.flush()
 
-        # Start watchdog timer
-        watchdog_timer = threading.Timer(timeout_seconds, watchdog_callback)
-        watchdog_timer.daemon = True
-        watchdog_timer.start()
+            # Start watchdog timer
+            watchdog_timer = threading.Timer(timeout_seconds, watchdog_callback)
+            watchdog_timer.daemon = True
+            watchdog_timer.start()
 
-        # Wait for Virtuoso response
-        returnData = read_until_delimiter()
+            # Wait for Virtuoso response
+            returnData = read_until_delimiter()
+        finally:
+            _vai_lock_release(_vai_fd)
 
         # If normal return, set timeout flag to True to stop watchdog
         if not timeout_flag:

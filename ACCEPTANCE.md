@@ -3,11 +3,13 @@
 Run on the lab machine in a throwaway library. Until every box passes,
 this toolset is experimental.
 
-1. [ ] Build vcli from this repo (`cargo install --path .`) and apply
-      `docs/integration/bridge-lite-vai-lock.patch` to bridge-lite.
+1. [ ] Install both sides from this repo: `./install.sh --user` (or
+      `cargo install --path .`) and `uv pip install ./python` (or pip).
 2. [ ] Start ONE Virtuoso session in a scratch library. Load bridge-lite's
-      `ramic_bridge.il`, then vcli's (namespaced) `ramic_bridge.il`, in the
-      same CIW. Both must load without "already defined"/unbound errors.
+      `ramic_bridge.il` (under
+      `python/src/virtuoso_bridge/virtuoso/basic/resources/`), then vcli's
+      (namespaced) `resources/ramic_bridge.il`, in the same CIW. Both must
+      load without "already defined"/unbound errors.
 3. [ ] Harmless read through bridge-lite (`virtuoso-bridge eval '1+2'` → 3).
 4. [ ] Harmless read through vcli (`vcli skill exec 'getCurrentTime()'`).
 5. [ ] Lock proof: start a long-running SKILL eval through bridge-lite

@@ -1,0 +1,1038 @@
+"""Write Maestro configuration: create tests, set analyses, outputs, corners, etc.
+
+All functions take a session string and call mae* SKILL functions.
+They return the raw SKILL output string.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import shlex
+import shutil
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+from virtuoso_bridge import VirtuosoClient
+from virtuoso_bridge.models import ExecutionStatus, VirtuosoResult
+from virtuoso_bridge.virtuoso.dialogs import DialogBlockedError
+from virtuoso_bridge.virtuoso.requests import RequestRecoveryError
+from virtuoso_bridge.virtuoso.ops import escape_skill_string
+
+
+logger = logging.getLogger(__name__)
+
+
+class MaestroCompletionUnknown(TimeoutError):
+    """An acknowledged run is unconfirmed; compatible with timeout handlers."""
+
+    def __init__(self, result: VirtuosoResult) -> None:
+        self.result = result
+        super().__init__(result.errors[0] if result.errors else "Maestro completion unknown")
+
+
+def _q(client: VirtuosoClient, expr: str, timeout: float | None = None) -> str:
+    kwargs = {"timeout": timeout} if timeout is not None else {}
+    r = client.execute_skill(expr, **kwargs)
+    if r.errors:
+        if getattr(r, "metadata", {}).get("request_handle"):
+            raise RequestRecoveryError(r)
+        if getattr(r, "metadata", {}).get("dialog_guard"):
+            raise DialogBlockedError(r)
+        error = RuntimeError(f"SKILL error: {r.errors[0]}")
+        error.result = r
+        raise error
+    return r.output or ""
+
+
+def _simulation_failure(client, exc: Exception, *, timeout: float, **context) -> VirtuosoResult:
+    """Keep the original error/receipt and add bounded opt-in inspection evidence."""
+    result = None
+    for attribute in ("result", "virtuoso_result"):
+        try:
+            candidate = getattr(exc, attribute, None)
+        except Exception:
+            continue
+        if isinstance(candidate, VirtuosoResult):
+            result = candidate
+            break
+    if result is None:
+        result = VirtuosoResult(status=ExecutionStatus.ERROR, errors=[str(exc)])
+    for attribute in ("result", "virtuoso_result"):
+        try:
+            existing = getattr(exc, attribute, None)
+            if existing is not None and existing is not result:
+                continue
+            setattr(exc, attribute, result)
+            break
+        except Exception:
+            # Custom exceptions may own .result or refuse new attributes.
+            continue
+    result.metadata.update(context)
+    result.metadata.setdefault("outcome", "not_started" if
+                               result.metadata.get("request_sent") is False else "unknown")
+    dialogs = getattr(client, "dialogs", None)
+    if (dialogs is not None and dialogs.enabled and not result.metadata.get("dialog_guard")
+            and not result.metadata.get("dialog_inspection_error")
+            and result.metadata.get("request_sent") is not False):
+        outcome = result.metadata["outcome"]
+        try:
+            dialogs.annotate_failure(result, timeout=max(0, min(5.0, timeout)))
+        except Exception as inspection_error:
+            # Inspection failure must not replace the original recovery error.
+            result.metadata["dialog_inspection_error"] = str(inspection_error) or type(inspection_error).__name__
+            result.warnings.append(f"Dialog inspection unavailable: {inspection_error}")
+        finally:
+            result.metadata["outcome"] = outcome
+    if isinstance(exc, DialogBlockedError):
+        try:
+            exc.inspection = result.metadata.get("dialog_guard")
+            exc.outcome = result.metadata["outcome"]
+        except Exception:
+            pass
+    return result
+
+
+def _resolve_session(client: VirtuosoClient, session: str) -> str:
+    """Return *session* or the unquoted current Maestro session name."""
+    if session:
+        return session
+    resolved = _strip_skill_atom(_q(client, "car(maeGetSessions())"))
+    if not resolved or resolved == "nil":
+        raise RuntimeError("No active Maestro session found.")
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+
+def create_test(client: VirtuosoClient, test: str, *,
+                lib: str, cell: str, view: str = "schematic",
+                simulator: str = "spectre", session: str = "") -> str:
+    """maeCreateTest — create a new test."""
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    return _q(client,
+        f'maeCreateTest("{escape_skill_string(test)}" '
+        f'?lib "{escape_skill_string(lib)}" ?cell "{escape_skill_string(cell)}" '
+        f'?view "{escape_skill_string(view)}" '
+        f'?simulator "{escape_skill_string(simulator)}"{s})')
+
+
+def set_design(client: VirtuosoClient, test: str, *,
+               lib: str, cell: str, view: str = "schematic",
+               session: str = "") -> str:
+    """maeSetDesign — change the DUT for an existing test."""
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    return _q(client,
+        f'maeSetDesign("{escape_skill_string(test)}" "{escape_skill_string(lib)}" '
+        f'"{escape_skill_string(cell)}" "{escape_skill_string(view)}"{s})')
+
+
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
+
+def set_analysis(client: VirtuosoClient, test: str, analysis: str, *,
+                 enable: bool = True, options: str = "", session: str = "") -> str:
+    """maeSetAnalysis — enable/disable an analysis and set its options.
+
+    options: SKILL alist string, e.g. '(("start" "1") ("stop" "10G") ("dec" "20"))'
+
+    ADE netlists a field holding ``VAR(...)`` through a cached ``_EXPR_n``
+    parameter (the test session's ``expressionTable``), and maeSetAnalysis
+    does not refresh it: on IC23.1 a tran stop changed from
+    ``302*VAR("tclk")`` to ``906*VAR("tclk")`` kept netlisting
+    ``_EXPR_1=302n``. The cached entries of the fields set here are dropped,
+    so the netlist takes the new value.
+    """
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    en = "t" if enable else "nil"
+    opts = f" ?options `{options}" if options else ""
+    noise = sorted(set(_option_names(options)) & _TRAN_NOISE_OPTIONS)
+    if analysis == "tran" and noise:
+        logger.warning(
+            "set_analysis: %s are netlisted only while transient noise is "
+            "enabled, and Maestro accepts them silently otherwise; verify the "
+            "netlist with check_netlist_options()", ", ".join(noise))
+    etest = escape_skill_string(test)
+    eanalysis = escape_skill_string(analysis)
+    call = f'maeSetAnalysis("{etest}" "{eanalysis}" ?enable {en}{opts}{s})'
+    fields = [f"{analysis}_{name}" for name in _option_names(options)]
+    if not fields:
+        return _q(client, call)
+    keys = " ".join(f'"{escape_skill_string(f)}"' for f in fields)
+    return _q(client, (
+        f"let((vbR vbS vbT vbK) vbR = {call} "
+        f'errset(progn(vbS = asiGetSession(maeGetTestSession("{etest}"{s})) '
+        f"vbT = vbS->data['expressionTable] "
+        f"when(tablep(vbT) "
+        f"foreach(k vbT when(listp(vbT[k]) && member(symbolToString(car(vbT[k])) '({keys})) vbK = cons(k vbK))) "
+        f"foreach(k vbK remove(k vbT))))) "
+        f"vbR)"))
+
+
+# Transient-noise options Spectre receives only when the tran form's noise
+# toggle is on; maeSetAnalysis accepts them either way.
+_TRAN_NOISE_OPTIONS = frozenset(
+    {"noisefmax", "noisefmin", "noiseseed", "noisescale", "noisetmin"})
+
+
+def _option_names(options: str) -> list[str]:
+    """Option names of a SKILL alist string such as '(("stop" "1n"))'."""
+    return re.findall(r'\(\s*"([^"]+)"', options or "")
+
+
+def missing_netlist_options(netlist: str, analysis: str,
+                            names) -> list[str]:
+    """Return the *names* not set on any *analysis* statement of a netlist.
+
+    Pure. Spectre statements continue across lines ending in ``\\``; an
+    analysis statement reads ``<instance> <analysis> key=value ...``.
+    """
+    text = re.sub(r"\\\s*\n", " ", netlist)
+    present: set[str] = set()
+    for line in text.splitlines():
+        tokens = line.split()
+        if len(tokens) >= 2 and tokens[1] == analysis:
+            present.update(t.split("=", 1)[0] for t in tokens[2:] if "=" in t)
+    return [name for name in names if name not in present]
+
+
+def check_netlist_options(client: VirtuosoClient, netlist_path: str,
+                          analysis: str, names) -> list[str]:
+    """Check that requested analysis options reached a generated netlist.
+
+    Maestro accepts some options without netlisting them (for example
+    ``noisefmax`` while transient noise is off). Generate the netlist first,
+    e.g. with :func:`create_netlist_for_corner`, then pass its ``input.scs``.
+    Returns the names that are missing; an empty list means all arrived.
+    """
+    if isinstance(names, str):
+        names = _option_names(names)
+    local = Path(tempfile.gettempdir()) / f"vb_netlist_{uuid.uuid4().hex}.scs"
+    try:
+        client.download_file(netlist_path, str(local))
+        text = local.read_text(encoding="utf-8", errors="replace")
+    finally:
+        local.unlink(missing_ok=True)
+    return missing_netlist_options(text, analysis, names)
+
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+def add_output(client: VirtuosoClient, name: str, test: str, *,
+               output_type: str = "", signal_name: str = "",
+               expr: str = "", session: str = "",
+               replace: bool = False) -> str:
+    """maeAddOutput — add an output (waveform or expression).
+
+    maeAddOutput keeps the old definition of an output that already exists.
+    ``replace=True`` deletes an output of that name first (with its spec),
+    so the call updates it or adds it.
+    """
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    parts = (
+        f'maeAddOutput("{escape_skill_string(name)}" '
+        f'"{escape_skill_string(test)}"'
+    )
+    if output_type:
+        parts += f' ?outputType "{escape_skill_string(output_type)}"'
+    if signal_name:
+        parts += f' ?signalName "{escape_skill_string(signal_name)}"'
+    if expr:
+        parts += f' ?expr "{escape_skill_string(expr)}"'
+    parts += f'{s})'
+    if replace:
+        parts = (
+            f'progn(errset(maeDeleteOutput("{escape_skill_string(name)}" '
+            f'"{escape_skill_string(test)}"{s}) nil) {parts})'
+        )
+    return _q(client, parts)
+
+
+def set_spec(client: VirtuosoClient, name: str, test: str, *,
+             lt: str = "", gt: str = "", session: str = "") -> str:
+    """maeSetSpec — set pass/fail spec on an output."""
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    parts = f'maeSetSpec("{escape_skill_string(name)}" "{escape_skill_string(test)}"'
+    if lt:
+        parts += f' ?lt "{escape_skill_string(lt)}"'
+    if gt:
+        parts += f' ?gt "{escape_skill_string(gt)}"'
+    parts += f'{s})'
+    return _q(client, parts)
+
+
+# ---------------------------------------------------------------------------
+# Variables
+# ---------------------------------------------------------------------------
+
+def set_var(client: VirtuosoClient, name: str, value: str, *,
+            type_name: str = "", type_value: str = "",
+            session: str = "") -> str:
+    """maeSetVar — set a design variable.
+
+    Global:    set_var(client, "vdd", "1.35")
+    Test-level: set_var(client, "f", "100M,2G,4G,8G",
+                        type_name="test", type_value='("IB_PSS")')
+    Corner:    set_var(client, "vdd", "1.2 1.4",
+                       type_name="corner", type_value='("myCorner")')
+
+    Note: if a test has a local variable, it overrides the global one.
+    Use type_name="test" to set test-level variables directly.
+    Comma-separated values create a parametric sweep.
+
+    On IC23.10 a test-level value was seen to have no effect on the runs
+    of corners; read the netlisted value back, or set the variable per
+    corner with :func:`setup_corner` ``variables=``.
+    """
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    parts = (
+        f'maeSetVar("{escape_skill_string(name)}" '
+        f'"{escape_skill_string(value)}"'
+    )
+    if type_name:
+        parts += f' ?typeName "{escape_skill_string(type_name)}"'
+    if type_value:
+        parts += f" ?typeValue '{type_value}"
+    parts += f'{s})'
+    return _q(client, parts)
+
+
+def get_var(client: VirtuosoClient, name: str, *, session: str = "") -> str:
+    """maeGetVar — get the value of a design variable."""
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    return _q(client, f'maeGetVar("{escape_skill_string(name)}"{s})')
+
+
+def delete_var(client: VirtuosoClient, name: str, *,
+               test: str = "", session: str = "") -> str:
+    """Delete a design variable using axl* API.
+
+    Global:     delete_var(client, "f")
+    Test-level: delete_var(client, "f", test="IB_PSS")
+
+    Note: to delete a global variable, you must first delete it
+    from all tests that have a local copy.
+    """
+    sess = escape_skill_string(_resolve_session(client, session))
+    ename = escape_skill_string(name)
+    if test:
+        etest = escape_skill_string(test)
+        expr = (f'axlRemoveElement(axlGetVar('
+                f'axlGetTest(axlGetMainSetupDB("{sess}") "{etest}") "{ename}"))')
+    else:
+        expr = (f'axlRemoveElement(axlGetVar('
+                f'axlGetMainSetupDB("{sess}") "{ename}"))')
+    return _q(client, expr)
+
+
+# ---------------------------------------------------------------------------
+# Parameters (parametric sweep)
+# ---------------------------------------------------------------------------
+
+def get_parameter(client: VirtuosoClient, name: str, *,
+                  type_name: str = "", type_value: str = "",
+                  session: str = "") -> str:
+    """maeGetParameter — get value of a parameter for a test or corner."""
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    parts = f'maeGetParameter("{escape_skill_string(name)}"'
+    if type_name:
+        parts += f' ?typeName "{escape_skill_string(type_name)}"'
+    if type_value:
+        parts += f' ?typeValue `{type_value}'
+    parts += f'{s})'
+    return _q(client, parts)
+
+
+def set_parameter(client: VirtuosoClient, name: str, value: str, *,
+                  type_name: str = "", type_value: str = "",
+                  session: str = "") -> str:
+    """maeSetParameter — add or update a parameter at global or corner level.
+
+    For global:  set_parameter(client, "cload", "1p")
+    For corner:  set_parameter(client, "cload", "1p 2p",
+                               type_name="corner", type_value='("myCorner")')
+    """
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    parts = (
+        f'maeSetParameter("{escape_skill_string(name)}" '
+        f'"{escape_skill_string(value)}"'
+    )
+    if type_name:
+        parts += f' ?typeName "{escape_skill_string(type_name)}"'
+    if type_value:
+        parts += f' ?typeValue `{type_value}'
+    parts += f'{s})'
+    return _q(client, parts)
+
+
+# ---------------------------------------------------------------------------
+# Environment & Simulator Options
+# ---------------------------------------------------------------------------
+
+def set_env_option(client: VirtuosoClient, test: str, options: str, *,
+                   session: str = "") -> str:
+    """maeSetEnvOption — set environment options (model files, view list, etc.).
+
+    options: SKILL alist string, e.g.
+      '(("modelFiles" (("/path/model.scs" "tt"))))'
+    """
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    return _q(client,
+        f'maeSetEnvOption("{escape_skill_string(test)}" ?options `{options}{s})')
+
+
+def set_sim_option(client: VirtuosoClient, test: str, options: str, *,
+                   session: str = "") -> str:
+    """maeSetSimOption — set simulator options (reltol, temp, etc.).
+
+    options: SKILL alist string, e.g.
+      '(("temp" "85") ("reltol" "1e-5"))'
+    """
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    return _q(client,
+        f'maeSetSimOption("{escape_skill_string(test)}" ?options `{options}{s})')
+
+
+# ---------------------------------------------------------------------------
+# Corners
+# ---------------------------------------------------------------------------
+
+def set_corner(client: VirtuosoClient, name: str, *,
+               disable_tests: str = "", session: str = "") -> str:
+    """maeSetCorner — create or modify a corner.
+
+    disable_tests: SKILL list string, e.g. '("AC" "TRAN")'
+    """
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    dt = f' ?disableTests `{disable_tests}' if disable_tests else ""
+    return _q(client, f'maeSetCorner("{escape_skill_string(name)}"{dt}{s})')
+
+
+def setup_corner(client: VirtuosoClient, name: str, *,
+                 model_file: str = "", model_section: str = "",
+                 variables: dict[str, str] | None = None,
+                 session: str = "") -> str:
+    """Convenience wrapper: create a corner + set its vars + attach a model file.
+
+    Internally does three things any caller can also do manually:
+
+      1. :func:`set_corner` — create the corner (``maeSetCorner``).
+      2. For each entry in ``variables``: ``maeSetVar(?typeName "corner" ?typeValue …)``.
+      3. ``axlGetCorner`` → ``axlPutModel`` → ``axlSetModelFile`` /
+         ``axlSetModelSection`` — attach the model.
+
+    A corner model file replaces the test's ``modelFiles``, so includes
+    listed there (a std-cell netlist, for example) are dropped for this
+    corner. Put such includes in the test's ``definitionFiles`` instead,
+    which corners do not override::
+
+        set_env_option(client, test, '(("definitionFiles" ("/path/std.scs")))')
+
+    Intentionally heavier than its peers — use it when you want a fully
+    configured corner in one call.  For "just create an empty corner",
+    call :func:`set_corner` directly.
+
+    Args:
+        name: Corner name, e.g. "tt_25"
+        model_file: Path to model file, e.g. "/path/to/mypdk.scs"
+        model_section: Model section name, e.g. "tt"
+        variables: Corner-specific variables, e.g. {"temperature": "25", "vdd": "1.2"}
+        session: Maestro session ID
+    """
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    ename = escape_skill_string(name)
+
+    # Create the corner
+    set_corner(client, name, session=session)
+
+    # Set corner-specific variables
+    if variables:
+        for var_name, var_value in variables.items():
+            _q(client,
+               f'maeSetVar("{escape_skill_string(var_name)}" '
+               f'"{escape_skill_string(var_value)}" '
+               f'?typeName "corner" ?typeValue \'("{ename}"){s})')
+
+    # Set model file + section via axl* setup-DB API
+    if model_file:
+        sess_id = escape_skill_string(_resolve_session(client, session))
+        model_name = model_file.rsplit("/", 1)[-1] if "/" in model_file else model_file
+        emodel_name = escape_skill_string(model_name)
+        emodel_file = escape_skill_string(model_file)
+        emodel_section = escape_skill_string(model_section)
+        expr = (
+            f'let((sdb corn model) '
+            f'sdb = axlGetMainSetupDB("{sess_id}") '
+            f'corn = axlGetCorner(sdb "{ename}") '
+            f'model = axlPutModel(corn "{emodel_name}") '
+            f'axlSetModelFile(model "{emodel_file}") '
+            f'{f"""axlSetModelSection(model "{emodel_section}") """ if model_section else ""}'
+            f'model)'
+        )
+        _q(client, expr)
+
+    return name
+
+
+def load_corners(client: VirtuosoClient, filepath: str, *,
+                 sections: str = "corners",
+                 operation: str = "overwrite") -> str:
+    """maeLoadCorners — load corners from a CSV file."""
+    return _q(client,
+        f'maeLoadCorners("{escape_skill_string(filepath)}" '
+        f'?sections "{escape_skill_string(sections)}" '
+        f'?operation "{escape_skill_string(operation)}")')
+
+
+# ---------------------------------------------------------------------------
+# Simulation
+# ---------------------------------------------------------------------------
+
+def set_current_run_mode(client: VirtuosoClient, run_mode: str, *,
+                         session: str = "") -> str:
+    """maeSetCurrentRunMode — switch run mode.
+
+    run_mode: e.g. "Single Run, Sweeps and Corners"
+    """
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    return _q(client,
+        f'maeSetCurrentRunMode(?runMode "{escape_skill_string(run_mode)}"{s})')
+
+
+def set_job_control_mode(client: VirtuosoClient, mode: str, *,
+                         session: str = "") -> str:
+    """maeSetJobControlMode — set job control mode (e.g. "Local", "LSCS")."""
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    return _q(client, f'maeSetJobControlMode("{escape_skill_string(mode)}"{s})')
+
+
+def set_job_policy(client: VirtuosoClient, policy, *,
+                   test_name: str = "", job_type: str = "",
+                   session: str = "") -> str:
+    """maeSetJobPolicy — set job policy for a test."""
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    parts = f"maeSetJobPolicy({policy}"
+    if test_name:
+        parts += f' ?testName "{escape_skill_string(test_name)}"'
+    if job_type:
+        parts += f' ?jobType "{escape_skill_string(job_type)}"'
+    parts += f'{s})'
+    return _q(client, parts)
+
+
+def _without_history_name_form(call: str) -> str:
+    """SKILL running *call* with the "Specify History Name" form switched off.
+
+    A site or user can set ``adexl.historyNamePrefix showNameHistoryForm`` to
+    ask for a history name in a modal form before every run. Nothing answers
+    that form for a programmatic run, so the CIW would stay blocked. The
+    setting is turned off for this call only and restored afterwards, also
+    when the call fails; Virtuoso versions without the variable are left
+    untouched.
+    """
+    tool, var = '"adexl.historyNamePrefix"', '"showNameHistoryForm"'
+    return (
+        "let((vbFormOn vbRun) "
+        f"vbFormOn = isCallable('envIsVal) && envIsVal({tool} {var} t) && envGetVal({tool} {var}) "
+        f"when(vbFormOn envSetVal({tool} {var} 'boolean nil)) "
+        f"vbRun = errset({call} t) "
+        f"when(vbFormOn envSetVal({tool} {var} 'boolean t)) "
+        'unless(vbRun error("%s failed: %L" "maeRunSimulation" errset.errset)) '
+        "car(vbRun))"
+    )
+
+
+def run_simulation(client: VirtuosoClient, *, session: str = "",
+                   callback: str = "", run_mode: str = "",
+                   timeout: float | None = None) -> str:
+    """maeRunSimulation — run simulation (async, returns immediately).
+
+    Returns the history name (e.g. "Interactive.1"). A "Specify History
+    Name" form enabled by the site's ADE settings is not shown for this run
+    (see :func:`_without_history_name_form`); the default name is used.
+
+    Args:
+        session: session name (default: current session)
+        callback: SKILL procedure name to call when run finishes
+        run_mode: explicit Maestro run mode; empty preserves the Cadence default
+        timeout: socket timeout for Maestro to accept the run request
+    """
+    parts = "maeRunSimulation("
+    if session:
+        parts += f'?session "{escape_skill_string(session)}" '
+    if callback:
+        parts += f'?callback "{escape_skill_string(callback)}" '
+    if run_mode:
+        parts += f'?runMode "{escape_skill_string(run_mode)}" '
+    parts = parts.rstrip() + ")"
+    budget = timeout if timeout is not None else getattr(client, "_timeout", 30)
+    deadline = time.monotonic() + budget
+    try:
+        return _q(client, _without_history_name_form(parts), timeout=timeout)
+    except Exception as exc:
+        result = _simulation_failure(
+            client, exc, timeout=deadline - time.monotonic(),
+            session=session, maestro_phase="simulation_start",
+        )
+        result.metadata.setdefault("simulation_start_sent", result.metadata.get("request_sent"))
+        raise
+
+
+def _remove_marker(runner, marker: str) -> None:
+    """Delete the marker file in either local or remote mode."""
+    if runner is None:
+        from pathlib import Path as _Path
+        try:
+            _Path(marker).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    else:
+        runner.run_command(f"rm -f {shlex.quote(marker)}", timeout=10)
+
+
+def _marker_runner(client: VirtuosoClient):
+    """Runner for the host where Virtuoso's SKILL callback writes /tmp markers."""
+    return getattr(client, "gui_runner", None) or getattr(client, "ssh_runner", None)
+
+
+# Without the opt-in guard, a modal dialog (an ASSEMBLER question, a disk
+# error) stops the run's completion callback and the wait would look like a
+# long simulation. Probe the CIW read-only this often, and report a blocker
+# only when the same dialogs are seen on two probes in a row, so a transient
+# progress box is not mistaken for one.
+_UNGUARDED_PROBE_INTERVAL = 30.0
+
+
+def _dialog_titles(report) -> tuple[str, ...]:
+    return tuple(sorted(str(d.get("title") or d.get("window_id") or "") for d in report.dialogs))
+
+
+def _wait_until_done(client: VirtuosoClient, marker: str,
+                      timeout: float = 600, *, dialog_check: bool = True) -> str:
+    """Internal: poll the marker file written by run_and_wait's SKILL callback.
+
+    Cadence-side ``maeRunSimulation(?callback ...)`` registers a SKILL
+    callback that ``echo``s ``done`` to ``marker`` when the run finishes.
+    Local mode reads the file directly via stdlib; remote mode ``ssh
+    cat``s it every 2 s on the SSH channel, keeping the SKILL channel
+    free for other work (read-only dialog inspection, ...). Shared mode checks
+    blockers out-of-band at most once every ten seconds, without cancelling
+    a simulation or waiting for the full completion timeout.
+
+    Not public — call :func:`run_and_wait` instead, which sets up the
+    callback + marker and calls this helper.
+    """
+    import time as _time
+    from pathlib import Path as _Path
+
+    runner = _marker_runner(client)
+
+    deadline = _time.monotonic() + timeout
+    next_dialog_check = 0.0
+    next_probe = _time.monotonic() + _UNGUARDED_PROBE_INTERVAL
+    seen_blocked: tuple[str, ...] | None = None
+    while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+
+        if runner is None:
+            mp = _Path(marker)
+            if mp.exists():
+                content = mp.read_text().strip()
+                if content:
+                    _remove_marker(runner, marker)
+                    return content
+        else:
+            r = runner.run_command(
+                f"cat {shlex.quote(marker)} 2>/dev/null",
+                timeout=min(10.0, remaining),
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                _remove_marker(runner, marker)
+                return r.stdout.strip()
+
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+        dialogs = getattr(client, "dialogs", None)
+        if dialogs is not None and dialogs.enabled and _time.monotonic() >= next_dialog_check:
+            blocked = dialogs.preflight(timeout=min(5.0, remaining))
+            next_dialog_check = _time.monotonic() + 10.0
+            if blocked is not None:
+                blocked.errors = [
+                    "Simulation completion wait stopped: shared CIW has a blocker "
+                    "or cannot be inspected. Bridge did not request simulation cancellation."
+                ]
+                blocked.metadata.pop("request_sent", None)
+                blocked.metadata.update(outcome="unknown", phase="completion_wait",
+                                        completion_marker=marker)
+                raise DialogBlockedError(blocked)
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
+        elif (dialog_check and dialogs is not None and hasattr(dialogs, "probe")
+              and _time.monotonic() >= next_probe):
+            next_probe = _time.monotonic() + _UNGUARDED_PROBE_INTERVAL
+            report = dialogs.probe(timeout=min(10.0, remaining))
+            if report is not None and report.status == "blocked":
+                titles = _dialog_titles(report)
+                if titles == seen_blocked:
+                    raise DialogBlockedError(VirtuosoResult(
+                        status=ExecutionStatus.ERROR,
+                        errors=["Simulation completion wait stopped: a dialog blocks the CIW "
+                                f"({', '.join(t for t in titles if t) or 'untitled'}). "
+                                "Answer it in Virtuoso, then wait for this history again; "
+                                "the run was not cancelled and no dialog was dismissed."],
+                        metadata={"dialog_guard": report.model_dump(), "outcome": "unknown",
+                                  "phase": "completion_wait", "completion_marker": marker},
+                    ))
+                seen_blocked = titles
+            else:
+                seen_blocked = None
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
+        _time.sleep(min(2.0, remaining))
+
+    raise TimeoutError(f"Simulation did not finish within {timeout}s")
+
+
+def _strip_skill_atom(raw: str) -> str:
+    return (raw or "").strip().strip('"')
+
+
+class MaestroPointsFailed(RuntimeError):
+    """A finished run whose Spectre logs report failed points."""
+
+    def __init__(self, history: str, points: list[dict]) -> None:
+        self.history = history
+        self.points = points
+        failed = [p for p in points if p["status"] != "ok"]
+        detail = "; ".join(
+            f'{p["log"]}: {p["status"]}' + (f' ({p["errors"][0]})' if p["errors"] else "")
+            for p in failed[:5])
+        super().__init__(
+            f"{history}: {len(failed)} of {len(points)} points did not complete: {detail}")
+
+
+def run_and_wait(client: VirtuosoClient, *, session: str = "",
+                 run_mode: str = "", timeout: int = 600,
+                 check: bool = False, lib: str = "",
+                 cell: str = "", dialog_check: bool = True) -> tuple[str, str]:
+    """Run simulation and wait for completion without blocking SKILL.
+
+    Uses maeRunSimulation(?callback ...) to register a completion callback
+    atomically with the simulation start — no race condition possible.
+    The callback writes a marker file; Python polls it via SSH.
+
+    The SKILL channel remains free during the wait — you can still
+    execute_skill, inspect dialogs, take screenshots, etc.
+
+    ``timeout`` is an end-to-end budget covering the simulation-start request
+    and completion polling. Returns (history, status) — e.g.
+    ('"Interactive.3"', 'done').
+
+    "done" only means Maestro finished; points can still have failed (a
+    Spectre crash, for instance). ``check=True`` reads every point's
+    ``spectre.out`` (see :func:`check_points`) and raises
+    :class:`MaestroPointsFailed` unless all completed without errors, or
+    no log was found. ``lib``/``cell`` locate the results and are read
+    from the session when omitted.
+
+    While waiting, the CIW is checked read-only every 30 s even without the
+    dialog guard; a dialog seen on two checks in a row (a modal ASSEMBLER
+    question, say, which stops the completion callback) raises
+    :class:`DialogBlockedError` carrying the history instead of waiting out
+    ``timeout``. Nothing is dismissed. ``dialog_check=False`` turns it off.
+    """
+    deadline = time.monotonic() + timeout
+
+    def remaining_timeout() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Simulation did not finish within {timeout}s")
+        return remaining
+
+    # runner is None in local mode (Virtuoso on the same host); _remove_marker
+    # and _wait_until_done both handle that case via local fs operations.
+    runner = _marker_runner(client)
+
+    # The CIW PID for the read-only dialog checks during the wait: the
+    # daemon cannot tell it once a dialog holds the CIW.
+    dialogs = getattr(client, "dialogs", None)
+    if dialog_check and hasattr(dialogs, "remember_pid") and not dialogs.enabled:
+        dialogs.remember_pid(timeout=min(5.0, max(0.1, deadline - time.monotonic())))
+
+    nonce = uuid.uuid4().hex[:8]
+    marker = f"/tmp/vb_sim_done_{nonce}"
+    _remove_marker(runner, marker)
+
+    try:
+        setup_timeout = remaining_timeout()
+    except TimeoutError as exc:
+        _simulation_failure(
+            client, exc, timeout=0, completion_marker=marker, session=session,
+            maestro_phase="callback_setup", simulation_start_sent=False,
+            request_sent=False, outcome="not_started",
+        )
+        raise
+
+    # Define callback that writes marker file when simulation finishes.
+    # Use system("echo ... > file") instead of outfile/fprintf to avoid
+    # SKILL I/O buffering issues in callback context.
+    try:
+        _q(client, f'''
+procedure(_vb_sim_done_{nonce}(session runID)
+  system(sprintf(nil "echo done > {marker}"))
+  printf("[%s sim done] run %L\\n" nth(2 parseString(getCurrentTime())) runID))
+''', timeout=setup_timeout)
+    except Exception as exc:
+        _simulation_failure(client, exc, timeout=deadline - time.monotonic(),
+                            maestro_phase="callback_setup", session=session,
+                            simulation_start_sent=False)
+        raise
+
+    try:
+        start_timeout = remaining_timeout()
+    except TimeoutError as exc:
+        _simulation_failure(
+            client, exc, timeout=0, completion_marker=marker, session=session,
+            maestro_phase="simulation_start", simulation_start_sent=False,
+            request_sent=False, outcome="not_started",
+        )
+        raise
+    try:
+        # Start once: missing acknowledgement must not trigger a second run.
+        history = run_simulation(client, session=session,
+                                 callback=f"_vb_sim_done_{nonce}",
+                                 run_mode=run_mode,
+                                 timeout=start_timeout)
+    except Exception as exc:
+        result = _simulation_failure(client, exc, timeout=deadline - time.monotonic(),
+                                     completion_marker=marker, session=session,
+                                     maestro_phase="simulation_start")
+        result.metadata.setdefault("simulation_start_sent", result.metadata.get("request_sent"))
+        raise
+
+    history_name = _strip_skill_atom(history)
+    if not history_name or history_name == "nil":
+        # Do not query the SKILL channel again: a user dialog may now block it.
+        # Retain the callback marker so a late completion remains observable.
+        message = (
+            "maeRunSimulation returned nil (no history acknowledged). "
+            "No form was dismissed and the simulation was not retried. "
+            "Use read-only dialogs.inspect(pid=...) to diagnose blockers; "
+            "verify run state before retrying. "
+            f"session={session or '<current>'}, completion_marker={marker}"
+        )
+        failure = VirtuosoResult(
+            status=ExecutionStatus.ERROR, errors=[message],
+            metadata={"completion_marker": marker, "session": session,
+                      "maestro_phase": "simulation_start", "simulation_start_sent": True,
+                      "outcome": "unknown"},
+        )
+        dialogs = getattr(client, "dialogs", None)
+        if dialogs is not None and dialogs.enabled:
+            error = DialogBlockedError(failure)
+        else:
+            error = RuntimeError(message)
+            error.result = failure
+        _simulation_failure(client, error, timeout=deadline - time.monotonic())
+        raise error
+
+    # Poll marker via SSH (SKILL channel stays free)
+    try:
+        status = _wait_until_done(client, marker, timeout=remaining_timeout(),
+                                  dialog_check=dialog_check)
+    except DialogBlockedError as exc:
+        exc.result.metadata.update(history=history_name, session=session,
+                                   phase="completion_wait", completion_marker=marker,
+                                   simulation_start_sent=True)
+        raise
+    except Exception as exc:
+        # The start was acknowledged. Keep its identity when completion is
+        # uncertain so clients can inspect this run without starting another.
+        # Transport polling can also raise TimeoutExpired or connection errors,
+        # not just the end-to-end TimeoutError.
+        result = _simulation_failure(
+            client, exc, timeout=deadline - time.monotonic(), session=session,
+            history=history_name, completion_marker=marker,
+            phase="completion_wait", simulation_start_sent=True,
+        )
+        raise MaestroCompletionUnknown(result) from exc
+    if check:
+        _check_run_points(client, history_name, session=session, lib=lib, cell=cell)
+    return history, status
+
+
+def _check_run_points(client: VirtuosoClient, history: str, *, session: str,
+                      lib: str, cell: str) -> None:
+    from virtuoso_bridge.virtuoso.maestro.reader._skill import _session_lib_cell
+    from virtuoso_bridge.virtuoso.maestro.reader.runs import check_points
+
+    if not lib or not cell:
+        found_lib, found_cell = _session_lib_cell(client, session)
+        lib, cell = lib or found_lib, cell or found_cell
+    try:
+        points = check_points(client, history, lib=lib, cell=cell)
+    except RuntimeError as exc:
+        # Keep the acknowledged run's identity, as MaestroPointsFailed does:
+        # a run whose points never reached Spectre (netlisting failed, say)
+        # leaves no log, and the caller still needs to know which history.
+        exc.history = history
+        raise
+    if points and any(p["status"] != "ok" for p in points):
+        raise MaestroPointsFailed(history, points)
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+def create_netlist_for_corner(client: VirtuosoClient, test: str,
+                              corner: str, output_dir: str, *,
+                              session: str = "") -> str:
+    """maeCreateNetlistForCorner — export standalone netlist for a corner.
+
+    If *session* is omitted, Cadence uses the current Maestro session.
+    """
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    return _q(client,
+        f'maeCreateNetlistForCorner("{escape_skill_string(test)}" '
+        f'"{escape_skill_string(corner)}" "{escape_skill_string(output_dir)}"{s})')
+
+
+def _export_output_view_skill(filepath: str, args: str) -> str:
+    """SKILL running maeExportOutputView that fails unless *filepath* exists.
+
+    maeExportOutputView can return without writing anything and without an
+    error; remove any stale destination first and require both errset success
+    and the exported file.
+    """
+    path = escape_skill_string(filepath)
+    return (
+        f'let((vbRun) when(isFile("{path}") deleteFile("{path}")) '
+        f'vbRun = errset(maeExportOutputView({args} ?fileName "{path}") t) '
+        f'unless(vbRun && isFile("{path}") error("maeExportOutputView wrote no file %s: %L" '
+        f'"{path}" if(vbRun car(vbRun) errset.errset))) '
+        f'car(vbRun))'
+    )
+
+
+def export_output_view(client: VirtuosoClient, filepath: str, *,
+                       view: str = "Detail") -> str:
+    """maeExportOutputView — export results to CSV.
+
+    Raises ``RuntimeError`` when no file was written.
+    """
+    return _q(client, _export_output_view_skill(
+        filepath, f'?view "{escape_skill_string(view)}"'))
+
+
+def copy_point_netlist(client: VirtuosoClient, source: str,
+                       destination: str) -> None:
+    """Copy a Maestro point's netlist directory for a standalone rerun.
+
+    ``netlist`` and ``ihnl`` in a point directory are relative symlinks into
+    ``psf/<TEST>/netlist``, so a plain copy leaves dangling links. This copy
+    follows them. Runs on the Virtuoso host.
+    """
+    runner = client.ssh_runner
+    if runner is None:
+        shutil.copytree(source, destination, symlinks=False)
+        return
+    r = runner.run_command(
+        f"cp -RL {shlex.quote(source)} {shlex.quote(destination)}")
+    if r.returncode != 0:
+        raise RuntimeError(f"copy_point_netlist failed: {r.stderr.strip()}")
+
+
+def write_script(client: VirtuosoClient, filepath: str) -> str:
+    """maeWriteScript — export entire setup as reproducible SKILL script."""
+    return _q(client, f'maeWriteScript("{escape_skill_string(filepath)}")')
+
+
+# ---------------------------------------------------------------------------
+# Migration
+# ---------------------------------------------------------------------------
+
+def migrate_adel_to_maestro(client: VirtuosoClient, lib: str, cell: str,
+                            state: str) -> str:
+    """maeMigrateADELStateToMaestro — convert ADE L state to maestro view."""
+    return _q(client,
+        f'maeMigrateADELStateToMaestro("{escape_skill_string(lib)}" '
+        f'"{escape_skill_string(cell)}" "{escape_skill_string(state)}")')
+
+
+def migrate_adexl_to_maestro(client: VirtuosoClient, lib: str, cell: str,
+                             view: str = "adexl", *,
+                             maestro_view: str = "maestro") -> str:
+    """maeMigrateADEXLToMaestro — convert ADE XL view to maestro view."""
+    return _q(client,
+        f'maeMigrateADEXLToMaestro("{escape_skill_string(lib)}" '
+        f'"{escape_skill_string(cell)}" "{escape_skill_string(view)}" '
+        f'?maestroView "{escape_skill_string(maestro_view)}")')
+
+
+# ---------------------------------------------------------------------------
+# Save
+# ---------------------------------------------------------------------------
+
+def save_setup(client: VirtuosoClient, lib: str, cell: str, *,
+               session: str = "") -> str:
+    """maeSaveSetup — save the maestro setup to disk."""
+    s = f' ?session "{escape_skill_string(session)}"' if session else ""
+    return _q(client,
+        f'maeSaveSetup(?lib "{escape_skill_string(lib)}" '
+        f'?cell "{escape_skill_string(cell)}" ?view "maestro"{s})')
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+def open_maestro_gui_with_history(client: VirtuosoClient, lib: str, cell: str,
+                                  *, history: str = "") -> str:
+    """Open Maestro GUI window and display a simulation history.
+
+    If history is not given, auto-detects the latest from asiGetResultsDir.
+
+    Steps:
+        1. asiGetResultsDir → extract history name
+        2. deOpenCellView → open GUI window (read mode)
+        3. maeMakeEditable → switch to edit mode
+        4. maeRestoreHistory → load history results into GUI
+        5. maeSaveSetup → persist
+
+    Returns the history name.
+    """
+    import re
+
+    # Auto-detect history name
+    if not history:
+        r = client.execute_skill('asiGetResultsDir(asiGetCurrentSession())')
+        rd = (r.output or "").strip('"')
+        m = re.search(r'/maestro/results/maestro/([^/]+)/', rd)
+        if not m:
+            raise RuntimeError("No simulation history found")
+        history = m.group(1)
+
+    elib = escape_skill_string(lib)
+    ecell = escape_skill_string(cell)
+    ehistory = escape_skill_string(history)
+    _q(client, f'deOpenCellView("{elib}" "{ecell}" "maestro" "maestro" nil "r")')
+    _q(client, 'maeMakeEditable()')
+    _q(client, f'maeRestoreHistory("{ehistory}")')
+    _q(client, f'maeSaveSetup(?lib "{elib}" ?cell "{ecell}" ?view "maestro")')
+
+    return history

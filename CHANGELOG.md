@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Integration (virtuoso-cli-integration, 2026-11-27)
+
+- Vendored virtuoso-bridge-lite into `python/` (base 2cc3d066) with the
+  cross-bridge mutation lock applied in-tree; the repo is now
+  self-contained - no separate clone or manual patching.
+- Applied the same flock to the fallback daemons in `resources/daemons/`
+  (py3 + py2.7).
+- Fixed the source export: `src/target/` was silently excluded by the
+  generic `target/` ignore rule and is now tracked.
+- Comment budget passes within existing baselines; vendored `python/` is
+  excluded from that gate like `resources/`.
+- Added `tests/python/test_vai_lock_integration.py` (functional
+  cross-process flock proof over the shipped daemon code).
+- Design rationale moved to `docs/decision-records/0001-dual-bridge-coexistence.md`.
+
+## [Unreleased]
+
 ### Added
 
 - **The `analog-artist-symbol` skill.** It draws a compact, readable functional

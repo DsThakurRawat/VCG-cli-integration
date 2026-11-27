@@ -11,3 +11,7 @@ psf*
 target/
 __pycache__/
 *.pyc
+!src/target/
+# Vendored bridge-lite: upstream tracks these; the generic sim-output rules above must not hide them
+!python/src/virtuoso_bridge/spectre/psf.py
+!python/**/*.scs

@@ -1,0 +1,948 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from virtuoso_bridge.models import ExecutionStatus, VirtuosoResult
+from virtuoso_bridge.transport.ssh import CommandResult
+from virtuoso_bridge.transport.tunnel import (
+    SSHClient,
+    _profiled_bridge_leaf,
+    _profiled_env_key,
+)
+from virtuoso_bridge import cli
+
+
+@pytest.fixture(autouse=True)
+def isolated_configuration(monkeypatch, tmp_path):
+    """Offline transport tests must not load a developer's live EDA config."""
+    from virtuoso_bridge import env
+    path = tmp_path / "empty.env"
+    path.write_text("")
+    monkeypatch.setattr(env, "_RUNTIME_ENV_FILE", path)
+
+
+class _FakeRunner:
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+        self.uploads: dict[str, str] = {}
+
+    def run_command(self, command: str, timeout=None) -> CommandResult:
+        self.commands.append(command)
+        if command == "whoami":
+            return CommandResult(0, "designer", "")
+        if "VB_BUNDLE_" in command:
+            return CommandResult(returncode=0, stdout='{"reused": false}', stderr="")
+        return CommandResult(returncode=0, stdout="/home/designer" if command == 'getent passwd "$(id -u)" | cut -d: -f6' else "", stderr="")
+
+    def upload_text(self, text: str, remote_path: str, timeout=None) -> CommandResult:
+        self.uploads[remote_path] = text
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+
+def test_profiled_bridge_leaf_preserves_default_path() -> None:
+    assert _profiled_bridge_leaf(None) == "virtuoso_bridge"
+
+
+def test_profiled_bridge_leaf_adds_profile_suffix() -> None:
+    assert _profiled_bridge_leaf("t28_digital") == "virtuoso_bridge_t28_digital"
+    assert _profiled_bridge_leaf("t28/io") == "virtuoso_bridge_t28_io"
+
+
+def test_profiled_env_key_preserves_default_and_suffixes_profiles() -> None:
+    assert _profiled_env_key("VB_LOCAL_PORT", None) == "VB_LOCAL_PORT"
+    assert _profiled_env_key("VB_LOCAL_PORT", "t180_io") == "VB_LOCAL_PORT_t180_io"
+
+
+def test_remote_setup_path_and_port_are_profile_scoped(monkeypatch) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.remote_paths.load_vb_env", lambda: None)
+    monkeypatch.delenv("VB_REMOTE_SCRATCH_ROOT", raising=False)
+    monkeypatch.delenv("VB_CLIENT_ID_t28_digital", raising=False)
+    monkeypatch.setenv("VB_CLIENT_ID", "90590")
+    fake = _FakeRunner()
+    client = SSHClient(
+        remote_host="thu-wei",
+        remote_user="designer",
+        port=65263,
+        profile="t28_digital",
+    )
+    client._ssh_runner = fake
+    monkeypatch.setattr(client, "_detect_remote_python", lambda: ("python3", 3, 11))
+
+    client.ensure_remote_setup()
+
+    assert client.remote_work_dir == "/tmp/virtuoso_bridge_designer/90590/virtuoso_bridge_t28_digital"
+    setup_path = "/tmp/virtuoso_bridge_designer/90590/virtuoso_bridge_t28_digital/virtuoso_setup.il"
+    setup = fake.uploads[setup_path]
+    assert 'setShellEnvVar("RB_PORT" "65263")' in setup
+    assert 'setShellEnvVar("RB_LISTEN_ALL" "0")' in setup
+    assert setup.index("RB_LISTEN_ALL") < setup.index("\nload(")
+    assert 'setShellEnvVar("RB_IDENTITY_PATH"' in setup
+    assert '/tmp/virtuoso_bridge_designer/90590/virtuoso_bridge_t28_digital/ramic_bridge.il' in setup
+
+
+def test_automatic_setup_is_shared_across_profiles_and_clients(monkeypatch):
+    monkeypatch.setattr("virtuoso_bridge.transport.remote_paths.load_vb_env", lambda: None)
+    monkeypatch.delenv("VB_REMOTE_SCRATCH_ROOT", raising=False)
+    for profile in ("project_a", "project_b"):
+        monkeypatch.setenv("VB_CLIENT_ID", profile)
+        fake = _FakeRunner()
+        client = SSHClient(remote_host="eda", remote_user="designer", profile=profile,
+                           discover_instances=True)
+        client._ssh_runner = fake
+        monkeypatch.setattr(client, "_detect_remote_python", lambda: ("python3", 3, 11))
+        client.ensure_remote_setup()
+        path = "/tmp/virtuoso_bridge_designer/daemon/virtuoso_setup.il"
+        assert client.setup_path == path
+        payload = json.loads(next(command for command in fake.commands if "VB_BUNDLE_" in command).splitlines()[-2])
+        assert not fake.uploads
+        assert payload["destination"] == str(Path(path).parent).replace("\\", "/")
+        assert payload["replace"] is False
+        setup = payload["files"]["virtuoso_setup.il"]
+        assert 'setShellEnvVar("RB_SCRATCH_ROOT" "/tmp/virtuoso_bridge_designer")' in setup
+        assert 'setShellEnvVar("RB_PORT" "0")' in setup
+
+
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_same_account_profiles_do_not_overwrite_each_others_setup(tmp_path, monkeypatch, local):
+    monkeypatch.setattr("virtuoso_bridge.transport.remote_paths.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.state_dir", lambda: tmp_path)
+    monkeypatch.delenv("VB_REMOTE_SCRATCH_ROOT", raising=False)
+    monkeypatch.setenv("VB_CLIENT_ID", "synthetic-client")
+    fake = _FakeRunner()
+    paths = []
+    setups = []
+    for profile, port in (("project_a", 65101), ("project_b", 65102)):
+        monkeypatch.delenv(f"VB_CLIENT_ID_{profile}", raising=False)
+        client = SSHClient(
+            remote_host="localhost" if local else "eda-host",
+            remote_user="designer", port=port, profile=profile,
+        )
+        client._ssh_runner = fake
+        monkeypatch.setattr(client, "_detect_remote_python", lambda: ("python3", 3, 11))
+        if local:
+            client.ensure_local_setup()
+        else:
+            client.ensure_remote_setup()
+        paths.append(client.setup_path)
+        if local:
+            setups.append(Path(paths[-1]).read_text(encoding="utf-8"))
+        else:
+            setups.append(fake.uploads[paths[-1]])
+        assert f'setShellEnvVar("RB_PORT" "{port}")' in setups[-1]
+    assert paths[0] != paths[1]
+    first_after = Path(paths[0]).read_text(encoding="utf-8") if local else fake.uploads[paths[0]]
+    assert first_after == setups[0]
+
+
+
+
+def test_restart_cli_reports_verified_replacement_and_closes(monkeypatch, capsys) -> None:
+    calls = []
+    client = SimpleNamespace(remote_port=65271, restart_instance=lambda: calls.append("restart"),
+                             close=lambda: calls.append("close"))
+    monkeypatch.setattr(SSHClient, "from_env", lambda **kw: client)
+    assert cli._restart_daemon_one("t28_io") is True
+    assert calls == ["restart", "close"]
+    assert "replacement instance authenticated" in capsys.readouterr().out
+
+
+def test_restart_cli_reports_identity_refusal_and_closes(monkeypatch, capsys) -> None:
+    calls = []
+    def refuse():
+        raise RuntimeError("signed instance differs: alice versus bob")
+    client = SimpleNamespace(restart_instance=refuse, close=lambda: calls.append("close"))
+    monkeypatch.setattr(SSHClient, "from_env", lambda **kw: client)
+    assert cli._restart_daemon_one(None) is False
+    out = capsys.readouterr().out
+    assert "alice versus bob" in out
+    assert calls == ["close"]
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Remote port de-confliction (cross-user port squatting)
+# ---------------------------------------------------------------------------
+
+from virtuoso_bridge.transport.tunnel import (  # noqa: E402
+    _remote_port_occupancy_cmd,
+    _update_env_file,
+)
+
+
+class _ScriptedRunner:
+    """FakeRunner whose occupancy probes replay scripted verdicts."""
+
+    def __init__(self, verdicts: list[str]) -> None:
+        self.verdicts = list(verdicts)
+        self.commands: list[str] = []
+        self.uploads: dict[str, str] = {}
+
+    def run_command(self, command: str, timeout=None) -> CommandResult:
+        self.commands.append(command)
+        if "echo OWN" in command:
+            verdict = self.verdicts.pop(0) if self.verdicts else "FREE"
+            return CommandResult(returncode=0, stdout=f"{verdict}\n", stderr="")
+        return CommandResult(returncode=0, stdout="/home/designer" if command == 'getent passwd "$(id -u)" | cut -d: -f6' else "", stderr="")
+
+    def upload_text(self, text: str, remote_path: str, timeout=None) -> CommandResult:
+        self.uploads[remote_path] = text
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+
+def _make_remote_client(port: int) -> SSHClient:
+    client = SSHClient(
+        remote_host="thu-wei",
+        remote_user="designer",
+        port=port,
+        profile="t28_digital",
+    )
+    return client
+
+
+def test_occupancy_cmd_targets_port() -> None:
+    cmd = _remote_port_occupancy_cmd(65061)
+    assert ":65061$" in cmd
+    assert "pgrep" in cmd and "id -un" in cmd
+    assert r"ramic_bridge_daemon_(3|27)\.py.* 65061$" in cmd
+
+
+def test_deconflict_shifts_off_foreign_listener(monkeypatch) -> None:
+    client = _make_remote_client(65061)
+    runner = _ScriptedRunner(["FOREIGN", "FOREIGN", "FREE"])
+    updates: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel._update_env_file",
+        lambda key, value: updates.append((key, value)) or True,
+    )
+
+    changed = client._deconflict_remote_port(runner)
+
+    assert changed
+    assert client._port == 65063
+    assert updates == [("VB_REMOTE_PORT_t28_digital", "65063")]
+
+
+def test_deconflict_keeps_free_and_own_ports(monkeypatch) -> None:
+    updates: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel._update_env_file",
+        lambda key, value: updates.append((key, value)) or True,
+    )
+
+    client = _make_remote_client(65061)
+    assert not client._deconflict_remote_port(_ScriptedRunner(["FREE"]))
+    assert client._port == 65061
+
+    # A port held by this user's own bridge daemon stays ours.
+    client = _make_remote_client(65061)
+    assert not client._deconflict_remote_port(_ScriptedRunner(["OWN"]))
+    assert client._port == 65061
+    assert updates == []
+
+
+def test_deconflict_survives_probe_failure(monkeypatch) -> None:
+    client = _make_remote_client(65061)
+
+    class _BrokenRunner(_ScriptedRunner):
+        def run_command(self, command: str, timeout=None) -> CommandResult:
+            raise RuntimeError("ssh down")
+
+    assert not client._deconflict_remote_port(_BrokenRunner([]))
+    assert client._port == 65061
+
+
+def test_deconflict_untouched_when_probe_output_unrecognized() -> None:
+    client = _make_remote_client(65061)
+    runner = _ScriptedRunner([])
+    runner.verdicts = []  # probes answer FREE (empty script) — fine
+    # A runner returning garbage stdout must keep the configured port.
+    class _GarbageRunner(_ScriptedRunner):
+        def run_command(self, command: str, timeout=None) -> CommandResult:
+            return CommandResult(returncode=0, stdout="", stderr="")
+
+    assert not client._deconflict_remote_port(_GarbageRunner([]))
+    assert client._port == 65061
+
+
+def test_deconflict_gives_up_when_range_exhausted() -> None:
+    client = _make_remote_client(65061)
+    runner = _ScriptedRunner(["FOREIGN"] * 100)
+    assert not client._deconflict_remote_port(runner)
+    assert client._port == 65061
+
+
+def test_ensure_remote_setup_deploys_shifted_port(monkeypatch) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.remote_paths.load_vb_env", lambda: None)
+    monkeypatch.delenv("VB_REMOTE_SCRATCH_ROOT", raising=False)
+    monkeypatch.delenv("VB_CLIENT_ID_t28_digital", raising=False)
+    monkeypatch.setenv("VB_CLIENT_ID", "90590")
+    fake = _ScriptedRunner(["FOREIGN", "FREE"])
+    client = _make_remote_client(65263)
+    client._ssh_runner = fake
+    monkeypatch.setattr(client, "_detect_remote_python", lambda: ("python3", 3, 11))
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel._update_env_file", lambda key, value: True
+    )
+
+    client.ensure_remote_setup()
+
+    setup_path = "/tmp/virtuoso_bridge_designer/90590/virtuoso_bridge_t28_digital/virtuoso_setup.il"
+    setup = fake.uploads[setup_path]
+    # 65263 was FOREIGN -> setup must target the next free port, 65264.
+    assert 'setShellEnvVar("RB_PORT" "65264")' in setup
+    assert client._port == 65264
+
+
+class _TunnelProcess:
+    pid = 43210
+    stderr = None
+
+    @staticmethod
+    def poll():
+        return None
+
+
+class _TunnelRunner:
+    def __init__(self) -> None:
+        self.tunnel_pid = None
+        self.start_calls: list[tuple[int, int]] = []
+
+    @property
+    def is_tunnel_alive(self) -> bool:
+        return False
+
+    def start_port_forward(self, port, settle=1.5, *, remote_port=None):
+        self.start_calls.append((port, remote_port))
+        self.tunnel_pid = _TunnelProcess.pid
+        return _TunnelProcess()
+
+
+def test_ensure_tunnel_skips_unknown_local_listener(monkeypatch) -> None:
+    client = SSHClient(
+        remote_host="thu-wei",
+        remote_user="designer",
+        port=65061,
+        local_port=65061,
+        profile="t28",
+    )
+    runner = _TunnelRunner()
+    client._ssh_runner = runner
+    monkeypatch.setattr(client, "read_state", lambda profile=None, **_: None)
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel.SSHRunner.can_reach_port",
+        lambda port: port == 65061,
+    )
+    updates: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel._update_env_file",
+        lambda key, value: updates.append((key, value)) or True,
+    )
+
+    client.ensure_tunnel()
+
+    assert runner.start_calls == [(65062, 65061)]
+    assert client.port == 65062
+    assert client.remote_port == 65061
+    assert updates == [("VB_LOCAL_PORT_t28", "65062")]
+
+
+@pytest.mark.parametrize("saved_port", [65062, 65085, None, ""])
+def test_ensure_tunnel_reuses_only_matching_managed_listener(monkeypatch, saved_port) -> None:
+    client = SSHClient(
+        remote_host="thu-wei",
+        remote_user="designer",
+        port=65062,
+        local_port=65061,
+        profile="t28",
+    )
+    runner = _TunnelRunner()
+    client._ssh_runner = runner
+    monkeypatch.setattr(
+        client,
+        "read_state",
+        lambda profile=None, **_: {
+            "mode": "remote",
+            "port": 65061,
+            "remote_port": saved_port,
+            "daemon_host": "thu-wei",
+            "tunnel_pid": 9876,
+        },
+    )
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel._pid_is_alive",
+        lambda pid: pid == 9876,
+    )
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel.SSHRunner.can_reach_port",
+        lambda port: port == 65061,
+    )
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel._update_env_file", lambda *a: True)
+
+    client.ensure_tunnel()
+
+    if saved_port == 65062:
+        assert runner.tunnel_pid == 9876
+        assert runner.start_calls == []
+    else:
+        assert runner.start_calls == [(65062, 65062)]
+
+
+@pytest.mark.parametrize("discover", [False, True])
+def test_legacy_tunnel_is_not_reused_even_with_fixed_port(monkeypatch, discover) -> None:
+    client = SSHClient(
+        remote_host="thu-wei",
+        remote_user="designer",
+        port=65062,
+        local_port=65061,
+        profile="t28",
+        discover_instances=discover,
+    )
+    runner = _TunnelRunner()
+    client._ssh_runner = runner
+    monkeypatch.setattr(
+        client,
+        "read_state",
+        lambda profile=None, **_: {
+            "mode": "remote",
+            "port": 65061,
+            "daemon_host": "thu-wei",
+            "tunnel_pid": 9876,
+        },
+    )
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel._pid_is_alive", lambda pid: pid == 9876)
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel._update_env_file", lambda *a: True)
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel.SSHRunner.can_reach_port",
+        lambda port: port == 65061,
+    )
+
+    client.ensure_tunnel()
+
+    assert runner.start_calls == [(65062, 65062)]
+    assert client.port == 65062
+
+
+def test_active_runner_is_rechecked_when_selected_port_changes(monkeypatch):
+    client = SSHClient(remote_host="eda", port=34713, local_port=65082,
+                       discover_instances=True, keep_remote_files=True)
+    runner = client.ssh_runner
+    forwards = []
+    occupied = set()
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._pid_is_alive", lambda pid: True)
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHRunner.can_reach_port",
+                        lambda port: port in occupied)
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel._update_env_file", lambda *a: True)
+    monkeypatch.setattr(client, "read_state", lambda *a, **kw: None)
+    def start(port, settle, *, remote_port):
+        forwards.append((port, remote_port))
+        occupied.add(port)
+        runner.tunnel_pid = 100 + len(forwards)
+        return SimpleNamespace(pid=runner.tunnel_pid, poll=lambda: None)
+    monkeypatch.setattr(runner, "start_port_forward", start)
+    client.ensure_tunnel()
+    client.ensure_tunnel()
+    assert forwards == [(65082, 34713)]
+    client._port = 40109
+    assert not client.is_tunnel_alive  # the SSH process lives, but serves another port
+    client.ensure_tunnel()
+    assert forwards == [(65082, 34713), (65083, 40109)]
+    assert occupied == {65082, 65083}  # no old forward was terminated
+    assert client.is_tunnel_alive
+
+    # A subsequent stop must not signal an attached forward for another target.
+    client._port = 41000
+    stopped = []
+    monkeypatch.setattr(runner, "stop_port_forward", lambda: stopped.append(runner.tunnel_pid))
+    monkeypatch.setattr(client, "_clear_state", lambda: None)
+    monkeypatch.setattr(client, "close", lambda: None)
+    client.stop()
+    assert stopped == [None]
+
+
+def test_remote_running_state_requires_pid_endpoint_and_reachable_port(monkeypatch) -> None:
+    state = {
+        "mode": "remote",
+        "port": 65061,
+        "remote_port": 65062,
+        "tunnel_pid": 9876,
+    }
+    monkeypatch.setattr(SSHClient, "read_state", staticmethod(lambda profile=None, **_: state))
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel._pid_is_alive", lambda pid: pid == 9876)
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel.SSHRunner.can_reach_port",
+        lambda port: port == 65061,
+    )
+
+    assert SSHClient.is_running("t28")
+
+    state.pop("remote_port")
+    assert not SSHClient.is_running("t28")
+
+    state["remote_port"] = "not-a-port"
+    assert not SSHClient.is_running("t28")
+
+
+def test_save_state_records_remote_daemon_port(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel.legacy_cache_state_file",
+        lambda profile=None: tmp_path / "legacy.json",
+    )
+    client = SSHClient(
+        remote_host="thu-wei",
+        remote_user="designer",
+        port=65062,
+        local_port=65061,
+        profile="t28",
+    )
+    client._ssh_runner = SimpleNamespace(tunnel_pid=9876)
+
+    client.save_state()
+
+    state = SSHClient.read_state("t28")
+    assert state is not None
+    assert state["port"] == 65061
+    assert state["remote_port"] == 65062
+
+
+def test_start_hint_uses_distinct_local_and_remote_ports(monkeypatch, capsys) -> None:
+    class _FakeSSHClient:
+        port = 65061
+        remote_port = 65062
+
+        @staticmethod
+        def is_running(profile=None):
+            return False
+
+        @classmethod
+        def from_env(cls, **_kwargs):
+            return cls()
+
+        def warm(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+    monkeypatch.setattr(
+        cli,
+        "remote_host_roles_from_os",
+        lambda profile, load=False: SimpleNamespace(daemon_host="thu-wei"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "remote_ssh_env_from_os",
+        lambda profile: SimpleNamespace(
+            remote_host="thu-wei",
+            remote_user="designer",
+            jump_host=None,
+            jump_user=None,
+        ),
+    )
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(cli, "_wait_for_tunnel_running", lambda profile: False)
+
+    rc = cli._start_one_profile("t28")
+
+    assert rc == 1
+    assert "-L 65061:127.0.0.1:65062" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("daemon_host", ["eda-host", "localhost"])
+@pytest.mark.parametrize("elapsed", [1, 12])
+def test_start_prints_the_ciw_load_line(monkeypatch, capsys, daemon_host, elapsed) -> None:
+    setup_path = "/tmp/virtuoso_bridge_designer/virtuoso_bridge/virtuoso_setup.il"
+
+    class _FakeSSHClient:
+        port = 65061
+        remote_port = 65062
+
+        @staticmethod
+        def is_running(profile=None):
+            return False
+
+        @staticmethod
+        def read_state(profile=None):
+            return {"port": 65061, "setup_path": setup_path}
+
+        @classmethod
+        def from_env(cls, **_kwargs):
+            return cls()
+
+        def warm(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+    monkeypatch.setattr(
+        cli,
+        "remote_host_roles_from_os",
+        lambda profile, load=False: SimpleNamespace(daemon_host=daemon_host),
+    )
+    monkeypatch.setattr(cli, "_wait_for_tunnel_running", lambda profile: True)
+    times = iter([0, elapsed])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(times))
+
+    assert cli._start_one_profile(None) == 0
+    output = capsys.readouterr().out
+    assert f'Load in Virtuoso CIW: load("{setup_path}")' in output
+    assert ("reverse DNS" in output) == (daemon_host != "localhost" and elapsed >= 10)
+    if "reverse DNS" in output:
+        assert "If plain SSH" in output
+
+
+def test_wait_for_tunnel_running_retries_during_startup(monkeypatch) -> None:
+    checks = iter([False, True])
+
+    class _FakeSSHClient:
+        @staticmethod
+        def is_running(profile=None):
+            assert profile == "t28"
+            return next(checks)
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+    assert cli._wait_for_tunnel_running("t28", timeout=5)
+
+
+def test_daemon_listens_on_loopback_unless_listen_all_is_set(monkeypatch) -> None:
+    from virtuoso_bridge.transport.tunnel import _find_ramic_bridge_il, _generate_virtuoso_setup_il
+
+    il = _find_ramic_bridge_il().read_text(encoding="utf-8")
+    assert 'RBLocal = getShellEnvVar("RB_LISTEN_ALL") != "1"' in il
+    assert 'setShellEnvVar("RB_LISTEN_ALL" "0")' in _generate_virtuoso_setup_il("d.py", "b.il")
+    assert 'setShellEnvVar("RB_LISTEN_ALL" "1")' in _generate_virtuoso_setup_il(
+        "d.py", "b.il", listen_all=True
+    )
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHRunner", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setenv("VB_REMOTE_HOST_t28", "eda-host")
+    monkeypatch.delenv("VB_DAEMON_LISTEN_ALL_t28", raising=False)
+    assert SSHClient.from_env(profile="t28")._listen_all is False
+    monkeypatch.setenv("VB_DAEMON_LISTEN_ALL_t28", "1")
+    assert SSHClient.from_env(profile="t28")._listen_all is True
+
+
+@pytest.mark.parametrize("previous, replaced", [
+    ('setShellEnvVar("RB_PORT" "65158")\nload("/tmp/x/ramic_bridge.il")\n', 65158),
+    ('setShellEnvVar("RB_PORT" "65263")\n', None),
+    ("", None),
+])
+def test_deploy_reports_a_replaced_setup_that_used_another_port(monkeypatch, previous, replaced) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.remote_paths.load_vb_env", lambda: None)
+    monkeypatch.delenv("VB_REMOTE_SCRATCH_ROOT", raising=False)
+
+    class _Runner(_FakeRunner):
+        def run_command(self, command: str, timeout=None) -> CommandResult:
+            self.commands.append(command)
+            stdout = previous if command.startswith("cat ") else ("/home/designer" if command == 'getent passwd "$(id -u)" | cut -d: -f6' else "")
+            return CommandResult(returncode=0, stdout=stdout, stderr="")
+
+    client = SSHClient(remote_host="eda-host", remote_user="designer", port=65263, profile="t28")
+    client._ssh_runner = _Runner()
+    monkeypatch.setattr(client, "_detect_remote_python", lambda: ("python3", 3, 11))
+
+    client.ensure_remote_setup()
+
+    assert client.replaced_setup_port == replaced
+
+
+def test_start_warns_when_it_replaced_a_setup_for_another_port(monkeypatch, capsys) -> None:
+    class _FakeSSHClient:
+        port = remote_port = 65177
+        setup_path = "/tmp/virtuoso_bridge_designer/virtuoso_bridge/virtuoso_setup.il"
+        replaced_setup_port = 65158
+
+        @staticmethod
+        def is_running(profile=None):
+            return False
+
+        @staticmethod
+        def read_state(profile=None):
+            return {"port": 65177, "setup_path": _FakeSSHClient.setup_path}
+
+        @classmethod
+        def from_env(cls, **_kwargs):
+            return cls()
+
+        def warm(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+    monkeypatch.setattr(
+        cli, "remote_host_roles_from_os", lambda profile, load=False: SimpleNamespace(daemon_host="eda-host"),
+    )
+    monkeypatch.setattr(cli, "_wait_for_tunnel_running", lambda profile: True)
+
+    assert cli._start_one_profile(None) == 0
+    out = capsys.readouterr().out
+    assert "[warning] This replaced /tmp/virtuoso_bridge_designer/virtuoso_bridge/virtuoso_setup.il" in out
+    assert "port 65158" in out and "now uses port 65177" in out
+
+
+def test_restart_exits_nonzero_when_the_daemon_restart_fails(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_start_one", lambda: 0)
+    monkeypatch.setattr(cli, "_restart_daemon_one", lambda profile: False)
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel.SSHClient",
+        SimpleNamespace(is_running=lambda profile=None: False),
+    )
+
+    assert cli._restart_one() == 1
+
+
+@pytest.mark.parametrize("caps, text", [
+    ({"lane": {"state": "idle"}}, ""),
+    (None, ""),
+    ({"server_time_ms": 50_000, "lane": {"state": "busy", "detail": "legacy", "since_ms": 20_000}},
+     "busy for 30 s (legacy)"),
+    ({"server_time_ms": 9_000, "lane": {"state": "resyncing", "since_ms": 2_000,
+                                        "detail": "SKILL did not answer within the request timeout"}},
+     "resyncing for 7 s (SKILL did not answer within the request timeout)"),
+])
+def test_status_describes_a_non_idle_lane(caps, text) -> None:
+    assert cli._describe_lane(caps) == text
+
+
+def test_a_daemon_launched_moments_ago_is_not_killed_as_a_zombie() -> None:
+    """.cdsinit and -restore can load the bridge back to back, before the CIW
+    has read the first daemon's banner; that daemon is still starting."""
+    from virtuoso_bridge.transport.tunnel import _find_ramic_bridge_il
+
+    il = _find_ramic_bridge_il().read_text(encoding="utf-8")
+    start = il[il.index("procedure(RBStart()"):il.index("procedure(RBStop()")]
+    assert "unless(boundp('RBLaunchedAt) RBLaunchedAt = nil)" in il
+    zombie = start[start.index("when(boundp('RBIpc)"):start.index("zombie detected")]
+    assert "compareTime(getCurrentTime() RBLaunchedAt) < RBStartGraceSeconds" in zombie
+    assert start.index("] already starting (launched at") < start.index("running_bind=%s] already running")
+    assert start.index("RBLaunchedAt = getCurrentTime()") < start.index("ipcBeginProcess(")
+
+
+@pytest.mark.parametrize("entrypoint", ["warm", "connect_instance"])
+@pytest.mark.parametrize("spawned", [True, False])
+def test_verification_failure_stops_only_newly_spawned_tunnel(
+    monkeypatch, entrypoint: str, spawned: bool
+) -> None:
+    from tests.test_instance_discovery import row
+
+    stopped: list[bool] = []
+
+    class _FakeVerifyRunner:
+        persistent_shell_enabled = False
+        is_tunnel_alive = True
+        tunnel_pid = 43210
+
+        def stop_port_forward(self) -> None:
+            stopped.append(True)
+
+        def close(self) -> None:
+            pass
+
+    client = SSHClient(remote_host="eda-host", remote_user="designer", port=65001, local_port=65100)
+    runner = _FakeVerifyRunner()
+    client._ssh_runner = runner
+    client._deployment_runner = runner
+    client._role_runners["daemon"] = runner
+    client._tunnel_endpoint = (65100, 65001, 43210)
+    monkeypatch.setattr(client, "ensure_remote_setup", lambda: None)
+    monkeypatch.setattr(client, "ensure_daemon_token", lambda: "ab" * 32)
+    monkeypatch.setattr(client, "read_daemon_token", lambda: "ab" * 32)
+    monkeypatch.setattr(client, "probe_daemon_endpoint_hostname", lambda: "eda-host")
+    monkeypatch.setattr(client, "ensure_tunnel", lambda: spawned)
+    monkeypatch.setattr(client, "save_state", lambda: pytest.fail("state must not be saved"))
+
+    def fail_verify(_timeout: int) -> None:
+        raise RuntimeError("daemon handshake rejected")
+
+    monkeypatch.setattr(client, "_verify_discovered_instance", fail_verify)
+    monkeypatch.setattr(client, "verify_instance", fail_verify)
+
+    with pytest.raises(RuntimeError, match="daemon handshake rejected"):
+        if entrypoint == "warm":
+            client.warm()
+        else:
+            client.connect_instance(row(65001))
+
+    if spawned:
+        assert stopped == [True]
+        assert client._tunnel_endpoint is None
+    else:
+        assert stopped == []
+
+
+def test_save_state_records_tunnel_identity_and_stop_refuses_mismatched_pid(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import subprocess
+    import sys
+    from virtuoso_bridge.transport import ssh as ssh_mod, tunnel
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel.legacy_cache_state_file",
+        lambda profile=None: tmp_path / "legacy.json",
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time; print('ready', flush=True); time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "ready"
+        client = SSHClient(
+            remote_host="eda-host",
+            remote_user="designer",
+            port=65062,
+            local_port=65061,
+            profile="idtest",
+        )
+        client._ssh_runner._tunnel_pid = proc.pid
+        client.save_state()
+
+        state = SSHClient.read_state("idtest", target=client.target)
+        assert state is not None
+        assert isinstance(state.get("tunnel_identity"), dict)
+        inspected = SSHClient.inspect_states("idtest")
+        assert any(row.get("birth_identity_saved") is True for row in inspected)
+
+        # Case 1: saved tunnel_identity does not match the live process (PID reuse).
+        mismatched = dict(state, tunnel_identity={**state["tunnel_identity"], "start_time": "stale-start"})
+        state_path = tunnel._state_file("idtest", client.target)
+        tunnel._write_private_json(state_path, mismatched)
+
+        killed: list[int] = []
+        real_kill = os.kill
+
+        def spy_kill(pid: int, sig: int) -> None:
+            if sig != 0:
+                killed.append(pid)
+            real_kill(pid, sig)
+
+        monkeypatch.setattr(ssh_mod.os, "kill", spy_kill)
+
+        fresh = SSHClient(
+            remote_host="eda-host",
+            remote_user="designer",
+            port=65062,
+            local_port=65061,
+            profile="idtest",
+        )
+        fresh.stop()
+        assert proc.poll() is None
+        assert proc.pid not in killed
+
+        # Case 2: legacy state without tunnel_identity pointing at a non-ssh process.
+        legacy_state = {k: v for k, v in state.items() if k != "tunnel_identity"}
+        tunnel._write_private_json(state_path, legacy_state)
+        fresh2 = SSHClient(
+            remote_host="eda-host",
+            remote_user="designer",
+            port=65062,
+            local_port=65061,
+            profile="idtest",
+        )
+        fresh2.stop()
+        assert proc.poll() is None
+        assert proc.pid not in killed
+
+        # Case 3: matching tunnel_identity is stopped cleanly.
+        tunnel._write_private_json(state_path, state)
+        fresh3 = SSHClient(
+            remote_host="eda-host",
+            remote_user="designer",
+            port=65062,
+            local_port=65061,
+            profile="idtest",
+        )
+        fresh3.stop()
+        assert proc.pid in killed
+        assert proc.wait(timeout=5) is not None
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+def test_identity_looks_like_ssh_tunnel_filters_non_tunnel_processes() -> None:
+    from virtuoso_bridge.transport.ssh import _identity_looks_like_ssh_tunnel
+
+    assert _identity_looks_like_ssh_tunnel(
+        {
+            "platform": "posix",
+            "start_time": "Thu Nov 26 11:00:00 2026",
+            "argv0": "/usr/bin/ssh",
+            "command": "/usr/bin/ssh -o ExitOnForwardFailure=yes -N -L 65061:127.0.0.1:65062 designer@eda",
+        },
+        local_port=65061,
+        remote_port=65062,
+    )
+    assert not _identity_looks_like_ssh_tunnel(
+        {
+            "platform": "posix",
+            "start_time": "Thu Nov 26 11:00:00 2026",
+            "argv0": "/usr/bin/ssh",
+            "command": "/usr/bin/ssh -o ExitOnForwardFailure=yes -N -L 65999:127.0.0.1:65062 designer@eda",
+        },
+        local_port=65061,
+        remote_port=65062,
+    )
+    assert not _identity_looks_like_ssh_tunnel(
+        {
+            "platform": "posix",
+            "start_time": "Thu Nov 26 11:00:00 2026",
+            "argv0": "ssh",
+            "command": "ssh designer@eda",
+        },
+        local_port=65061,
+        remote_port=65062,
+    )
+    assert not _identity_looks_like_ssh_tunnel(
+        {
+            "platform": "posix",
+            "start_time": "Thu Nov 26 11:00:00 2026",
+            "argv0": "python3",
+            "command": "python3 -c 'import time; time.sleep(30)'",
+        },
+        local_port=65061,
+        remote_port=65062,
+    )
+    assert _identity_looks_like_ssh_tunnel(
+        {"platform": "nt", "start_time": "12345", "image": r"C:\Windows\System32\OpenSSH\ssh.exe"},
+        local_port=65061,
+        remote_port=65062,
+    )
+    assert not _identity_looks_like_ssh_tunnel(
+        {"platform": "nt", "start_time": "12345", "image": r"C:\Python311\python.exe"},
+        local_port=65061,
+        remote_port=65062,
+    )

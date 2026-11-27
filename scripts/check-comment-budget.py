@@ -38,7 +38,7 @@ SKIP_DIRS_ANY = {"node_modules", ".git", "__pycache__"}
 # discipline), the agent-tooling trees, the docs tree, and vendored resources.
 EXCLUDE_DIRS = {
     ".claude", ".agents", ".codex", ".ua", ".evoontology",
-    ".pensieve", ".workbuddy", "docs", "resources",
+    ".pensieve", ".workbuddy", "docs", "resources", "python",
 }
 EXCLUDE_FILE_PREFIXES = ()
 

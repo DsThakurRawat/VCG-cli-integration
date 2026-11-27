@@ -13,10 +13,10 @@ Built from (both MIT-licensed):
   * virtuoso-bridge-lite by Arcadia-1 (Tsinghua University /
     tokenzhang.com)
     https://github.com/Arcadia-1/virtuoso-bridge-lite
-    Used as the second bridge via the patch in
-    docs/integration/bridge-lite-vai-lock.patch. If you use
-    virtuoso-bridge in academic work, cite Zhang et al. 2025
-    (see upstream CITATION.cff).
+    Vendored in python/ (MIT license retained in python/LICENSE) with
+    the cross-bridge lock applied in-tree; see python/VENDORED.md.
+    If you use virtuoso-bridge in academic work, cite Zhang et al. 2025
+    (see python/CITATION.cff).
 
 Both upstream projects descend from the same "RAMIC Bridge" SKILL daemon,
 which is exactly why they collide when loaded into one Virtuoso session;

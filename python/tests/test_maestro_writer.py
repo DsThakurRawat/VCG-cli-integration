@@ -1,0 +1,646 @@
+from __future__ import annotations
+
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from virtuoso_bridge.virtuoso.maestro import (
+    add_output,
+    create_netlist_for_corner,
+    run_and_wait,
+    run_simulation,
+)
+from virtuoso_bridge.virtuoso.maestro import MaestroOps
+from virtuoso_bridge.virtuoso.maestro import writer
+from virtuoso_bridge.virtuoso.maestro.writer import _without_history_name_form
+from virtuoso_bridge.models import ExecutionStatus, VirtuosoResult
+from virtuoso_bridge.virtuoso.dialogs import DialogBlockedError
+from virtuoso_bridge.virtuoso.requests import RequestHandle, RequestRecoveryError
+
+
+class _RecordingClient:
+    def __init__(self) -> None:
+        self.expressions: list[str] = []
+        self.skill_kwargs: list[dict] = []
+        self.ssh_runner = None
+
+    def execute_skill(self, expression: str, **kwargs):
+        self.expressions.append(expression)
+        self.skill_kwargs.append(kwargs)
+        return SimpleNamespace(errors=[], output="t")
+
+
+def test_create_netlist_for_corner_uses_current_session_by_default() -> None:
+    client = _RecordingClient()
+
+    result = create_netlist_for_corner(
+        client,
+        "tran_test",
+        "tt",
+        "/tmp/tran_tt",
+    )
+
+    assert result == "t"
+    assert client.expressions == [
+        'maeCreateNetlistForCorner("tran_test" "tt" "/tmp/tran_tt")'
+    ]
+
+
+def test_add_output_escapes_all_skill_string_parameters() -> None:
+    client = _RecordingClient()
+
+    add_output(
+        client,
+        'Pin"\\HB',
+        'hb"\\1tone',
+        output_type='point"\\type',
+        signal_name='VIN"\\PLUS',
+        expr='harmonic(pvi(\'hb, "\\/IN_PORT", 0, "/VIN/PLUS", 0), 1)',
+        session='session"\\3',
+    )
+
+    assert client.expressions == [
+        'maeAddOutput("Pin\\"\\\\HB" "hb\\"\\\\1tone" '
+        '?outputType "point\\"\\\\type" ?signalName "VIN\\"\\\\PLUS" '
+        '?expr "harmonic(pvi(\'hb, \\"\\\\/IN_PORT\\", 0, \\"/VIN/PLUS\\", 0), 1)" '
+        '?session "session\\"\\\\3")'
+    ]
+
+
+def test_run_simulation_forwards_timeout_to_skill_request() -> None:
+    client = _RecordingClient()
+
+    run_simulation(client, session='session"\\3', callback='done"\\callback', timeout=90)
+
+    assert client.expressions == [
+        _without_history_name_form(
+            'maeRunSimulation(?session "session\\"\\\\3" ?callback "done\\"\\\\callback")'
+        )
+    ]
+    assert client.skill_kwargs == [{"timeout": 90}]
+
+
+def test_run_simulation_passes_explicit_run_mode() -> None:
+    client = _RecordingClient()
+
+    run_simulation(
+        client,
+        session="session4",
+        callback="done",
+        run_mode='Monte Carlo "Sampling"',
+    )
+
+    assert client.expressions == [
+        _without_history_name_form(
+            'maeRunSimulation(?session "session4" ?callback "done" '
+            '?runMode "Monte Carlo \\"Sampling\\"")'
+        )
+    ]
+
+
+def test_run_and_wait_uses_one_timeout_budget(monkeypatch) -> None:
+    client = _RecordingClient()
+    clock = [100.0]
+    start_timeouts: list[float] = []
+    wait_timeouts: list[float] = []
+
+    def fake_run_simulation(*args, **kwargs):
+        start_timeouts.append(kwargs["timeout"])
+        clock[0] += 12
+        return '"Interactive.1"'
+
+    def fake_wait(*args, **kwargs):
+        wait_timeouts.append(kwargs["timeout"])
+        return "done"
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(writer, "run_simulation", fake_run_simulation)
+    monkeypatch.setattr(writer, "_wait_until_done", fake_wait)
+    monkeypatch.setattr(writer.uuid, "uuid4", lambda: SimpleNamespace(hex="deadbeef"))
+
+    history, status = run_and_wait(client, run_mode="Monte Carlo Sampling", timeout=60)
+
+    assert (history, status) == ('"Interactive.1"', "done")
+    assert start_timeouts == [60]
+    assert wait_timeouts == [48]
+
+
+def test_completion_wait_timeout_keeps_acknowledged_run(monkeypatch) -> None:
+    client = _RecordingClient()
+    monkeypatch.setattr(writer, "run_simulation", lambda *a, **kw: '"Interactive.11"')
+    monkeypatch.setattr(writer, "_wait_until_done", lambda *a, **kw:
+                        (_ for _ in ()).throw(TimeoutError("completion timed out")))
+    monkeypatch.setattr(writer.uuid, "uuid4", lambda: SimpleNamespace(hex="deadbeef"))
+    # Existing callers catch TimeoutError; the recovery receipt is additive.
+    with pytest.raises(TimeoutError) as caught:
+        run_and_wait(client, session="amp", timeout=60)
+    assert isinstance(caught.value, writer.MaestroCompletionUnknown)
+    metadata = caught.value.result.metadata
+    assert metadata["outcome"] == "unknown"
+    assert metadata["history"] == "Interactive.11"
+    assert metadata["session"] == "amp"
+    assert metadata["completion_marker"] == "/tmp/vb_sim_done_deadbeef"
+    assert metadata["simulation_start_sent"] is True
+
+
+def test_wait_until_done_caps_remote_poll_and_sleep_to_budget(monkeypatch) -> None:
+    clock = [100.0]
+    command_timeouts: list[float] = []
+    sleeps: list[float] = []
+
+    class _Runner:
+        def run_command(self, _command, *, timeout):
+            command_timeouts.append(timeout)
+            return SimpleNamespace(returncode=1, stdout="")
+
+    client = SimpleNamespace(ssh_runner=_Runner())
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+
+    with pytest.raises(TimeoutError, match=r"within 3s"):
+        writer._wait_until_done(client, "/tmp/missing-marker", timeout=3)
+
+    assert command_timeouts == [3, 1]
+    assert sleeps == [2, 1]
+
+
+def test_create_netlist_for_corner_passes_explicit_session() -> None:
+    client = _RecordingClient()
+
+    create_netlist_for_corner(
+        client,
+        "tran_test",
+        "tt",
+        "/tmp/tran_tt",
+        session="session3",
+    )
+
+    assert client.expressions == [
+        'maeCreateNetlistForCorner("tran_test" "tt" "/tmp/tran_tt" '
+        '?session "session3")'
+    ]
+
+
+def test_create_netlist_for_corner_session_is_keyword_only() -> None:
+    client = _RecordingClient()
+
+    with pytest.raises(TypeError):
+        create_netlist_for_corner(
+            client,
+            "tran_test",
+            "tt",
+            "/tmp/tran_tt",
+            "session3",
+        )
+
+
+def test_maestro_ops_passes_explicit_session_to_corner_netlist_export() -> None:
+    client = _RecordingClient()
+
+    MaestroOps(client).create_netlist_for_corner(
+        "tran_test",
+        "tt",
+        "/tmp/tran_tt",
+        session="session3",
+    )
+
+    assert client.expressions == [
+        'maeCreateNetlistForCorner("tran_test" "tt" "/tmp/tran_tt" '
+        '?session "session3")'
+    ]
+
+
+def test_run_turns_off_the_history_name_form_for_that_call_only() -> None:
+    # A site setting can open a modal "Specify History Name" form before
+    # every run; nothing answers it for a programmatic run.
+    skill = _without_history_name_form("maeRunSimulation()")
+    tool_var = '"adexl.historyNamePrefix" "showNameHistoryForm"'
+
+    probe = f"isCallable('envIsVal) && envIsVal({tool_var} t) && envGetVal({tool_var})"
+    off = f"when(vbFormOn envSetVal({tool_var} 'boolean nil))"
+    run = "vbRun = errset(maeRunSimulation() t)"
+    restore = f"when(vbFormOn envSetVal({tool_var} 'boolean t))"
+    assert probe in skill
+    # Restored after the call whether or not it failed, before any error.
+    assert skill.index(off) < skill.index(run) < skill.index(restore) < skill.index("error(")
+    assert skill.endswith("car(vbRun))")
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_start_error_keeps_marker_and_original_recovery_error(monkeypatch, recovery):
+    client = _RecordingClient()
+    result = VirtuosoResult(status=ExecutionStatus.ERROR, errors=["socket error"],
+                            metadata={"request_sent": None, "outcome": "unknown",
+                                      "dialog_guard": {"status": "blocked"}})
+    if recovery:
+        result.metadata["request_handle"] = RequestHandle(
+            request_id="a" * 32, daemon_instance="b" * 32, virtuoso_pid=42).model_dump()
+        original = RequestRecoveryError(result)
+    else:
+        original = DialogBlockedError(result)
+    starts = []
+    def start(*a, **kw):
+        starts.append(kw)
+        raise original
+    monkeypatch.setattr(writer, "run_simulation", start)
+    monkeypatch.setattr(writer, "_remove_marker", lambda *a: None)
+    with pytest.raises(type(original)) as caught:
+        run_and_wait(client, session="session1", timeout=30)
+    assert caught.value is original
+    assert len(starts) == 1
+    assert result.metadata["completion_marker"].startswith("/tmp/vb_sim_done_")
+    assert result.metadata["session"] == "session1"
+    assert result.metadata["simulation_start_sent"] is None
+
+
+@pytest.mark.parametrize("status", ["clear", "blocked", "indeterminate"])
+@pytest.mark.parametrize("error_type", [ConnectionError, TimeoutError])
+def test_start_transport_error_inspects_only_enabled_guard(monkeypatch, status, error_type):
+    original = error_type("socket reset")
+    calls = []
+    def annotate(result, timeout):
+        calls.append(timeout)
+        result.metadata["dialog_guard"] = {"status": status}
+        return result
+    client = _RecordingClient()
+    client.dialogs = SimpleNamespace(enabled=True, annotate_failure=annotate)
+    def failed(*a, **kw):
+        raise original
+    monkeypatch.setattr(client, "execute_skill", failed)
+    with pytest.raises(error_type) as caught:
+        run_simulation(client, session="amp", timeout=30)
+    assert caught.value is original
+    assert len(calls) == 1 and 0 < calls[0] <= 5
+    assert caught.value.result.metadata["simulation_start_sent"] is None
+    assert caught.value.result.metadata["session"] == "amp"
+
+
+@pytest.mark.parametrize("status", ["clear", "blocked", "indeterminate"])
+def test_completion_transport_error_carries_dialog_and_acknowledged_run(monkeypatch, status):
+    client = _RecordingClient()
+    def annotate(result, timeout):
+        assert 0 < timeout <= 5
+        result.metadata["dialog_guard"] = {"status": status}
+        return result
+    client.dialogs = SimpleNamespace(enabled=True, annotate_failure=annotate)
+    monkeypatch.setattr(writer, "run_simulation", lambda *a, **k: '"Interactive.17"')
+    monkeypatch.setattr(writer, "_remove_marker", lambda *a: None)
+    original = ConnectionError("poll transport lost")
+    def poll(*a, **kw):
+        raise original
+    monkeypatch.setattr(writer, "_wait_until_done", poll)
+    with pytest.raises(TimeoutError) as caught:
+        run_and_wait(client, session="amp", timeout=30)
+    assert isinstance(caught.value, writer.MaestroCompletionUnknown)
+    assert caught.value.__cause__ is original
+    metadata = caught.value.result.metadata
+    assert metadata["dialog_guard"]["status"] == status
+    assert metadata["history"] == "Interactive.17"
+    assert metadata["simulation_start_sent"] is True
+    assert metadata["phase"] == "completion_wait"
+    assert metadata["outcome"] == "unknown"
+
+
+def test_start_preserves_third_party_exception_result_attribute(monkeypatch):
+    client = _RecordingClient()
+    original = ConnectionError("transport unavailable")
+    original.result = {"backend": "custom"}
+    def failed(*a, **kw):
+        raise original
+    monkeypatch.setattr(client, "execute_skill", failed)
+    with pytest.raises(ConnectionError) as caught:
+        run_simulation(client, session="amp", timeout=30)
+    assert caught.value is original
+    assert original.result == {"backend": "custom"}
+    assert original.virtuoso_result.metadata["session"] == "amp"
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_start_diagnostics_cannot_mask_read_only_exception(monkeypatch, frozen):
+    class ReadOnlyResult(ConnectionError):
+        @property
+        def result(self):
+            return None
+    class FrozenError(ConnectionError):
+        def __setattr__(self, name, value):
+            raise AttributeError("exception is frozen")
+    original = FrozenError("transport unavailable") if frozen else ReadOnlyResult("transport unavailable")
+    client = _RecordingClient()
+    def failed(*a, **kw):
+        raise original
+    monkeypatch.setattr(client, "execute_skill", failed)
+    with pytest.raises(ConnectionError) as caught:
+        run_simulation(client, session="amp", timeout=30)
+    assert caught.value is original
+    if not frozen:
+        assert original.result is None
+        assert original.virtuoso_result.metadata["session"] == "amp"
+
+
+def test_start_guard_refusal_preserves_not_started_and_does_not_inspect_twice(monkeypatch):
+    client = _RecordingClient()
+    client.dialogs = SimpleNamespace(enabled=True, annotate_failure=lambda *a, **kw:
+                                    pytest.fail("existing evidence must be preserved"))
+    result = VirtuosoResult(status=ExecutionStatus.ERROR, errors=["blocked"], metadata={
+        "dialog_guard": {"status": "blocked"}, "request_sent": False, "outcome": "not_started"})
+    monkeypatch.setattr(client, "execute_skill", lambda *a, **kw: result)
+    with pytest.raises(DialogBlockedError) as caught:
+        run_and_wait(client, session="amp", timeout=30)
+    assert caught.value.result.metadata["simulation_start_sent"] is False
+    assert caught.value.result.metadata["outcome"] == "not_started"
+
+
+def test_failed_diagnostic_inspection_does_not_mask_or_repeat_start_error(monkeypatch):
+    client = _RecordingClient()
+    inspections = []
+    def annotate(*a, **kw):
+        inspections.append(kw)
+        raise ConnectionError("inspection unavailable")
+    client.dialogs = SimpleNamespace(enabled=True, annotate_failure=annotate)
+    original = ConnectionError("start socket reset")
+    def execute(expression, **kw):
+        if "maeRunSimulation" in expression:
+            raise original
+        return VirtuosoResult(status=ExecutionStatus.SUCCESS, output="t")
+    monkeypatch.setattr(client, "execute_skill", execute)
+    monkeypatch.setattr(writer, "_remove_marker", lambda *a: None)
+    with pytest.raises(ConnectionError) as caught:
+        run_and_wait(client, session="amp", timeout=30)
+    assert caught.value is original
+    assert len(inspections) == 1
+    assert original.result.metadata["dialog_inspection_error"] == "inspection unavailable"
+    assert original.result.metadata["completion_marker"].startswith("/tmp/vb_sim_done_")
+
+
+def test_new_inspection_updates_existing_recovery_exception_fields(monkeypatch):
+    client = _RecordingClient()
+    result = VirtuosoResult(status=ExecutionStatus.ERROR, errors=["socket reset"], metadata={
+        "request_handle": RequestHandle(request_id="a" * 32, daemon_instance="b" * 32,
+                                        virtuoso_pid=42).model_dump(),
+        "request_sent": None, "outcome": "unknown"})
+    original = RequestRecoveryError(result)
+    handle = original.handle
+    def annotate(result, timeout):
+        result.metadata["dialog_guard"] = {"status": "blocked"}
+    client.dialogs = SimpleNamespace(enabled=True, annotate_failure=annotate)
+    def failed(*a, **kw):
+        raise original
+    monkeypatch.setattr(client, "execute_skill", failed)
+    with pytest.raises(RequestRecoveryError) as caught:
+        run_simulation(client, timeout=30)
+    assert caught.value is original
+    assert original.handle == handle
+    assert original.inspection == {"status": "blocked"}
+    assert original.outcome == original.result.metadata["outcome"] == "unknown"
+
+
+def test_budget_exhausted_before_start_is_definitely_not_started(monkeypatch):
+    client = _RecordingClient()
+    clock = [0.0]
+    def setup(*a, **kw):
+        clock[0] = 31
+        return "t"
+    monkeypatch.setattr(writer.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(writer, "_q", setup)
+    monkeypatch.setattr(writer, "_remove_marker", lambda *a: None)
+    monkeypatch.setattr(writer, "run_simulation", lambda *a, **kw: pytest.fail("no budget to start"))
+    with pytest.raises(TimeoutError) as caught:
+        run_and_wait(client, session="amp", timeout=30)
+    metadata = caught.value.result.metadata
+    assert metadata["simulation_start_sent"] is False
+    assert metadata["request_sent"] is False
+    assert metadata["outcome"] == "not_started"
+
+
+def test_budget_exhausted_before_callback_setup_is_definitely_not_started(monkeypatch):
+    client = _RecordingClient()
+    client.dialogs = SimpleNamespace(
+        enabled=True,
+        annotate_failure=lambda *a, **kw: pytest.fail("unsent request needs no inspection"),
+    )
+    clock = [0.0]
+
+    def prepare_marker(*args):
+        clock[0] = 31.0
+
+    monkeypatch.setattr(writer.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(writer, "_remove_marker", prepare_marker)
+    with pytest.raises(TimeoutError) as caught:
+        run_and_wait(client, session="amp", timeout=30)
+
+    assert client.expressions == []
+    metadata = caught.value.result.metadata
+    assert metadata["maestro_phase"] == "callback_setup"
+    assert metadata["session"] == "amp"
+    assert metadata["completion_marker"].startswith("/tmp/vb_sim_done_")
+    assert metadata["simulation_start_sent"] is False
+    assert metadata["request_sent"] is False
+    assert metadata["outcome"] == "not_started"
+
+
+@pytest.mark.parametrize("guard_enabled", [False, True])
+def test_nil_history_retains_context_when_diagnostic_inspection_fails(monkeypatch, guard_enabled):
+    client = _RecordingClient()
+    inspections = []
+    starts = []
+
+    def annotate(*args, **kwargs):
+        inspections.append(kwargs)
+        raise ConnectionError("inspection unavailable")
+
+    def start(*args, **kwargs):
+        starts.append(kwargs)
+        return "nil"
+
+    client.dialogs = SimpleNamespace(enabled=guard_enabled, annotate_failure=annotate)
+    monkeypatch.setattr(writer, "run_simulation", start)
+    monkeypatch.setattr(writer, "_remove_marker", lambda *a: None)
+    monkeypatch.setattr(writer, "_wait_until_done", lambda *a, **kw: pytest.fail("no acknowledged run"))
+    expected_type = DialogBlockedError if guard_enabled else RuntimeError
+    with pytest.raises(expected_type) as caught:
+        run_and_wait(client, session="amp", timeout=30)
+
+    assert type(caught.value) is expected_type
+    assert "no history acknowledged" in str(caught.value)
+    assert len(starts) == 1
+    assert len(inspections) == int(guard_enabled)
+    metadata = caught.value.result.metadata
+    assert metadata["session"] == "amp"
+    assert metadata["completion_marker"].startswith("/tmp/vb_sim_done_")
+    assert metadata["simulation_start_sent"] is True
+    assert metadata["outcome"] == "unknown"
+    if guard_enabled:
+        assert metadata["dialog_inspection_error"] == "inspection unavailable"
+
+
+def test_delete_var_unquotes_default_session_and_escapes_names() -> None:
+    class _SeqClient(_RecordingClient):
+        def __init__(self, responses):
+            super().__init__()
+            self._responses = list(responses)
+
+        def execute_skill(self, expression: str, **kwargs):
+            self.expressions.append(expression)
+            self.skill_kwargs.append(kwargs)
+            return SimpleNamespace(errors=[], output=self._responses.pop(0))
+
+    client = _SeqClient(['"fnxSession0"', "t"])
+    writer.delete_var(client, 'v"1')
+    assert client.expressions == [
+        "car(maeGetSessions())",
+        'axlRemoveElement(axlGetVar(axlGetMainSetupDB("fnxSession0") "v\\"1"))',
+    ]
+
+    client_test = _SeqClient(['"fnxSession0"', "t"])
+    writer.delete_var(client_test, "vdd", test='T"1')
+    assert client_test.expressions == [
+        "car(maeGetSessions())",
+        'axlRemoveElement(axlGetVar(axlGetTest(axlGetMainSetupDB("fnxSession0") "T\\"1") "vdd"))',
+    ]
+
+
+@pytest.mark.parametrize("raw_session", ["nil", "", '""'])
+def test_delete_var_and_setup_corner_raise_when_no_default_session(raw_session: str) -> None:
+    class _NilSessionClient(_RecordingClient):
+        def execute_skill(self, expression: str, **kwargs):
+            self.expressions.append(expression)
+            return SimpleNamespace(errors=[], output=raw_session)
+
+    with pytest.raises(RuntimeError, match="No active Maestro session"):
+        writer.delete_var(_NilSessionClient(), "vdd")
+
+    with pytest.raises(RuntimeError, match="No active Maestro session"):
+        writer.setup_corner(_NilSessionClient(), "tt", model_file="/pdk/model.scs")
+
+
+def test_setup_corner_unquotes_default_session_and_escapes_expressions() -> None:
+    class _SeqClient(_RecordingClient):
+        def __init__(self, responses):
+            super().__init__()
+            self._responses = list(responses)
+
+        def execute_skill(self, expression: str, **kwargs):
+            self.expressions.append(expression)
+            out = self._responses.pop(0) if self._responses else "t"
+            return SimpleNamespace(errors=[], output=out)
+
+    client = _SeqClient(["t", "t", '"fnxSession0"', "t"])
+    writer.setup_corner(
+        client,
+        'tt"25',
+        model_file='/pdk/a"b/model.scs',
+        model_section='tt"sec',
+        variables={"vcm": 'VAR("vdd")/2'},
+    )
+
+    assert client.expressions[0] == 'maeSetCorner("tt\\"25")'
+    assert client.expressions[1] == (
+        'maeSetVar("vcm" "VAR(\\"vdd\\")/2" '
+        '?typeName "corner" ?typeValue \'("tt\\"25"))'
+    )
+    assert client.expressions[2] == "car(maeGetSessions())"
+    assert 'axlGetMainSetupDB("fnxSession0")' in client.expressions[3]
+    assert '""fnxSession0""' not in client.expressions[3]
+    assert 'axlGetCorner(sdb "tt\\"25")' in client.expressions[3]
+    assert 'axlSetModelFile(model "/pdk/a\\"b/model.scs")' in client.expressions[3]
+    assert 'axlSetModelSection(model "tt\\"sec")' in client.expressions[3]
+
+
+def test_writer_escapes_var_expressions_and_preserves_raw_skill_lists() -> None:
+    client = _RecordingClient()
+
+    writer.set_var(
+        client,
+        "vcm",
+        'VAR("vdd")/2',
+        type_name="test",
+        type_value='("IB_PSS")',
+        session='s"1',
+    )
+    writer.set_parameter(
+        client,
+        "cload",
+        'VAR("c0")*2',
+        type_name="corner",
+        type_value='("myCorner")',
+        session='s"1',
+    )
+    writer.set_analysis(
+        client,
+        'T"1',
+        "tran",
+        options='(("stop" "1u"))',
+        session='s"1',
+    )
+    writer.set_env_option(
+        client,
+        'T"1',
+        '(("modelFiles" (("/pdk/m.scs" "tt"))))',
+        session='s"1',
+    )
+    writer.set_sim_option(
+        client,
+        'T"1',
+        '(("temp" "85"))',
+        session='s"1',
+    )
+    writer.set_corner(client, 'c"1', disable_tests='("AC")', session='s"1')
+    writer.load_corners(client, '/tmp/a"b.csv')
+
+    assert client.expressions[0] == (
+        'maeSetVar("vcm" "VAR(\\"vdd\\")/2" '
+        '?typeName "test" ?typeValue \'("IB_PSS") ?session "s\\"1")'
+    )
+    assert client.expressions[1] == (
+        'maeSetParameter("cload" "VAR(\\"c0\\")*2" '
+        '?typeName "corner" ?typeValue `("myCorner") ?session "s\\"1")'
+    )
+    assert 'maeSetAnalysis("T\\"1" "tran" ?enable t ?options `(("stop" "1u")) ?session "s\\"1")' in client.expressions[2]
+    assert 'maeGetTestSession("T\\"1" ?session "s\\"1")' in client.expressions[2]
+    assert client.expressions[3] == (
+        'maeSetEnvOption("T\\"1" ?options `(("modelFiles" (("/pdk/m.scs" "tt")))) ?session "s\\"1")'
+    )
+    assert client.expressions[4] == (
+        'maeSetSimOption("T\\"1" ?options `(("temp" "85")) ?session "s\\"1")'
+    )
+    assert client.expressions[5] == 'maeSetCorner("c\\"1" ?disableTests `("AC") ?session "s\\"1")'
+    assert client.expressions[6] == 'maeLoadCorners("/tmp/a\\"b.csv" ?sections "corners" ?operation "overwrite")'
+
+
+def test_run_and_wait_polls_gui_runner_on_split_host(monkeypatch) -> None:
+    gui_commands: list[str] = []
+    daemon_commands: list[str] = []
+
+    class _GuiRunner:
+        def run_command(self, cmd, *, timeout):
+            gui_commands.append(cmd)
+            if cmd.startswith("cat "):
+                return SimpleNamespace(returncode=0, stdout="done\n")
+            return SimpleNamespace(returncode=0, stdout="")
+
+    class _DaemonRunner:
+        def run_command(self, cmd, *, timeout):
+            daemon_commands.append(cmd)
+            return SimpleNamespace(returncode=1, stdout="")
+
+    client = _RecordingClient()
+    client.gui_runner = _GuiRunner()
+    client.ssh_runner = _DaemonRunner()
+    monkeypatch.setattr(writer, "run_simulation", lambda *a, **kw: '"Interactive.5"')
+    monkeypatch.setattr(writer.uuid, "uuid4", lambda: SimpleNamespace(hex="cafebabe"))
+
+    history, status = run_and_wait(client, session="s1", timeout=10, dialog_check=False)
+
+    assert (history, status) == ('"Interactive.5"', "done")
+    assert daemon_commands == []
+    assert gui_commands == [
+        "rm -f /tmp/vb_sim_done_cafebabe",
+        "cat /tmp/vb_sim_done_cafebabe 2>/dev/null",
+        "rm -f /tmp/vb_sim_done_cafebabe",
+    ]

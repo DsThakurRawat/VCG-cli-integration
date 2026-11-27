@@ -234,10 +234,6 @@ pub fn handle_request(
         return nak_frame(&msg);
     }
 
-    // Cross-bridge serialization (virtuoso-cli-integration): hold the
-    // shared host lock for the whole evaluation so the bridge-lite
-    // daemon and our own X11 GUI path cannot act on this session at
-    // the same moment. See the vai_lock module docs.
     let _vai_guard = crate::vai_lock::acquire();
 
     let started_at_unix = unix_now();

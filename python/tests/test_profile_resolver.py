@@ -1,0 +1,479 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import sys
+
+import pytest
+
+from virtuoso_bridge import cli
+from virtuoso_bridge.models import ExecutionStatus, VirtuosoResult
+from virtuoso_bridge.profile import (
+    bind_venv_profile,
+    clear_venv_profile,
+    resolve_profile,
+    resolve_profile_info,
+    venv_profile_path,
+)
+from virtuoso_bridge.spectre.runner import SpectreSimulator
+from virtuoso_bridge.virtuoso.basic.bridge import VirtuosoClient
+
+
+def _isolate_profile_env(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("VB_PROFILE", raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(
+        "virtuoso_bridge.profile.default_user_env_path",
+        lambda: tmp_path / "missing-user.env",
+    )
+    monkeypatch.setattr(
+        "virtuoso_bridge.profile.get_runtime_env_file",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "virtuoso_bridge.profile.discover_workspace_env_path",
+        lambda: None,
+    )
+
+
+def test_resolve_profile_prefers_explicit(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VB_PROFILE", "from_env")
+
+    info = resolve_profile_info("explicit")
+
+    assert info.profile == "explicit"
+    assert info.source == "explicit"
+
+
+def test_resolve_profile_prefers_environment_over_venv(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    venv = tmp_path / ".venv"
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    bind_venv_profile("from_venv")
+    monkeypatch.setenv("VB_PROFILE", "from_env")
+
+    info = resolve_profile_info()
+
+    assert info.profile == "from_env"
+    assert info.source == "environment"
+
+
+def test_resolve_profile_reads_runtime_env_before_venv(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    runtime_env = tmp_path / "custom.env"
+    runtime_env.write_text("VB_PROFILE=from_runtime\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "virtuoso_bridge.profile.get_runtime_env_file",
+        lambda: runtime_env,
+    )
+    venv = tmp_path / ".venv"
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    bind_venv_profile("from_venv")
+
+    info = resolve_profile_info()
+
+    assert info.profile == "from_runtime"
+    assert info.source == "runtime_env"
+    assert info.path == runtime_env
+
+
+def test_resolve_profile_reads_venv_binding(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    venv = tmp_path / ".venv"
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    binding = bind_venv_profile("t180_io")
+
+    info = resolve_profile_info()
+
+    assert binding == venv / ".virtuoso-bridge-profile"
+    assert info.profile == "t180_io"
+    assert info.source == "venv"
+    assert info.path == binding
+
+
+def test_resolve_profile_reads_user_env_after_venv(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    user_env = tmp_path / "user.env"
+    user_env.write_text("VB_PROFILE=user_default\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "virtuoso_bridge.profile.default_user_env_path",
+        lambda: user_env,
+    )
+
+    assert resolve_profile() == "user_default"
+
+
+def test_resolve_profile_returns_none_without_binding(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+
+    info = resolve_profile_info()
+
+    assert info.profile is None
+    assert info.source == "default"
+
+
+def test_clear_venv_profile_removes_binding(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / ".venv"))
+    path = bind_venv_profile("t28_io")
+
+    cleared = clear_venv_profile()
+
+    assert cleared == path
+    assert not path.exists()
+    assert venv_profile_path() == path
+
+
+def test_venv_profile_path_falls_back_to_sys_prefix(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    venv = tmp_path / ".venv"
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base-python"))
+
+    assert venv_profile_path() == venv / ".virtuoso-bridge-profile"
+
+
+def test_virtuoso_client_from_env_uses_resolved_profile(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / ".venv"))
+    bind_venv_profile("t28_digital")
+    monkeypatch.setattr(
+        "virtuoso_bridge.virtuoso.basic.bridge.load_vb_env",
+        lambda: None,
+    )
+    seen: list[tuple[str, str | None]] = []
+
+    class _FakeSSHClient:
+        @staticmethod
+        def is_running(profile=None):
+            seen.append(("is_running", profile))
+            return True
+
+        @staticmethod
+        def read_state(profile=None):
+            seen.append(("read_state", profile))
+            return {"port": 65501}
+
+        @classmethod
+        def from_env(cls, keep_remote_files=True, profile=None):
+            seen.append(("from_env", profile))
+            return cls()
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+
+    client = VirtuosoClient.from_env()
+
+    assert client.port == 65501
+    assert seen == [
+        ("is_running", "t28_digital"),
+        ("read_state", "t28_digital"),
+        ("from_env", "t28_digital"),
+    ]
+
+
+def test_virtuoso_client_from_env_accepts_role_only_hosts_without_tunnel(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("VB_REMOTE_HOST", raising=False)
+    monkeypatch.setenv("VB_GUI_HOST", "gui-a")
+    monkeypatch.setenv("VB_DAEMON_HOST", "compute-b")
+    monkeypatch.setattr(
+        "virtuoso_bridge.virtuoso.basic.bridge.load_vb_env",
+        lambda: None,
+    )
+    seen: list[tuple[str, str | None]] = []
+
+    class _FakeSSHClient:
+        port = 65432
+
+        @staticmethod
+        def is_running(profile=None):
+            seen.append(("is_running", profile))
+            return False
+
+        @classmethod
+        def from_env(cls, keep_remote_files=True, profile=None):
+            assert keep_remote_files
+            assert not os.environ.get("VB_REMOTE_HOST")
+            assert os.environ["VB_GUI_HOST"] == "gui-a"
+            assert os.environ["VB_DAEMON_HOST"] == "compute-b"
+            seen.append(("from_env", profile))
+            return cls()
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+
+    client = VirtuosoClient.from_env()
+
+    assert client.port == 65432
+    assert seen == [("is_running", None), ("from_env", None)]
+
+
+def test_virtuoso_client_from_env_rejects_cross_user_daemon(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VB_REMOTE_HOST_t28_io", "thu-wei")
+    monkeypatch.setenv("VB_REMOTE_USER_t28_io", "designer")
+    monkeypatch.delenv("VB_ALLOW_CROSS_USER_DAEMON", raising=False)
+    monkeypatch.setattr("virtuoso_bridge.virtuoso.basic.bridge.load_vb_env", lambda: None)
+
+    class _FakeSSHClient:
+        @staticmethod
+        def is_running(profile=None):
+            return True
+
+        @staticmethod
+        def read_state(profile=None):
+            return {"port": 65271}
+
+        @classmethod
+        def from_env(cls, keep_remote_files=True, profile=None):
+            return cls()
+
+    def fake_execute_skill(self, expr, timeout=None):
+        assert expr == 'getShellEnvVar("USER")'
+        return VirtuosoResult(status=ExecutionStatus.SUCCESS, output="other_user")
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+    monkeypatch.setattr(VirtuosoClient, "execute_skill", fake_execute_skill)
+
+    with pytest.raises(RuntimeError, match="daemon Unix user"):
+        VirtuosoClient.from_env(profile="t28_io")
+
+
+def test_virtuoso_client_from_env_allows_cross_user_override(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VB_REMOTE_HOST_t28_io", "thu-wei")
+    monkeypatch.setenv("VB_REMOTE_USER_t28_io", "designer")
+    monkeypatch.setenv("VB_ALLOW_CROSS_USER_DAEMON", "1")
+    monkeypatch.setattr("virtuoso_bridge.virtuoso.basic.bridge.load_vb_env", lambda: None)
+
+    class _FakeSSHClient:
+        @staticmethod
+        def is_running(profile=None):
+            return True
+
+        @staticmethod
+        def read_state(profile=None):
+            return {"port": 65271}
+
+        @classmethod
+        def from_env(cls, keep_remote_files=True, profile=None):
+            return cls()
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+
+    client = VirtuosoClient.from_env(profile="t28_io")
+
+    assert client.port == 65271
+
+
+def test_spectre_simulator_direct_constructor_uses_resolved_profile(monkeypatch, tmp_path) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / ".venv"))
+    bind_venv_profile("t28_io")
+    monkeypatch.setenv("VB_REMOTE_HOST_t28_io", "thu-wei")
+    monkeypatch.setenv("VB_REMOTE_USER_t28_io", "designer")
+    monkeypatch.setenv("VB_SSH_BACKEND_t28_io", "paramiko")
+    monkeypatch.setenv("VB_SSH_MAX_SESSIONS_t28_io", "255")
+    monkeypatch.setenv("VB_SSH_PROXY_t28_io", "socks5://127.0.0.1:10800")
+    monkeypatch.setattr("virtuoso_bridge.spectre.runner.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    captured: dict[str, object] = {}
+
+    class _CapturedRunner:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.spectre.runner.SSHRunner",
+        _CapturedRunner,
+    )
+
+    sim = SpectreSimulator(remote=True)
+    sim._get_ssh_runner()
+
+    assert sim._profile == "t28_io"
+    assert sim._remote_host == "thu-wei"
+    assert sim._remote_user == "designer"
+    assert captured["backend"] == "paramiko"
+    assert captured["max_sessions"] == 255
+    assert captured["proxy_url"] == "socks5://127.0.0.1:10800"
+
+
+def test_spectre_simulator_from_env_preserves_profile_ssh_runner(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VB_REMOTE_HOST_worker", "compute")
+    monkeypatch.setenv("VB_REMOTE_USER_worker", "designer")
+    monkeypatch.setenv("VB_SSH_BACKEND_worker", "paramiko")
+    monkeypatch.setenv("VB_SSH_PROXY_worker", "socks5://127.0.0.1:10800")
+    monkeypatch.setattr("virtuoso_bridge.spectre.runner.load_vb_env", lambda: None)
+    expected_runner = object()
+    calls: list[tuple[bool, str | None]] = []
+
+    class _Client:
+        ssh_runner = expected_runner
+
+    class _SSHClient:
+        @staticmethod
+        def is_running(profile=None):
+            return profile == "worker"
+
+        @staticmethod
+        def from_env(*, keep_remote_files=False, profile=None):
+            calls.append((keep_remote_files, profile))
+            return _Client()
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _SSHClient)
+
+    simulator = SpectreSimulator.from_env(
+        profile="worker",
+        keep_remote_files=True,
+    )
+
+    assert simulator._ssh_runner is expected_runner
+    assert simulator._profile == "worker"
+    assert simulator._remote_host == "compute"
+    assert calls == [(True, "worker")]
+
+
+def test_cli_profile_bind_show_clear(monkeypatch, tmp_path, capsys) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / ".venv"))
+
+    assert cli.main(["profile", "bind", "t180_io", "--venv"]) == 0
+    assert (tmp_path / ".venv" / ".virtuoso-bridge-profile").read_text(encoding="utf-8") == "t180_io\n"
+
+    assert cli.main(["profile", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "resolved profile : t180_io" in out
+    assert "source           : venv" in out
+
+    assert cli.main(["profile", "clear", "--venv"]) == 0
+    assert not (tmp_path / ".venv" / ".virtuoso-bridge-profile").exists()
+
+
+def test_cli_status_uses_venv_binding(monkeypatch, tmp_path, capsys) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / ".venv"))
+    bind_venv_profile("t28_io")
+    monkeypatch.setattr(cli, "_load_cli_env", lambda: None)
+    monkeypatch.setenv("VB_REMOTE_HOST_t28_io", "thu-wei")
+    monkeypatch.setenv("VB_REMOTE_USER_t28_io", "designer")
+
+    class _FakeSSHClient:
+        @staticmethod
+        def read_state(profile=None):
+            assert profile == "t28_io"
+            return None
+
+        @staticmethod
+        def is_running(profile=None):
+            assert profile == "t28_io"
+            return False
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+
+    rc = cli.main(["status"])
+
+    assert rc == 1
+    assert "[t28_io]" in capsys.readouterr().out
+
+
+def test_load_vb_env_does_not_pollute_os_environ_vb_profile_or_override_venv(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from virtuoso_bridge import env
+
+    _isolate_profile_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(env, "_RUNTIME_ENV_FILE", None)
+    user_env = tmp_path / "user.env"
+    user_env.write_text(
+        "VB_PROFILE=user_default\nVB_REMOTE_HOST_t28_io=eda-t28\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("virtuoso_bridge.env.default_user_env_path", lambda: user_env)
+    monkeypatch.setattr("virtuoso_bridge.profile.default_user_env_path", lambda: user_env)
+    monkeypatch.chdir(tmp_path)
+    venv = tmp_path / ".venv"
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    bind_venv_profile("t28_io")
+
+    assert env.load_vb_env(cwd=tmp_path) == user_env
+    assert "VB_PROFILE" not in os.environ
+    info = resolve_profile_info()
+    assert info.profile == "t28_io"
+    assert info.source == "venv"
+
+    # Process environment VB_PROFILE must also survive load_vb_env().
+    monkeypatch.setenv("VB_PROFILE", "shell_override")
+    env.load_vb_env(cwd=tmp_path)
+    assert os.environ["VB_PROFILE"] == "shell_override"
+    assert resolve_profile_info().profile == "shell_override"
+    assert resolve_profile_info().source == "environment"
+
+
+def test_workspace_dotenv_vb_profile_produces_single_profile_ssh_client(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from virtuoso_bridge import env
+    from virtuoso_bridge.transport.tunnel import SSHClient
+
+    for key in list(os.environ):
+        if key.startswith("VB_") and key != "VB_STATE_DIR":
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(env, "_RUNTIME_ENV_FILE", None)
+    monkeypatch.setattr(
+        "virtuoso_bridge.env.default_user_env_path",
+        lambda: tmp_path / "missing-user.env",
+    )
+    monkeypatch.setattr(
+        "virtuoso_bridge.profile.default_user_env_path",
+        lambda: tmp_path / "missing-user.env",
+    )
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+    (workspace / ".env").write_text(
+        "\n".join(
+            [
+                "VB_PROFILE=gpu1",
+                "VB_REMOTE_HOST=default-host",
+                "VB_REMOTE_USER=default-user",
+                "VB_REMOTE_PORT=65001",
+                "VB_LOCAL_PORT=65101",
+                "VB_SSH_BACKEND=openssh",
+                "VB_REMOTE_HOST_gpu1=gpu1-host",
+                "VB_REMOTE_USER_gpu1=gpu1-user",
+                "VB_REMOTE_PORT_gpu1=65002",
+                "VB_LOCAL_PORT_gpu1=65102",
+                "VB_SSH_BACKEND_gpu1=paramiko",
+                "VB_SSH_PROXY_gpu1=socks5://127.0.0.1:10808",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(workspace)
+
+    client = SSHClient.from_env()
+
+    assert "VB_PROFILE" not in os.environ
+    assert client._profile == "gpu1"
+    assert client.daemon_host == "gpu1-host"
+    assert client.remote_user == "gpu1-user"
+    assert client.remote_port == 65002
+    assert client.port == 65102
+    assert client.ssh_backend == "paramiko"
+    assert client._runner_kwargs["proxy_url"] == "socks5://127.0.0.1:10808"

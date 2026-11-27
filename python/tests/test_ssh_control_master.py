@@ -1,0 +1,1455 @@
+from __future__ import annotations
+
+import base64
+import io
+import os
+import re
+import shlex
+import subprocess
+import tarfile
+import threading
+from pathlib import Path
+from typing import Callable
+
+import pytest
+
+from virtuoso_bridge.transport.ssh import CommandResult, SSHRunner
+from virtuoso_bridge.transport.tunnel import SSHClient
+
+
+@pytest.fixture(autouse=True)
+def isolated_openssh_configuration(monkeypatch, tmp_path):
+    from virtuoso_bridge import env
+    path = tmp_path / "empty.env"
+    path.write_text("")
+    monkeypatch.setattr(env, "_RUNTIME_ENV_FILE", path)
+    monkeypatch.setenv("VB_SSH_BACKEND", "openssh")
+
+
+def _decode_remote_script(command: str) -> str:
+    argv = shlex.split(command)
+    assert argv[:2] == ["bash", "-c"]
+    match = re.fullmatch(
+        r'eval "\$\(printf %s ([A-Za-z0-9+/=]+) \| base64 -d\)"',
+        argv[2],
+    )
+    assert match is not None
+    return base64.b64decode(match.group(1)).decode("utf-8")
+
+
+class _Pipe:
+    def close(self) -> None:
+        pass
+
+
+class _Stderr:
+    def __init__(self, data: bytes = b"") -> None:
+        self.data = data
+        self.closed = False
+
+    def read(self, _size: int = -1) -> bytes:
+        data = self.data
+        self.data = b""
+        return data
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _tar_extract_root(cmd: list[str], cwd: Path | None) -> Path:
+    if "-C" not in cmd:
+        assert cwd is not None
+        return Path(cwd)
+    extract_arg = Path(cmd[cmd.index("-C") + 1])
+    if extract_arg.is_absolute():
+        return extract_arg
+    assert cwd is not None
+    return Path(cwd) / extract_arg
+
+
+def _install_download_pipeline(
+    monkeypatch,
+    *,
+    ssh_exit_seconds: int = 0,
+    reject_tar_path: Callable[[Path, bool], str | None] | None = None,
+) -> None:
+    class _FakeProcess:
+        def __init__(self, cmd, **kwargs):
+            self.cmd = cmd
+            self.cwd = kwargs.get("cwd")
+            self.is_tar = Path(cmd[0]).stem.lower() == "tar"
+            self.returncode = 0
+            self.stdout = _Pipe()
+            self.stderr = _Stderr()
+
+        def communicate(self, timeout=None):
+            if not self.is_tar:
+                return b"", b""
+            extract_root = _tar_extract_root(self.cmd, self.cwd)
+            rejection = (
+                reject_tar_path(extract_root, "-C" in self.cmd)
+                if reject_tar_path
+                else None
+            )
+            if rejection:
+                self.returncode = 2
+                return b"", rejection.encode("utf-8")
+            extracted = extract_root / "netlist"
+            extracted.mkdir()
+            (extracted / "input.scs").write_text("new netlist\n", encoding="utf-8")
+            return b"", b""
+
+        def wait(self, timeout=None):
+            if not self.is_tar and timeout is not None and timeout < ssh_exit_seconds:
+                raise subprocess.TimeoutExpired(self.cmd, timeout)
+            self.returncode = 0
+            return 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.subprocess.Popen", _FakeProcess)
+
+
+def test_control_path_is_bounded_for_long_remote_identity(monkeypatch) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    monkeypatch.delenv("VB_DISABLE_CONTROL_MASTER", raising=False)
+    monkeypatch.delenv("VB_FORCE_CONTROL_MASTER", raising=False)
+
+    runner = SSHRunner(
+        host="srv-elamien.ece.mcmaster.ca",
+        user="noorizad",
+    )
+
+    control_path = runner._control_path
+    assert Path(control_path).name.startswith("vb_ssh_")
+    assert "srv-elamien" not in control_path
+    assert "noorizad" not in control_path
+    if os.name != "nt":
+        assert len(control_path) + 18 < 104
+
+
+def test_macos_unix_listener_path_too_long_is_controlmaster_failure() -> None:
+    stderr = (
+        'unix_listener: path "/var/folders/x/y/T/'
+        'vb_ssh_noorizad@srv-elamien.ece.mcmaster.ca_direct.2BclHvp4raDoiKZF" '
+        "too long for Unix domain socket"
+    )
+
+    assert SSHRunner._is_cm_failure(255, stderr)
+    assert not SSHRunner._is_cm_failure(0, stderr)
+
+
+def test_remote_scp_target_quotes_legacy_shell_metacharacters() -> None:
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh")
+    remote_path = "/scratch root/$(touch PWNED);'quoted'[1].gds"
+    escaped_path = (
+        r"/scratch\ root/\$\(touch\ PWNED\)\;\'quoted\'\[1\].gds"
+    )
+
+    target = runner._remote_scp_target(remote_path)
+    host, separator, quoted_path = target.partition(":")
+
+    assert host == "designer@eda-host"
+    assert separator == ":"
+    assert quoted_path == escaped_path
+    assert shlex.split(quoted_path) == [remote_path]
+
+
+def test_remote_scp_target_preserves_simple_paths_and_rejects_controls() -> None:
+    runner = SSHRunner(host="eda-host", user=None, ssh_cmd="ssh")
+
+    assert runner._remote_scp_target("/tmp/result.gds") == (
+        "eda-host:/tmp/result.gds"
+    )
+    for remote_path in (
+        "/tmp/bad\x00name",
+        "/tmp/bad\tname",
+        "/tmp/bad\nname",
+        "/tmp/bad\rname",
+        "/tmp/bad\x7fname",
+    ):
+        with pytest.raises(ValueError, match="remote SCP path"):
+            runner._remote_scp_target(remote_path)
+
+
+def test_common_options_preserve_configured_host_key_policy(monkeypatch) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh._setup_command_log",
+        lambda: None,
+    )
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh")
+
+    options = runner._common_ssh_options()
+
+    assert "StrictHostKeyChecking=no" not in options
+    assert "BatchMode=yes" in options
+
+
+@pytest.mark.parametrize(
+    ("remote_path", "escaped_path"),
+    [
+        ("/tmp/result.gds", "/tmp/result.gds"),
+        (
+            r"/scratch root/result\copy[1].gds",
+            r"/scratch\ root/result\\copy\[1\].gds",
+        ),
+    ],
+)
+def test_nonrecursive_download_selects_safe_scp_mode(
+    monkeypatch,
+    tmp_path: Path,
+    remote_path: str,
+    escaped_path: str,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs) -> subprocess.CompletedProcess:
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"downloaded result")
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.run",
+        fake_run,
+    )
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh")
+
+    local_path = tmp_path / "result.gds"
+    result = runner.download(remote_path, local_path)
+
+    assert result.returncode == 0
+    assert "-O" not in commands[0]
+    target = commands[0][-2]
+    assert target == f"designer@eda-host:{escaped_path}"
+    assert shlex.split(target.partition(":")[2]) == [remote_path]
+    staged_target = Path(commands[0][-1])
+    assert staged_target != local_path
+    assert staged_target.parent.name.startswith(".vbtmp-")
+    assert local_path.read_bytes() == b"downloaded result"
+    assert not list(tmp_path.glob(".vbtmp-*"))
+
+
+def test_nonrecursive_download_preserves_target_when_scp_fails(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh._setup_command_log",
+        lambda: None,
+    )
+
+    def fake_run(command: list[str], **_kwargs) -> subprocess.CompletedProcess:
+        Path(command[-1]).write_bytes(b"partial result")
+        return subprocess.CompletedProcess(command, 1, b"", b"scp failed")
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.run",
+        fake_run,
+    )
+    local_path = tmp_path / "result.gds"
+    local_path.write_bytes(b"existing result")
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh")
+
+    result = runner.download("/remote/result.gds", local_path)
+
+    assert result.returncode == 1
+    assert local_path.read_bytes() == b"existing result"
+    assert not list(tmp_path.glob(".vbtmp-*"))
+
+
+def test_nonrecursive_download_preserves_target_on_timeout(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh._setup_command_log",
+        lambda: None,
+    )
+
+    def fake_run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+        Path(command[-1]).write_bytes(b"partial result")
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.run",
+        fake_run,
+    )
+    local_path = tmp_path / "result.gds"
+    local_path.write_bytes(b"existing result")
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh")
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner.download("/remote/result.gds", local_path, timeout=1)
+
+    assert local_path.read_bytes() == b"existing result"
+    assert not list(tmp_path.glob(".vbtmp-*"))
+
+
+def test_remote_python_detection_error_includes_ssh_stderr() -> None:
+    class _FakeRunner:
+        def run_command(self, command: str, timeout=None) -> CommandResult:
+            return CommandResult(
+                returncode=255,
+                stdout="",
+                stderr='unix_listener: path "/var/folders/.../vb_ssh" too long for Unix domain socket',
+            )
+
+    client = SSHClient(remote_host="localhost")
+    client._ssh_runner = _FakeRunner()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        client._detect_remote_python()
+
+    msg = str(excinfo.value)
+    assert "No Python interpreter found on localhost" in msg
+    assert "unix_listener" in msg
+    assert "SSH return code: 255" in msg
+
+
+def test_recursive_download_allows_ssh_exit_within_caller_timeout(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    _install_download_pipeline(monkeypatch, ssh_exit_seconds=6)
+
+    local_path = tmp_path / "netlist"
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh", timeout=30)
+
+    result = runner.download("/remote/netlist", local_path, recursive=True)
+
+    assert result.returncode == 0
+    assert (local_path / "input.scs").read_text(encoding="utf-8") == "new netlist\n"
+
+
+def test_recursive_download_supports_paths_outside_active_codepage(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+
+    def reject_non_cp936(path: Path, path_from_argv: bool) -> str | None:
+        if not path_from_argv:
+            return None
+        try:
+            str(path).encode("cp936")
+        except UnicodeEncodeError:
+            return f"tar could not chdir to {path}"
+        return None
+
+    _install_download_pipeline(monkeypatch, reject_tar_path=reject_non_cp936)
+    local_path = (
+        tmp_path
+        / "Chinese_\U00020bb7_emoji_\U0001f600"
+        / "netlist_\U00020bb7_\U0001f600"
+    )
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh", timeout=30)
+
+    result = runner.download("/remote/netlist", local_path, recursive=True)
+
+    assert result.returncode == 0
+    assert (local_path / "input.scs").read_text(encoding="utf-8") == "new netlist\n"
+
+
+def test_recursive_download_uses_bounded_staging_for_long_target_name(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+
+    local_parent = tmp_path / "long_target"
+    target_name_length = 250 - len(str(local_parent)) - 1
+    assert 1 <= target_name_length <= 240
+    local_path = local_parent / ("n" * target_name_length)
+    legacy_stage = local_path.with_name(f".{local_path.name}.tmp-" + ("0" * 32))
+    assert len(str(local_path)) == 250
+    assert len(str(legacy_stage)) >= 260
+
+    def reject_legacy_long_path(path: Path, path_from_argv: bool) -> str | None:
+        if path_from_argv and len(str(path)) >= 260:
+            return f"tar could not chdir to {path}"
+        return None
+
+    _install_download_pipeline(monkeypatch, reject_tar_path=reject_legacy_long_path)
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh", timeout=30)
+
+    result = runner.download("/remote/netlist", local_path, recursive=True)
+
+    assert result.returncode == 0
+    assert (local_path / "input.scs").read_text(encoding="utf-8") == "new netlist\n"
+
+
+def test_recursive_download_quotes_remote_path_components(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+
+    commands: list[list[str]] = []
+    process_cwds: list[Path | None] = []
+
+    class _FakeProcess:
+        def __init__(self, cmd, **kwargs):
+            commands.append(cmd)
+            process_cwds.append(kwargs.get("cwd"))
+            self.cmd = cmd
+            self.cwd = kwargs.get("cwd")
+            self.returncode = 0
+            self.stdout = _Pipe()
+            self.stderr = _Stderr()
+
+        def communicate(self, timeout=None):
+            if Path(self.cmd[0]).stem.lower() == "tar":
+                (_tar_extract_root(self.cmd, self.cwd) / "netlist dir").mkdir()
+            return b"", b""
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.subprocess.Popen", _FakeProcess)
+
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh", timeout=30)
+    remote_path = "/remote/sim's results/netlist dir"
+    result = runner.download(
+        remote_path,
+        tmp_path / "netlist dir",
+        recursive=True,
+    )
+
+    assert result.returncode == 0
+    remote_cmd = commands[0][-1]
+    inner_cmd = _decode_remote_script(remote_cmd)
+    assert f"p={shlex.quote(remote_path)}" in inner_cmd
+    assert 'd=$(dirname "$p")' in inner_cmd
+    assert 'b=$(basename "$p")' in inner_cmd
+    assert 'cd "$d"' in inner_cmd
+    assert 'tar czf - -- "$b"' in inner_cmd
+    assert commands[1] == [runner._tar_cmd, "xzf", "-"]
+    extract_dir = Path(process_cwds[1])
+    assert extract_dir.parent == tmp_path
+    assert extract_dir.name.startswith(".vbtmp-")
+
+
+def test_recursive_download_extracts_into_requested_directory(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+
+    commands: list[list[str]] = []
+    process_cwds: list[Path | None] = []
+
+    class _FakeProcess:
+        def __init__(self, cmd, **kwargs):
+            commands.append(cmd)
+            process_cwds.append(kwargs.get("cwd"))
+            self.cmd = cmd
+            self.cwd = kwargs.get("cwd")
+            self.returncode = 0
+            self.stdout = _Pipe()
+            self.stderr = _Stderr()
+
+        def communicate(self, timeout=None):
+            if Path(self.cmd[0]).stem.lower() == "tar":
+                extracted = _tar_extract_root(self.cmd, self.cwd) / "netlist"
+                extracted.mkdir()
+                (extracted / "input.scs").write_text("new netlist\n", encoding="utf-8")
+            return b"", b""
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.subprocess.Popen", _FakeProcess)
+
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh", timeout=30)
+    local_path = tmp_path / ".netlist.tmp-123"
+    result = runner.download(
+        "/remote/simulation/netlist",
+        local_path,
+        recursive=True,
+    )
+
+    assert result.returncode == 0
+    remote_cmd = commands[0][-1]
+    inner_cmd = _decode_remote_script(remote_cmd)
+    assert 'cd "$d"' in inner_cmd
+    assert 'tar czf - -- "$b"' in inner_cmd
+    assert commands[1] == [runner._tar_cmd, "xzf", "-"]
+    extract_dir = Path(process_cwds[1])
+    assert extract_dir.parent == tmp_path
+    assert extract_dir.name.startswith(".vbtmp-")
+    assert (local_path / "input.scs").read_text(encoding="utf-8") == "new netlist\n"
+
+
+def _local_openssh_runner(monkeypatch, tar_command: str, ssh_base: list[str]) -> SSHRunner:
+    """Run the OpenSSH tar pipelines against a local command instead of ssh."""
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    runner = SSHRunner(
+        host="eda-host",
+        user="designer",
+        ssh_cmd="ssh",
+        timeout=30,
+        backend="openssh",
+    )
+    runner._tar_cmd = tar_command
+    # The remote command is appended as an ignored trailing argument.
+    monkeypatch.setattr(runner, "_build_ssh_base", lambda: list(ssh_base))
+    return runner
+
+
+def test_openssh_recursive_download_keeps_appledouble_named_files_on_macos(
+    monkeypatch,
+    macos_bsdtar: str,
+    tmp_path: Path,
+) -> None:
+    files = {
+        "netlist/.__master.optionFile": b"o" * 481,
+        "netlist/designInfo": b"designInfo\n",
+        "netlist/.__master.termorder": b"termorder\n",
+    }
+    archive_path = tmp_path / "remote.tgz"
+    with tarfile.open(archive_path, mode="w:gz") as archive:
+        directory = tarfile.TarInfo("netlist")
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o755
+        archive.addfile(directory)
+        for name, contents in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(contents)
+            archive.addfile(info, io.BytesIO(contents))
+    runner = _local_openssh_runner(
+        monkeypatch,
+        macos_bsdtar,
+        ["/bin/sh", "-c", 'cat -- "$1"', "sh", str(archive_path)],
+    )
+    local_path = tmp_path / "downloads" / "netlist"
+
+    result = runner.download("/remote/sim/netlist", local_path, recursive=True)
+
+    assert result.returncode == 0, result.stderr
+    assert sorted(path.name for path in local_path.iterdir()) == sorted(
+        name.split("/", 1)[1] for name in files
+    )
+    for name, contents in files.items():
+        assert (local_path / name.split("/", 1)[1]).read_bytes() == contents
+
+
+def test_openssh_upload_omits_appledouble_members_on_macos(
+    monkeypatch,
+    macos_bsdtar: str,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "tree"
+    source.mkdir()
+    nested = source / "input.scs"
+    nested.write_text("simulator lang=spectre\n", encoding="utf-8")
+    for path in (source, nested):
+        subprocess.run(
+            ["xattr", "-w", "com.example.test", "1", str(path)],
+            check=True,
+        )
+    received = tmp_path / "received.tar"
+    runner = _local_openssh_runner(
+        monkeypatch,
+        macos_bsdtar,
+        ["/bin/sh", "-c", 'cat > "$1"', "sh", str(received)],
+    )
+
+    result = runner.upload(source, "/remote/tree", recursive=True)
+
+    assert result.returncode == 0, result.stderr
+    with tarfile.open(received, mode="r:") as archive:
+        assert sorted(archive.getnames()) == ["tree", "tree/input.scs"]
+
+
+def test_recursive_download_preserves_existing_target_when_tar_fails(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+
+    class _FakeProcess:
+        def __init__(self, cmd, **kwargs):
+            self.cmd = cmd
+            self.stdout = _Pipe()
+            self.stderr = _Stderr(b"remote ok")
+            self.returncode = 0 if "ssh" in cmd[0] else 2
+
+        def communicate(self, timeout=None):
+            return b"", b"tar failed"
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.subprocess.Popen", _FakeProcess)
+
+    existing = tmp_path / "netlist"
+    existing.mkdir()
+    (existing / "input.scs").write_text("old netlist\n", encoding="utf-8")
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh", timeout=30)
+
+    result = runner.download("/remote/netlist", existing, recursive=True)
+
+    assert result.returncode != 0
+    assert (existing / "input.scs").read_text(encoding="utf-8") == "old netlist\n"
+
+
+def test_recursive_download_restores_existing_target_when_install_rename_fails(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+
+    class _FakeProcess:
+        def __init__(self, cmd, **kwargs):
+            self.cmd = cmd
+            self.cwd = kwargs.get("cwd")
+            self.stdout = _Pipe()
+            self.stderr = _Stderr()
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            if Path(self.cmd[0]).stem.lower() == "tar":
+                extracted = _tar_extract_root(self.cmd, self.cwd) / "netlist"
+                extracted.mkdir()
+                (extracted / "input.scs").write_text("new netlist\n", encoding="utf-8")
+            return b"", b""
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    original_rename = Path.rename
+
+    def fail_temp_install(self: Path, target: Path):
+        if self.name == "netlist" and self.parent.name.startswith(".vbtmp-"):
+            raise OSError("install failed")
+        return original_rename(self, target)
+
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.subprocess.Popen", _FakeProcess)
+    monkeypatch.setattr(Path, "rename", fail_temp_install)
+
+    existing = tmp_path / "netlist"
+    existing.mkdir()
+    (existing / "input.scs").write_text("old netlist\n", encoding="utf-8")
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh", timeout=30)
+
+    with pytest.raises(OSError, match="install failed"):
+        runner.download("/remote/netlist", existing, recursive=True)
+
+    assert existing.is_dir()
+    assert (existing / "input.scs").read_text(encoding="utf-8") == "old netlist\n"
+
+
+class _DeadlineClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def consume(
+        self,
+        duration: float,
+        timeout: float,
+        command: object,
+    ) -> None:
+        if timeout < duration:
+            self.now += timeout
+            raise subprocess.TimeoutExpired(command, timeout)
+        self.now += duration
+
+
+def _configure_deadline_runner(monkeypatch, clock: _DeadlineClock) -> SSHRunner:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.time.monotonic", clock)
+    monkeypatch.delenv("VB_DISABLE_CONTROL_MASTER", raising=False)
+    monkeypatch.delenv("VB_FORCE_CONTROL_MASTER", raising=False)
+    monkeypatch.delenv("VB_SSH_BACKEND", raising=False)
+    monkeypatch.delenv("VB_SSH_MAX_SESSIONS", raising=False)
+    return SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh")
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["run_command", "scp_download", "upload_text"],
+)
+def test_retrying_public_calls_share_one_timeout_budget(
+    monkeypatch,
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    clock = _DeadlineClock()
+    runner = _configure_deadline_runner(monkeypatch, clock)
+    attempt_timeouts: list[float] = []
+
+    def fake_run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+        attempt_timeout = kwargs["timeout"]
+        attempt_timeouts.append(attempt_timeout)
+        clock.consume(0.04, attempt_timeout, command)
+        return subprocess.CompletedProcess(
+            command,
+            255,
+            b"",
+            b"Connection reset by peer",
+        )
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.run",
+        fake_run,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        if operation == "run_command":
+            runner.run_command("printf ok", timeout=0.05)
+        elif operation == "scp_download":
+            runner.download(
+                "/remote/result.gds",
+                tmp_path / "result.gds",
+                timeout=0.05,
+            )
+        else:
+            runner.upload_text("payload", "/remote/input.txt", timeout=0.05)
+
+    assert attempt_timeouts == pytest.approx([0.05, 0.01])
+    assert clock.now == pytest.approx(0.05)
+
+
+def test_scp_download_cm_fallback_uses_remaining_timeout(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    clock = _DeadlineClock()
+    runner = _configure_deadline_runner(monkeypatch, clock)
+    attempt_timeouts: list[float] = []
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+        attempt_timeout = kwargs["timeout"]
+        attempt_timeouts.append(attempt_timeout)
+        commands.append(command)
+        if len(commands) == 1:
+            Path(command[-1]).write_bytes(b"partial result")
+            clock.consume(0.02, attempt_timeout, command)
+            return subprocess.CompletedProcess(
+                command,
+                255,
+                b"",
+                b"mux_client_request_session: master session id: 2",
+            )
+        clock.consume(0.01, attempt_timeout, command)
+        Path(command[-1]).write_bytes(b"complete result")
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.run",
+        fake_run,
+    )
+
+    result = runner.download(
+        "/remote/result.gds",
+        tmp_path / "result.gds",
+        timeout=0.05,
+    )
+
+    assert result.returncode == 0
+    assert attempt_timeouts == pytest.approx([0.05, 0.03])
+    assert any("ControlMaster=auto" in part for part in commands[0])
+    assert not any("ControlMaster=auto" in part for part in commands[1])
+    assert runner._use_control_master is False
+    assert (tmp_path / "result.gds").read_bytes() == b"complete result"
+    assert not list(tmp_path.glob(".vbtmp-*"))
+
+
+def test_long_lived_port_forward_never_uses_control_master(monkeypatch) -> None:
+    captured: list[str] = []
+
+    class _Process:
+        pid = 4321
+        stderr = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **_kwargs):
+        captured.extend(command)
+        return _Process()
+
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.subprocess.Popen", fake_popen)
+    runner = SSHRunner(host="compute", user="designer", jump_host="gui")
+    runner.can_reach_port = lambda _port: True  # type: ignore[method-assign]
+
+    runner.start_port_forward(65080, settle=0, remote_port=65081)
+
+    command = " ".join(captured)
+    assert "ControlMaster=no" in command
+    assert "ControlPath=none" in command
+    assert "ControlPersist=no" in command
+    assert "ControlMaster=auto" not in command
+
+
+def test_tar_upload_retries_share_one_timeout_budget(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    clock = _DeadlineClock()
+    runner = _configure_deadline_runner(monkeypatch, clock)
+    communicate_timeouts: list[float] = []
+    processes: list[object] = []
+
+    class _UploadProcess:
+        def __init__(self, command: list[str], **_kwargs) -> None:
+            self.command = command
+            self.is_tar = Path(command[0]).stem.lower() == "tar"
+            self.returncode = 0 if self.is_tar else 255
+            self.stdout = _Pipe()
+            self.stderr = _Stderr(b"Connection reset by peer")
+            self.killed = False
+            self.wait_called = False
+            processes.append(self)
+
+        def communicate(self, timeout=None):
+            assert timeout is not None
+            communicate_timeouts.append(timeout)
+            clock.consume(0.04, timeout, self.command)
+            self.wait_called = True
+            return b"", b"Connection reset by peer"
+
+        def wait(self, timeout=None):
+            self.wait_called = True
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.Popen",
+        _UploadProcess,
+    )
+    local_path = tmp_path / "input.txt"
+    local_path.write_text("payload", encoding="utf-8")
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner.upload(local_path, "/remote/input.txt", timeout=0.05)
+
+    assert communicate_timeouts == pytest.approx([0.05, 0.01])
+    assert clock.now == pytest.approx(0.05)
+    assert len(processes) == 4
+    assert all(process.wait_called for process in processes)
+    assert all(process.killed for process in processes[-2:])
+
+
+def test_tar_upload_drains_local_stderr_while_ssh_is_running(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runner = _configure_deadline_runner(monkeypatch, _DeadlineClock())
+    stderr_started = threading.Event()
+    stderr_payload = b"tar warning\n" * 10000
+
+    class _SignalingStderr(_Stderr):
+        def read(self, size: int = -1) -> bytes:
+            stderr_started.set()
+            return super().read(size)
+
+    class _PipelineProcess:
+        def __init__(self, command: list[str], **_kwargs) -> None:
+            self.command = command
+            self.is_tar = Path(command[0]).stem.lower() == "tar"
+            self.returncode = 2 if self.is_tar else 0
+            self.stdout = _Pipe()
+            self.stderr = (
+                _SignalingStderr(stderr_payload) if self.is_tar else _Stderr()
+            )
+
+        def communicate(self, timeout=None):
+            assert not self.is_tar
+            assert stderr_started.wait(timeout=1)
+            return b"", b""
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.Popen",
+        _PipelineProcess,
+    )
+    local_path = tmp_path / "input.scs"
+    local_path.write_text("payload", encoding="utf-8")
+
+    result = runner.upload(local_path, "/remote/input.scs", timeout=5)
+
+    assert result.returncode == 2
+    assert result.stderr.encode("utf-8") == stderr_payload
+
+
+def test_tar_download_drains_ssh_stderr_while_tar_is_running(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runner = _configure_deadline_runner(monkeypatch, _DeadlineClock())
+    stderr_started = threading.Event()
+    stderr_payload = b"remote warning\n" * 10000
+
+    class _SignalingStderr(_Stderr):
+        def read(self, size: int = -1) -> bytes:
+            stderr_started.set()
+            return super().read(size)
+
+    class _PipelineProcess:
+        def __init__(self, command: list[str], **kwargs) -> None:
+            self.command = command
+            self.cwd = kwargs.get("cwd")
+            self.is_tar = Path(command[0]).stem.lower() == "tar"
+            self.returncode = 0 if self.is_tar else 1
+            self.stdout = _Pipe()
+            self.stderr = (
+                _Stderr() if self.is_tar else _SignalingStderr(stderr_payload)
+            )
+
+        def communicate(self, timeout=None):
+            assert self.is_tar
+            assert stderr_started.wait(timeout=1)
+            (Path(self.cwd) / "netlist").mkdir()
+            return b"", b""
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.Popen",
+        _PipelineProcess,
+    )
+
+    result = runner.download(
+        "/remote/netlist",
+        tmp_path / "netlist",
+        recursive=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 1
+    assert stderr_payload.decode("utf-8").strip() in result.stderr
+
+
+def test_batch_upload_groups_share_one_timeout_budget(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    clock = _DeadlineClock()
+    runner = _configure_deadline_runner(monkeypatch, clock)
+    communicate_timeouts: list[float] = []
+
+    class _BatchUploadProcess:
+        def __init__(self, command: list[str], **_kwargs) -> None:
+            self.command = command
+            self.is_tar = Path(command[0]).stem.lower() == "tar"
+            self.returncode = 0
+            self.stdout = _Pipe()
+            self.stderr = _Stderr()
+
+        def communicate(self, timeout=None):
+            assert not self.is_tar
+            assert timeout is not None
+            communicate_timeouts.append(timeout)
+            clock.consume(0.04, timeout, self.command)
+            return b"", b""
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.Popen",
+        _BatchUploadProcess,
+    )
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner.upload_batch(
+            [
+                (first, "/remote/a/first.txt"),
+                (second, "/remote/b/second.txt"),
+            ],
+            timeout=0.05,
+        )
+
+    assert communicate_timeouts == pytest.approx([0.05, 0.01])
+    assert clock.now == pytest.approx(0.05)
+
+
+def test_recursive_download_pipeline_shares_one_timeout_budget(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    clock = _DeadlineClock()
+    runner = _configure_deadline_runner(monkeypatch, clock)
+    tar_timeouts: list[float] = []
+    ssh_timeouts: list[float] = []
+
+    class _DownloadProcess:
+        def __init__(self, command: list[str], **kwargs) -> None:
+            self.command = command
+            self.cwd = kwargs.get("cwd")
+            self.is_tar = Path(command[0]).stem.lower() == "tar"
+            self.returncode = 0
+            self.stdout = _Pipe()
+            self.stderr = _Stderr()
+
+        def communicate(self, timeout=None):
+            assert self.is_tar
+            assert timeout is not None
+            tar_timeouts.append(timeout)
+            clock.consume(0.04, timeout, self.command)
+            extracted = Path(self.cwd) / "netlist"
+            extracted.mkdir()
+            return b"", b""
+
+        def wait(self, timeout=None):
+            if self.returncode == -9:
+                return self.returncode
+            assert not self.is_tar
+            assert timeout is not None
+            ssh_timeouts.append(timeout)
+            clock.consume(0.04, timeout, self.command)
+            return 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.Popen",
+        _DownloadProcess,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner.download(
+            "/remote/netlist",
+            tmp_path / "netlist",
+            recursive=True,
+            timeout=0.05,
+        )
+
+    assert tar_timeouts == pytest.approx([0.05])
+    assert ssh_timeouts == pytest.approx([0.01])
+    assert clock.now == pytest.approx(0.05)
+
+
+def test_persistent_shell_probe_and_command_share_one_timeout_budget(
+    monkeypatch,
+) -> None:
+    clock = _DeadlineClock()
+    runner = _configure_deadline_runner(monkeypatch, clock)
+    runner._persistent_shell_enabled = True
+    command_timeouts: list[float] = []
+
+    def fake_ensure(timeout=None, **kwargs) -> None:
+        budget = kwargs.get("_budget")
+        remaining = budget.remaining("persistent-shell probe") if budget else timeout
+        assert remaining is not None
+        clock.consume(0.04, remaining, "persistent-shell probe")
+
+    def fake_command(command: str, timeout=None, **kwargs) -> CommandResult:
+        budget = kwargs.get("_budget")
+        remaining = budget.remaining(command) if budget else timeout
+        assert remaining is not None
+        command_timeouts.append(remaining)
+        clock.consume(0.04, remaining, command)
+        return CommandResult(0, "ok", "")
+
+    monkeypatch.setattr(runner, "ensure_persistent_shell", fake_ensure)
+    monkeypatch.setattr(
+        runner,
+        "_run_command_via_persistent_shell_locked",
+        fake_command,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner.run_command("printf ok", timeout=0.05)
+
+    assert command_timeouts == pytest.approx([0.01])
+    assert clock.now == pytest.approx(0.05)
+
+
+@pytest.mark.skipif(
+    os.name == "nt"
+    or not os.path.exists("/bin/sh")
+    or not __import__("shutil").which("mktemp")
+    or not __import__("shutil").which("base64"),
+    reason="requires POSIX /bin/sh, mktemp, and base64",
+)
+def test_persistent_shell_isolates_state_exit_and_mktemp_in_real_shell(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    shell_tmp = tmp_path / "shell_tmp"
+    shell_tmp.mkdir()
+    counter_file = tmp_path / "counter.txt"
+    real_popen = subprocess.Popen
+
+    def local_shell_popen(cmd, **kwargs):
+        if cmd[-3:] == ["sh", "-l", "-s"]:
+            env = dict(os.environ)
+            env["TMPDIR"] = str(shell_tmp)
+            kwargs["env"] = env
+            return real_popen(["/bin/sh", "-s"], **kwargs)
+        return real_popen(cmd, **kwargs)
+
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.subprocess.Popen", local_shell_popen)
+    runner = SSHRunner(host="fixture-host", persistent_shell=True, timeout=15)
+    try:
+        pid_before = runner.run_command("printf %s $$").stdout
+        pwd_before = runner.run_command("pwd").stdout
+        umask_before = runner.run_command("umask").stdout
+
+        res_set_e = runner.run_command("set -e; false; echo unreachable")
+        assert res_set_e.returncode == 1
+        assert res_set_e.stdout == ""
+        assert runner.run_command("false; echo still-alive").stdout == "still-alive\n"
+
+        assert runner.run_command("umask 077").returncode == 0
+        assert runner.run_command("umask").stdout == umask_before
+
+        assert runner.run_command("cd /tmp").returncode == 0
+        assert runner.run_command("pwd").stdout == pwd_before
+
+        assert runner.run_command("VB_POISON=yes; export VB_POISON").returncode == 0
+        assert runner.run_command('printf %s "${VB_POISON:-clean}"').stdout == "clean"
+
+        # Non-zero exit must NOT kill the persistent shell or replay the command.
+        res_exit = runner.run_command(f"printf x >> {shlex.quote(str(counter_file))}; exit 7")
+        assert res_exit.returncode == 7
+        assert counter_file.read_text(encoding="utf-8") == "x"
+        assert runner.run_command("printf %s $$").stdout == pid_before
+        assert list(shell_tmp.iterdir()) == []
+    finally:
+        runner.close()
+
+
+def test_persistent_shell_upload_text_redacts_secret_from_log_verbose_and_timeout(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    import logging
+    import stat
+    from virtuoso_bridge.transport import ssh as ssh_mod
+
+    secret = "super-secret-bridge-token-" + ("ab" * 24)
+    encoded_secret = base64.b64encode((secret + "\n").encode("utf-8")).decode("ascii")
+    log_dir = tmp_path / "private_logs"
+    monkeypatch.setenv("VB_LOG_DIR", str(log_dir))
+
+    pkg_logger = logging.getLogger("virtuoso_bridge")
+    saved_handlers = list(pkg_logger.handlers)
+    for handler in list(pkg_logger.handlers):
+        if getattr(handler, "_vb_cmd_log", False):
+            pkg_logger.removeHandler(handler)
+
+    try:
+        ssh_mod._setup_command_log()
+        log_file = log_dir / "commands.log"
+        assert log_file.is_file()
+        if os.name == "posix":
+            assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
+            assert stat.S_IMODE(log_file.stat().st_mode) == 0o600
+
+        runner = SSHRunner(host="fixture-host", persistent_shell=True, verbose=True)
+        runner._persistent_shell_enabled = True
+        sent_scripts: list[str] = []
+
+        class _FakeStdin:
+            def __init__(self, out_q) -> None:
+                self._q = out_q
+
+            def write(self, data: bytes) -> int:
+                text = data.decode("utf-8")
+                sent_scripts.append(text)
+                begin = re.search(r"__vb_STDOUT_B64_BEGIN_[0-9a-f]+__", text).group(0)
+                stderr_m = re.search(r"__vb_STDERR_B64_BEGIN_[0-9a-f]+__", text).group(0)
+                rc_m = re.search(r"__vb_RC_[0-9a-f]+__", text).group(0)
+                self._q.put(begin + "\n")
+                self._q.put("\n")
+                self._q.put(stderr_m + "\n")
+                self._q.put("\n")
+                self._q.put(rc_m + "0\n")
+                return len(data)
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        import queue as _queue
+
+        out_q: _queue.Queue[str | None] = _queue.Queue()
+        fake_proc = type(
+            "_FakeShellProc",
+            (),
+            {
+                "stdin": _FakeStdin(out_q),
+                "stdout": None,
+                "poll": staticmethod(lambda: None),
+                "terminate": staticmethod(lambda: None),
+                "wait": staticmethod(lambda timeout=None: 0),
+                "kill": staticmethod(lambda: None),
+            },
+        )()
+        runner._shell_proc = fake_proc
+        runner._shell_queue = out_q
+
+        result = runner.upload_text(secret + "\n", "/home/u/.virtuoso-bridge/bridge_token.tmp")
+        assert result.returncode == 0
+        assert len(sent_scripts) == 1
+        assert encoded_secret in sent_scripts[0]
+
+        for handler in pkg_logger.handlers:
+            if getattr(handler, "_vb_cmd_log", False):
+                handler.flush()
+        log_text = log_file.read_text(encoding="utf-8")
+        err_text = capsys.readouterr().err
+        assert "upload_text" in log_text
+        assert "/home/u/.virtuoso-bridge/bridge_token.tmp" in log_text
+        assert secret not in log_text
+        assert encoded_secret not in log_text
+        assert "upload_text" in err_text
+        assert secret not in err_text
+        assert encoded_secret not in err_text
+
+        # TimeoutExpired must also carry only the redacted summary, not the secret.
+        monkeypatch.setattr(
+            runner,
+            "ensure_persistent_shell",
+            lambda **_kw: None,
+        )
+        with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+            runner.upload_text(secret + "\n", "/home/u/.virtuoso-bridge/bridge_token.tmp", timeout=0.0)
+        assert secret not in str(exc_info.value)
+        assert encoded_secret not in str(exc_info.value)
+    finally:
+        for handler in list(pkg_logger.handlers):
+            if getattr(handler, "_vb_cmd_log", False) and handler not in saved_handlers:
+                pkg_logger.removeHandler(handler)
+                handler.close()
+        for handler in saved_handlers:
+            if handler not in pkg_logger.handlers:
+                pkg_logger.addHandler(handler)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not os.path.exists("/bin/sh"),
+    reason="requires POSIX shell for POSIX start_port_forward path",
+)
+def test_posix_port_forward_retries_cannot_listen_and_surfaces_real_stderr(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    temp_dir = tmp_path / "tunnel_tmp"
+    temp_dir.mkdir()
+    monkeypatch.setenv("TMPDIR", str(temp_dir))
+
+    fake_ssh = tmp_path / "fake_ssh.sh"
+    fake_ssh.write_text(
+        "#!/bin/sh\n"
+        'for arg in "$@"; do\n'
+        '  case "$arg" in\n'
+        "    65120:127.0.0.1:*)\n"
+        '      printf "channel_setup_fwd_listener_tcpip: cannot listen to port: 65120\\n" >&2\n'
+        "      exit 255\n"
+        "      ;;\n"
+        "    65130:127.0.0.1:*)\n"
+        '      printf "Permission denied (publickey).\\n" >&2\n'
+        "      exit 255\n"
+        "      ;;\n"
+        "  esac\n"
+        "done\n"
+        "exec sleep 30\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o700)
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel.SSHRunner.can_reach_port",
+        staticmethod(lambda _p: False),
+    )
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel._TUNNEL_STARTUP_SETTLE_SECONDS", 0.5)
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel._update_env_file", lambda *a: True)
+
+    client = SSHClient(remote_host="eda-host", remote_user="designer", port=65000, local_port=65120)
+    client._ssh_runner = SSHRunner(host="eda-host", user="designer", ssh_cmd=str(fake_ssh))
+    try:
+        spawned = client.ensure_tunnel()
+        assert spawned is True
+        assert client.port == 65121
+        assert client._ssh_runner._tunnel_proc is not None
+        assert client._ssh_runner._tunnel_proc.stderr is None
+        assert list(temp_dir.glob("vb_tunnel_stderr_*.log")) == []
+    finally:
+        client._ssh_runner.stop_port_forward()
+
+    # Non-retryable startup failure must preserve the real stderr message.
+    failing_client = SSHClient(remote_host="eda-host", remote_user="designer", port=65000, local_port=65130)
+    failing_client._ssh_runner = SSHRunner(host="eda-host", user="designer", ssh_cmd=str(fake_ssh))
+    with pytest.raises(RuntimeError, match=r"Permission denied \(publickey\)\."):
+        failing_client.ensure_tunnel()
+    assert list(temp_dir.glob("vb_tunnel_stderr_*.log")) == []
+
+
+def test_windows_start_port_forward_closes_handle_checks_poll_first_and_stops_orphan(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from virtuoso_bridge.transport import ssh as ssh_mod
+
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    monkeypatch.setattr(ssh_mod, "_windows_no_window_kwargs", lambda **_kw: {})
+    monkeypatch.setattr(ssh_mod, "_process_identity", lambda _pid: None)
+
+    real_os = os
+
+    class _NtOsProxy:
+        name = "nt"
+
+        def __getattr__(self, item: str):
+            return getattr(real_os, item)
+
+    monkeypatch.setattr(ssh_mod, "os", _NtOsProxy())
+    monkeypatch.setattr(ssh_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    # Case 1: stderr handle closes right after Popen, stderr tail surfaced, temp log deleted.
+    observed_handles: list[object] = []
+
+    class _DeadProc:
+        pid = 9001
+
+        def __init__(self, _cmd, **kwargs) -> None:
+            fh = kwargs["stderr"]
+            observed_handles.append(fh)
+            fh.write(b"banner exchange timeout\n")
+            fh.flush()
+
+        def poll(self):
+            return 255
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout=None) -> int:
+            return 255
+
+        def kill(self) -> None:
+            pass
+
+    monkeypatch.setattr(ssh_mod.subprocess, "Popen", _DeadProc)
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh.exe")
+    runner.can_reach_port = lambda _port: False  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match=r"rc=255.*banner exchange timeout"):
+        runner.start_port_forward(65200, settle=0.1)
+    assert len(observed_handles) == 1
+    assert observed_handles[0].closed is True
+    assert list(tmp_path.glob("vb_tunnel_stderr_*.log")) == []
+
+    # Case 2: proc.poll() is checked BEFORE can_reach_port() so a dead proc is never adopted.
+    call_order: list[str] = []
+
+    class _DeadWithForeignPortProc:
+        pid = 9002
+
+        def __init__(self, _cmd, **kwargs) -> None:
+            observed_handles.append(kwargs["stderr"])
+
+        def poll(self):
+            call_order.append("poll")
+            return 1
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout=None) -> int:
+            return 1
+
+    monkeypatch.setattr(ssh_mod.subprocess, "Popen", _DeadWithForeignPortProc)
+    runner2 = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh.exe")
+
+    def fake_reach(_port: int) -> bool:
+        call_order.append("can_reach_port")
+        return True
+
+    runner2.can_reach_port = fake_reach  # type: ignore[method-assign]
+    assert runner2.start_port_forward(65201, settle=0.1) is None
+    assert call_order[0] == "poll"
+    assert runner2._tunnel_proc is None
+    assert runner2._tunnel_using_external is True
+    assert list(tmp_path.glob("vb_tunnel_stderr_*.log")) == []
+
+    # Case 3: post-loop can_reach_port() terminates still-alive proc before returning None.
+    terminated: list[bool] = []
+    reach_calls = iter([False, True])
+    clock_ticks = iter([0.0, 0.0, 100.0])
+
+    class _StuckProc:
+        pid = 9003
+
+        def __init__(self, _cmd, **_kwargs) -> None:
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+        def terminate(self) -> None:
+            terminated.append(True)
+            self._alive = False
+
+        def wait(self, timeout=None) -> int:
+            self._alive = False
+            return 0
+
+    monkeypatch.setattr(ssh_mod.subprocess, "Popen", _StuckProc)
+    monkeypatch.setattr(ssh_mod.time, "monotonic", lambda: next(clock_ticks))
+    monkeypatch.setattr(ssh_mod.time, "sleep", lambda _s: None)
+    runner3 = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh.exe")
+    runner3.can_reach_port = lambda _port: next(reach_calls)  # type: ignore[method-assign]
+    assert runner3.start_port_forward(65202, settle=0.1) is None
+    assert terminated == [True]
+    assert runner3._tunnel_proc is None
+    assert list(tmp_path.glob("vb_tunnel_stderr_*.log")) == []
