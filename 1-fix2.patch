@@ -1,0 +1,70 @@
+diff --git a/src/transport/x11.rs b/src/transport/x11.rs
+index 167496e..3b319e3 100644
+--- a/src/transport/x11.rs
++++ b/src/transport/x11.rs
+@@ -1454,7 +1454,7 @@ fn action_x11_cached(
+                 .collect::<Vec<_>>()
+                 .join(" && ");
+             match runner.run_command(&CommandRequest::with_exec_timeout(
+-                &vai_wrap(&joined),
++                vai_wrap(&joined),
+                 Duration::from_secs(*timeout_secs),
+             )) {
+                 Ok(out) => {
+@@ -1480,7 +1480,7 @@ fn action_x11_cached(
+                         .join(" ")
+                 );
+                 let out = runner.run_command(&CommandRequest::with_exec_timeout(
+-                    &vai_wrap(&remote_cmd),
++                    vai_wrap(&remote_cmd),
+                     Duration::from_secs(*timeout_secs),
+                 ))?;
+                 results.push(out);
+@@ -1677,7 +1677,7 @@ fn action_x11_cached(
+                 shell_escape(&resolved.window_id)
+             );
+             let _ = runner.run_command(&CommandRequest::with_exec_timeout(
+-                &vai_wrap(&activate_cmd),
++                vai_wrap(&activate_cmd),
+                 Duration::from_secs(5),
+             ));
+             std::thread::sleep(Duration::from_millis(150));
+@@ -1767,7 +1767,7 @@ fn action_x11_cached(
+                     .join(" ")
+             );
+             match runner.run_command(&CommandRequest::with_exec_timeout(
+-                &vai_wrap(&remote_cmd),
++                vai_wrap(&remote_cmd),
+                 Duration::from_secs(*timeout_secs),
+             )) {
+                 Ok(cmd_out) => {
+@@ -1800,7 +1800,7 @@ fn action_x11_cached(
+                     .join(" ")
+             );
+             let out = runner.run_command(&CommandRequest::with_exec_timeout(
+-                &vai_wrap(&remote_cmd),
++                vai_wrap(&remote_cmd),
+                 Duration::from_secs(*timeout_secs),
+             ))?;
+             outs.push(out);
+@@ -2637,7 +2637,7 @@ impl Drop for MouseButtonGuard<'_> {
+             self.display_prefix, self.window_id, self.button,
+         );
+         let req = CommandRequest::with_exec_timeout(
+-            &vai_wrap(&remote_cmd),
++            vai_wrap(&remote_cmd),
+             Duration::from_secs(5), // bounded best-effort
+         );
+         if let Err(e) = self.runner.run_command(&req) {
+diff --git a/src/vai_lock.rs b/src/vai_lock.rs
+index 4faabee..8c031ad 100644
+--- a/src/vai_lock.rs
++++ b/src/vai_lock.rs
+@@ -26,6 +26,7 @@ pub fn acquire() -> VaiLock {
+         .read(true)
+         .write(true)
+         .create(true)
++        .truncate(false)
+         .open(&path)
+     {
+         Ok(f) => {
