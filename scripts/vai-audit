@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Show what agents did through either MCP server (shared JSONL audit log)."""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def default_log():
+    v = (os.environ.get("VAI_AUDIT_LOG") or "").strip()
+    if v and v.lower() not in ("0", "off", "false", "none"):
+        return Path(v)
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "virtuoso-ai" / "audit.jsonl"
+
+
+def parse(line):
+    try:
+        return json.loads(line)
+    except ValueError:
+        return None
+
+
+def keep(e, a):
+    if e is None:
+        return False
+    if a.errors and e.get("ok"):
+        return False
+    if a.tool and a.tool not in str(e.get("tool", "")):
+        return False
+    if a.server and e.get("server") != a.server:
+        return False
+    if a.client and a.client.lower() not in str(e.get("client", "")).lower():
+        return False
+    return True
+
+
+def show(e, a):
+    if a.json:
+        print(json.dumps(e))
+        return
+    args = e.get("args")
+    args = args if isinstance(args, str) else json.dumps(args, separators=(",", ":"))
+    if not a.full and len(args) > 100:
+        args = args[:97] + "..."
+    status = "ok " if e.get("ok") else "ERR"
+    print("%s  %-6s %-14s %-26s %s %6sms  %s" % (
+        str(e.get("ts", ""))[:23], e.get("server", "?"), str(e.get("client", "?"))[:14],
+        e.get("tool", "?"), status, e.get("ms", "?"), args))
+    if not e.get("ok") and e.get("error"):
+        print("    error: %s" % e["error"])
+    sys.stdout.flush()
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("-n", type=int, default=30, help="show the last N matching entries (default 30, 0 = all)")
+    p.add_argument("-f", "--follow", action="store_true", help="keep watching for new calls")
+    p.add_argument("--tool", help="substring match on the tool name")
+    p.add_argument("--server", choices=["vcli", "bridge"])
+    p.add_argument("--client", help="substring match on the agent/client name")
+    p.add_argument("--errors", action="store_true", help="only failed calls")
+    p.add_argument("--full", action="store_true", help="do not shorten arguments")
+    p.add_argument("--json", action="store_true", help="print raw JSONL")
+    p.add_argument("--log", type=Path, default=default_log())
+    a = p.parse_args()
+
+    if not a.log.exists() and not a.follow:
+        print("no audit log yet at %s" % a.log, file=sys.stderr)
+        return 0
+    rows = []
+    if a.log.exists():
+        with a.log.open(encoding="utf-8", errors="replace") as fh:
+            rows = [e for e in map(parse, fh) if keep(e, a)]
+    for e in rows[-a.n:] if a.n else rows:
+        show(e, a)
+    if not a.follow:
+        return 0
+    while not a.log.exists():
+        time.sleep(0.5)
+    with a.log.open(encoding="utf-8", errors="replace") as fh:
+        fh.seek(0, os.SEEK_END)
+        try:
+            while True:
+                line = fh.readline()
+                if not line:
+                    time.sleep(0.3)
+                    continue
+                e = parse(line)
+                if keep(e, a):
+                    show(e, a)
+        except KeyboardInterrupt:
+            return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

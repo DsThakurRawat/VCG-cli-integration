@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
+pub mod audit;
 pub mod prompts;
 pub mod resources;
 pub mod server;
@@ -158,7 +159,10 @@ impl McpServer {
 
     fn handle_request(&self, request: McpRequest) -> McpResponse {
         match request.method.as_str() {
-            "initialize" => McpResponse::success(initialize_result(), request.id),
+            "initialize" => {
+                audit::set_client(&request.params);
+                McpResponse::success(initialize_result(), request.id)
+            }
             "tools/list" => {
                 let tool_list: Vec<serde_json::Value> = self
                     .tools
@@ -185,14 +189,37 @@ impl McpServer {
                     .cloned()
                     .unwrap_or(serde_json::Value::Object(Default::default()));
 
-                if let Some(tool) = self.tools.iter().find(|t| t.name == name) {
-                    match self.call_tool(tool, arguments) {
-                        Ok(result) => McpResponse::success(result, request.id),
-                        Err(e) => McpResponse::error(-32603, e.to_string(), request.id),
-                    }
-                } else {
-                    McpResponse::error(-32602, format!("unknown tool: {}", name), request.id)
-                }
+                let started = std::time::Instant::now();
+                let audit_args = arguments.clone();
+                let (response, error) =
+                    if let Some(tool) = self.tools.iter().find(|t| t.name == name) {
+                        match self.call_tool(tool, arguments) {
+                            Ok(result) => {
+                                let error = audit::result_error(&result);
+                                (McpResponse::success(result, request.id), error)
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                (
+                                    McpResponse::error(-32603, msg.clone(), request.id),
+                                    Some(msg),
+                                )
+                            }
+                        }
+                    } else {
+                        let msg = format!("unknown tool: {}", name);
+                        (
+                            McpResponse::error(-32602, msg.clone(), request.id),
+                            Some(msg),
+                        )
+                    };
+                audit::record(
+                    name,
+                    &audit_args,
+                    error.as_deref(),
+                    started.elapsed().as_millis(),
+                );
+                response
             }
             "resources/list" => {
                 McpResponse::success(resources_list_json(&self.resources), request.id)

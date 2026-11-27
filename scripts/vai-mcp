@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# One entry point for every MCP agent (Claude Code, opencode, Codex, Cursor,
+# Gemini CLI, ...): resolves this repo's binaries and per-tool config, then
+# execs the requested stdio MCP server. Logs go to stderr only.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+CONF_DIR="${VAI_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/virtuoso-ai}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/virtuoso-ai"
+FULL_CAPS="schematic,maestro,window,cell,simulation,transaction,library,admin"
+SAFE_DENY="evaluate,load_file"
+
+usage() {
+    cat >&2 <<USAGE
+usage: vai-mcp <vcli|bridge|doctor>
+  vcli     run vcli's MCP server (stdio)
+  bridge   run virtuoso-bridge-lite's MCP server (stdio)
+  doctor   check both sides and print the effective settings
+settings (env, or in \$VAI_CONFIG_DIR/{vcli,bridge}.env; default dir $CONF_DIR):
+  VAI_MODE=full|safe   full (default): raw SKILL allowed on both servers
+                       safe: no raw SKILL (vcli without admin, bridge without $SAFE_DENY)
+  VAI_LOCK_FILE        cross-bridge lock (default /tmp/virtuoso-ai-bridge.lock)
+  VAI_AUDIT_LOG        shared audit log (default $STATE_DIR/audit.jsonl; "off" disables)
+  VCLI_BIN, VAI_PYTHON override binary / interpreter discovery
+USAGE
+}
+
+log() { echo "[vai-mcp] $*" >&2; }
+
+load_env() {
+    local f="$CONF_DIR/$1.env"
+    if [[ -f "$f" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "$f"
+        set +a
+    fi
+}
+
+common() {
+    export VAI_LOCK_FILE="${VAI_LOCK_FILE:-/tmp/virtuoso-ai-bridge.lock}"
+    export VAI_AUDIT_LOG="${VAI_AUDIT_LOG:-$STATE_DIR/audit.jsonl}"
+    VAI_MODE="${VAI_MODE:-full}"
+    case "$VAI_MODE" in
+        full | safe) ;;
+        *) log "VAI_MODE must be full or safe (got '$VAI_MODE')"; exit 2 ;;
+    esac
+}
+
+find_vcli() {
+    local c
+    for c in "${VCLI_BIN:-}" "$REPO/target/release/vcli" "$REPO/target/debug/vcli"; do
+        [[ -n "$c" && -x "$c" ]] && { echo "$c"; return 0; }
+    done
+    if c="$(command -v vcli 2>/dev/null)"; then
+        log "using vcli from PATH ($c); make sure it is THIS repo's namespaced build, not upstream vcli"
+        echo "$c"
+        return 0
+    fi
+    return 1
+}
+
+find_python() {
+    local c
+    for c in "${VAI_PYTHON:-}" "$REPO/python/.venv/bin/python" "$REPO/.venv/bin/python" "$(command -v python3 2>/dev/null || true)"; do
+        [[ -n "$c" && -x "$c" ]] && "$c" -c 'import virtuoso_bridge' 2>/dev/null && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+run_vcli() {
+    load_env vcli
+    common
+    local bin
+    bin="$(find_vcli)" || { log "vcli not found: run ./install.sh --user or cargo build --release in $REPO"; exit 1; }
+    if [[ "$VAI_MODE" == full ]]; then
+        export VCLI_CAPABILITY="${VCLI_CAPABILITY:-$FULL_CAPS}"
+    fi
+    exec "$bin" mcp serve
+}
+
+run_bridge() {
+    load_env bridge
+    common
+    export RB_REPLY_TAGS="${RB_REPLY_TAGS:-1}"
+    if [[ "$VAI_MODE" == safe ]]; then
+        export VAI_DENY_TOOLS="${VAI_DENY_TOOLS:-$SAFE_DENY}"
+    fi
+    local py
+    py="$(find_python)" || { log "virtuoso_bridge not importable: run 'uv venv python/.venv && uv pip install --python python/.venv/bin/python ./python' in $REPO"; exit 1; }
+    exec "$py" "$REPO/python/mcp_server.py"
+}
+
+has() { if [[ -f "$1" ]]; then echo "present"; else echo "not set (optional)"; fi; }
+
+check() { if "$@" >/dev/null 2>&1; then echo "ok"; else echo "MISSING"; fi; }
+
+doctor() {
+    common
+    local bin py
+    echo "repo          $REPO"
+    echo "mode          $VAI_MODE"
+    echo "config dir    $CONF_DIR (vcli.env: $(has "$CONF_DIR/vcli.env"), bridge.env: $(has "$CONF_DIR/bridge.env"))"
+    if bin="$(find_vcli 2>/dev/null)"; then
+        echo "vcli          ok   $bin ($("$bin" --version 2>/dev/null | head -1))"
+    else
+        echo "vcli          MISSING  (./install.sh --user, or cargo build --release)"
+    fi
+    if py="$(find_python)"; then
+        echo "bridge-lite   ok   $py"
+    else
+        echo "bridge-lite   MISSING  (uv venv python/.venv && uv pip install --python python/.venv/bin/python ./python)"
+    fi
+    echo "lock file     $VAI_LOCK_FILE ($(check touch "$VAI_LOCK_FILE"))"
+    echo "audit log     $VAI_AUDIT_LOG"
+    echo "live checks   virtuoso-bridge status   |   vcli skill exec 'getCurrentTime()'"
+}
+
+case "${1:-}" in
+    vcli) run_vcli ;;
+    bridge) run_bridge ;;
+    doctor) doctor ;;
+    -h | --help | help) usage ;;
+    *) usage; exit 2 ;;
+esac

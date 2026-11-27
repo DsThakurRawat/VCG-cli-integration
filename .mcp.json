@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "virtuoso-vcli": {
+      "command": "./scripts/vai-mcp",
+      "args": ["vcli"]
+    },
+    "virtuoso-bridge": {
+      "command": "./scripts/vai-mcp",
+      "args": ["bridge"]
+    }
+  }
+}

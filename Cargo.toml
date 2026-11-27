@@ -24,6 +24,9 @@ exclude = [
     "process_data/",
     "SKILL-TREE-SYNC-REPORT.md",
     "CLAUDE.md",
+    "AGENTS.md",
+    ".mcp.json",
+    "opencode.json",
 ]
 
 [[bin]]

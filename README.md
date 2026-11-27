@@ -52,8 +52,24 @@ uv pip install ./python      # or: pip install ./python
 ```
 
 Human use: `vcli ...` and `virtuoso-bridge ...` CLIs as documented by each
-tool. Agent use: point your MCP client at vcli's MCP server and/or
-`python/mcp_server.py` (stdio; see `python/mcp/mcp.example.json`).
+tool.
+
+## Use with any AI agent
+
+Both bridges are MCP servers, started through one launcher:
+`scripts/vai-mcp vcli` and `scripts/vai-mcp bridge`. Run
+`scripts/vai-mcp doctor` to check the install.
+
+- **Claude Code** (`.mcp.json`) and **opencode** (`opencode.json`): ready in
+  the repo root, so start the agent here.
+- **Codex, Cursor, Gemini CLI, VS Code, Claude Desktop, ...**: copy-paste
+  configs in `docs/agents.md`.
+- **Agent rules**: `AGENTS.md` (Claude Code reads it via `CLAUDE.md`).
+- **Mode**: `VAI_MODE=full` (default) lets the agent run raw SKILL, so it
+  can do anything Cadence can. `VAI_MODE=safe` removes raw SKILL from both
+  servers.
+- **Human oversight**: every agent tool call from either server goes to one
+  shared audit log. Watch it live with `scripts/vai-audit -f`.
 
 ## Setup notes that matter
 

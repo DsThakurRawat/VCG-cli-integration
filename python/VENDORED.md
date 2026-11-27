@@ -20,7 +20,13 @@ in academic use).
    `$VAI_LOCK_FILE`, default `/tmp/virtuoso-ai-bridge.lock`), taken for the
    whole of every evaluation. Design rationale:
    `../docs/decision-records/0001-dual-bridge-coexistence.md`.
-2. This directory is excluded from the repo's comment-budget gate
+2. `mcp_server.py`: appends every `tools/call` to the JSONL audit log
+   shared with vcli's MCP server (`$VAI_AUDIT_LOG`, default
+   `~/.local/state/virtuoso-ai/audit.jsonl`, `off` disables), and honours
+   `VAI_DENY_TOOLS` (comma list, hidden from `tools/list` and refused on
+   call; the `scripts/vai-mcp` safe mode sets it). Tested by
+   `../tests/python/test_agent_layer.py`.
+3. This directory is excluded from the repo's comment-budget gate
    (`../scripts/check-comment-budget.py`), the same way `resources/` is:
    vendored code keeps upstream's comment surface.
 
@@ -32,7 +38,7 @@ Get them from the upstream repo if needed.
 
 ## Updating
 
-Re-copy from a newer upstream commit, re-apply modification 1 (or port it if
-the daemon files changed), run `tests/` plus
+Re-copy from a newer upstream commit, re-apply modifications 1 and 2 (or port them if
+the files changed), run `tests/` plus
 `../tests/python/test_vai_lock_integration.py`, then update the base commit
 above.

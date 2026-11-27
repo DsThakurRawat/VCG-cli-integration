@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "virtuoso-vcli": {
+      "type": "local",
+      "command": ["./scripts/vai-mcp", "vcli"],
+      "enabled": true
+    },
+    "virtuoso-bridge": {
+      "type": "local",
+      "command": ["./scripts/vai-mcp", "bridge"],
+      "enabled": true
+    }
+  }
+}

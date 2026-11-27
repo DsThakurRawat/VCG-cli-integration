@@ -22,3 +22,25 @@ this toolset is experimental.
 8. [ ] `VCStopAll()` / `RBStopAll()` each stop only their own daemon.
 9. [ ] One write test in the scratch library (place a component via each
       bridge, sequentially) and open the cellView to confirm both landed.
+
+## Agent layer (same scratch session)
+
+10. [ ] `scripts/vai-mcp doctor` reports vcli and bridge-lite `ok`, with
+       `VAI_LOCK_FILE` equal to the value in the Virtuoso session's env.
+11. [ ] Start an MCP agent in this repo (opencode via `opencode.json`, or
+       Claude Code via `.mcp.json`). Both `virtuoso-vcli` and
+       `virtuoso-bridge` connect and list tools.
+12. [ ] Ask the agent for a harmless read on each server (bridge
+       `evaluate` `1+2`, vcli `skill_exec` `getCurrentTime()`); both answer.
+13. [ ] `scripts/vai-audit -f` in another terminal shows both calls live,
+       with the agent's client name, `ok`, and duration.
+14. [ ] Lock under an agent: while the agent runs a long bridge eval, run
+       `vcli skill exec '1+1'` by hand. It waits, then answers.
+15. [ ] Restart with `VAI_MODE=safe`: `evaluate`, `load_file` and
+       `skill_exec` are gone from the tool lists, and a forced call is
+       refused and logged as `ERR`.
+16. [ ] Agent write in the scratch library: `tx_begin`, place one instance,
+       `tx_diff`, `tx_rollback`. The cellview is unchanged afterwards. Then
+       repeat with `tx_commit` and confirm in the GUI.
+17. [ ] Repeat 11-12 with a second agent (Codex, Cursor or Gemini, configs
+       in `docs/agents.md`) to confirm the setup is agent-agnostic.

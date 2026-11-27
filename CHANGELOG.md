@@ -18,6 +18,13 @@ All notable changes to this project will be documented in this file.
 - Added `tests/python/test_vai_lock_integration.py` (functional
   cross-process flock proof over the shipped daemon code).
 - Design rationale moved to `docs/decision-records/0001-dual-bridge-coexistence.md`.
+- Agent-agnostic MCP setup: `scripts/vai-mcp` launcher (`vcli` / `bridge` /
+  `doctor`, per-tool env files, `VAI_MODE=full|safe`), ready configs for
+  Claude Code (`.mcp.json`) and opencode (`opencode.json`), other agents in
+  `docs/agents.md`, and agent rules in `AGENTS.md`.
+- Shared agent audit log: both MCP servers append every tool call to
+  `$VAI_AUDIT_LOG` (JSONL, mode 0600); `scripts/vai-audit [-f]` shows it.
+- Added "Agent layer" steps 10-17 to `ACCEPTANCE.md`.
 
 ## [Unreleased]
 
