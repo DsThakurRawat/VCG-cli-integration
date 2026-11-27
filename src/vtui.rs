@@ -35,8 +35,8 @@ mod target;
 mod test_env;
 mod transaction;
 mod transport;
-mod vai_lock;
 mod tui;
+mod vai_lock;
 mod version;
 
 pub use capability::{Capability, CapabilitySet};

@@ -9,7 +9,6 @@ pub mod config;
 pub mod config_file;
 pub mod context;
 pub mod daemon;
-pub mod vai_lock;
 pub mod error;
 pub mod exit_codes;
 pub mod history;
@@ -35,6 +34,7 @@ pub mod test_env;
 pub mod transaction;
 pub mod transport;
 pub mod tui;
+pub mod vai_lock;
 pub mod version;
 
 pub use auth::{auth, check_auth, log_rpc, Auth};

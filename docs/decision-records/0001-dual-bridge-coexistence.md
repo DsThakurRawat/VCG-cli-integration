@@ -40,6 +40,11 @@ same cellView at the same moment.
   and EDA hosts often mount home/scratch over NFS.
 - Fail-open with a stderr warning if the lock file is unusable: a
   coordination aid must not wedge a daemon on an odd filesystem.
+- Platform scope: flock exists only on Unix, and both daemons (and the
+  Virtuoso host they run on) are always Linux. On non-Unix builds (the
+  Windows client is ssh-only and never runs a local SKILL mutation),
+  `src/vai_lock.rs` compiles to an explicit no-op that logs a warning and
+  never claims to hold a lock. Mutual exclusion on the host is unchanged.
 
 ## Consequences
 

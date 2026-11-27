@@ -1,7 +1,9 @@
 //! Cross-bridge mutation lock - rationale: docs/decision-records/0001-dual-bridge-coexistence.md
 
-use std::fs::{File, OpenOptions};
-use std::io;
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
 pub const DEFAULT_LOCK_PATH: &str = "/tmp/virtuoso-ai-bridge.lock";
@@ -17,9 +19,15 @@ pub struct VaiLock {
     file: Option<File>,
 }
 
+#[cfg(unix)]
 pub fn acquire() -> VaiLock {
     let path = lock_path();
-    match OpenOptions::new().read(true).write(true).create(true).open(&path) {
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+    {
         Ok(f) => {
             let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
             if rc == 0 {
@@ -28,22 +36,34 @@ pub fn acquire() -> VaiLock {
                 eprintln!(
                     "[vai-lock] flock({}) failed: {}; proceeding UNLOCKED",
                     path,
-                    io::Error::last_os_error()
+                    std::io::Error::last_os_error()
                 );
                 VaiLock { file: None }
             }
         }
         Err(e) => {
-            eprintln!("[vai-lock] cannot open {}: {}; proceeding UNLOCKED", path, e);
+            eprintln!(
+                "[vai-lock] cannot open {}: {}; proceeding UNLOCKED",
+                path, e
+            );
             VaiLock { file: None }
         }
     }
 }
 
+#[cfg(not(unix))]
+pub fn acquire() -> VaiLock {
+    eprintln!("[vai-lock] flock is unavailable on this platform; proceeding UNLOCKED");
+    VaiLock { file: None }
+}
+
 impl Drop for VaiLock {
     fn drop(&mut self) {
-        if let Some(f) = self.file.take() {
-            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        if let Some(_f) = self.file.take() {
+            #[cfg(unix)]
+            unsafe {
+                libc::flock(_f.as_raw_fd(), libc::LOCK_UN)
+            };
         }
     }
 }
@@ -63,6 +83,7 @@ mod tests {
         std::env::remove_var("VAI_LOCK_FILE");
     }
 
+    #[cfg(unix)]
     #[test]
     fn second_acquire_blocks_until_first_releases() {
         std::env::set_var("VAI_LOCK_FILE", "/tmp/vai-test-serialize.lock");

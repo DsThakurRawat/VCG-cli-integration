@@ -3047,7 +3047,6 @@ pub fn resolve_unique_window(
     }
 }
 
-
 fn vai_wrap(cmd: &str) -> String {
     format!(
         "flock {} -c {}",
