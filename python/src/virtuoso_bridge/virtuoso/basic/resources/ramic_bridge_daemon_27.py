@@ -450,6 +450,38 @@ _o_nonblock = int(getattr(os, "O_NONBLOCK", 0))
 # Fail-open with a stderr warning: a coordination aid must not wedge the
 # daemon on an odd filesystem.
 _VAI_LOCK_PATH = os.environ.get("VAI_LOCK_FILE") or "/tmp/virtuoso-ai-bridge.lock"
+
+def _vai_quarantine_path():
+    return _VAI_LOCK_PATH + ".quarantine"
+
+
+def _vai_quarantined():
+    try:
+        with open(_vai_quarantine_path(), "r") as fh:
+            body = fh.read().strip()
+        return body if body else "reason not recorded"
+    except (IOError, OSError) as exc:
+        if getattr(exc, "errno", None) == errno.ENOENT:
+            return None
+        return "quarantine marker exists but is UNREADABLE: %s" % exc
+
+
+def _vai_enter_quarantine(reason):
+    try:
+        with open(_vai_quarantine_path(), "w") as fh:
+            fh.write(reason)
+        sys.stderr.write("[vai-lock] QUARANTINE entered: %s\n" % reason)
+        return True
+    except (IOError, OSError) as exc:
+        sys.stderr.write("[vai-lock] cannot write quarantine marker %s: %s; "
+                         "lock remains HELD. Recovery order: confirm the "
+                         "Virtuoso session is idle (or restart it) FIRST - "
+                         "restarting this daemon alone does not stop a remote "
+                         "evaluation that may still be running - then fix the "
+                         "filesystem, then restart this daemon to release the "
+                         "lock\n" % (_vai_quarantine_path(), exc))
+        return False
+
 _flock_fn = getattr(_fcntl, "flock", None)
 _VAI_LOCK_EX = getattr(_fcntl, "LOCK_EX", 2)
 _VAI_LOCK_UN = getattr(_fcntl, "LOCK_UN", 8)
@@ -883,8 +915,24 @@ def _execute_recoverable(skill_code):
     # Hold the cross-bridge lock for the whole round-trip so a co-resident
     # virtuoso-cli daemon (or GUI input) cannot act on this session mid-eval.
     _vai_fd = _vai_lock_acquire()
+    if _vai_fd is None:
+        raise RequestNotStarted(
+            "cross-bridge lock unavailable (%s); refusing to run uncoordinated" % _VAI_LOCK_PATH)
+    _vai_q = _vai_quarantined()
+    if _vai_q is not None:
+        _vai_lock_release(_vai_fd)
+        raise RequestNotStarted(
+            "cross-bridge quarantine active: %s (remove %s only after the Virtuoso session is confirmed idle)"
+            % (_vai_q, _vai_quarantine_path()))
+    _vai_keep_lock = False
     try:
-        raw = _transmit_and_read(skill_code)
+        try:
+            raw = _transmit_and_read(skill_code)
+        except ExecutionUncertain:
+            if not _vai_enter_quarantine(
+                    "bridge-lite recoverable request outcome uncertain; remote SKILL may still be running"):
+                _vai_keep_lock = True
+            raise
         try:
             result = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -892,7 +940,8 @@ def _execute_recoverable(skill_code):
         success = raw[:1] == "\x02"
         return result
     finally:
-        _vai_lock_release(_vai_fd)
+        if not _vai_keep_lock:
+            _vai_lock_release(_vai_fd)
         _RB_CALLS += 1
         if not success:
             _RB_ERRORS += 1
@@ -976,7 +1025,22 @@ def handle_external_connection(conn, addr):
             _safe_sendall(conn, _signed_response(request_nonce, return_data))
             return
 
+        _vai_fd = _vai_lock_acquire()
+        if _vai_fd is None:
+            _RECOVERY.finish_legacy(None)
+            return_data = "\x15LockError: cross-bridge lock unavailable (%s); refusing to run uncoordinated" % _VAI_LOCK_PATH
+            _safe_sendall(conn, _signed_response(request_nonce, return_data))
+            return
+        _vai_q = _vai_quarantined()
+        if _vai_q is not None:
+            _vai_lock_release(_vai_fd)
+            _RECOVERY.finish_legacy(None)
+            return_data = ("\x15QuarantineError: cross-bridge quarantine active: %s (remove %s only after the Virtuoso session is confirmed idle)" % (_vai_q, _vai_quarantine_path())).encode("utf-8")
+            _safe_sendall(conn, _signed_response(request_nonce, return_data))
+            return
+
         poison = None
+        _vai_keep_lock = False
         try:
             return_data = _transmit_and_read(
                 request_data["skill"], request_data["timeout"]
@@ -984,12 +1048,20 @@ def handle_external_connection(conn, addr):
         except RequestNotStarted as exc:
             return_data = "\x15" + _format_exception(exc)
         except ExecutionUncertain as exc:
+            if not _vai_enter_quarantine(
+                    "bridge-lite legacy request outcome uncertain: %s" % _format_exception(exc)):
+                _vai_keep_lock = True
             poison = _format_exception(exc) or "legacy execution outcome is unknown"
             return_data = "\x15" + poison
         except Exception as exc:
+            if not _vai_enter_quarantine(
+                    "bridge-lite legacy request failed after possible transmission: %s" % _format_exception(exc)):
+                _vai_keep_lock = True
             poison = "unexpected legacy failure after possible transmission: " + _format_exception(exc)
             return_data = "\x15" + poison
         finally:
+            if not _vai_keep_lock:
+                _vai_lock_release(_vai_fd)
             _RECOVERY.finish_legacy(poison)
 
         _safe_sendall(conn, _signed_response(request_nonce, return_data))

@@ -94,7 +94,115 @@ def test_cross_process_exclusion_and_release(tmp_path):
             child.wait(timeout=10)
 
 
-def test_fail_open_on_unusable_path(tmp_path):
+def test_unusable_lock_path_returns_none(tmp_path):
     bad_dir = tmp_path / "no-such-dir"
     mod = load_daemon_module(DAEMON_PATHS[0], str(bad_dir / "vai.lock"))
     assert mod._vai_lock_acquire() is None
+
+
+def test_all_daemon_copies_carry_quarantine_check():
+    for rel in DAEMON_PATHS:
+        with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as fh:
+            text = fh.read()
+        assert "_vai_quarantined" in text, rel
+        assert ".quarantine" in text, rel
+
+
+def test_quarantine_marker_blocks_and_clears(tmp_path):
+    lock_path = str(tmp_path / "vai.lock")
+    mod = load_daemon_module(DAEMON_PATHS[0], lock_path)
+    assert mod._vai_quarantined() is None
+    marker = mod._vai_quarantine_path()
+    assert marker == lock_path + ".quarantine"
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write("timeout during eval")
+    reason = mod._vai_quarantined()
+    assert reason == "timeout during eval"
+    try:
+        mod._execute_recoverable("1+1")
+        raise AssertionError("eval ran while quarantined")
+    except mod.RequestNotStarted as exc:
+        assert "quarantine" in str(exc)
+    os.remove(marker)
+    assert mod._vai_quarantined() is None
+
+
+def test_uncertain_outcome_writes_quarantine_marker(tmp_path):
+    lock_path = str(tmp_path / "vai.lock")
+    mod = load_daemon_module(DAEMON_PATHS[0], lock_path)
+
+    def boom(_skill):
+        raise mod.ExecutionUncertain("simulated partial transmission")
+
+    mod._transmit_and_read = boom
+    try:
+        mod._execute_recoverable("1+1")
+        raise AssertionError("expected ExecutionUncertain")
+    except mod.ExecutionUncertain:
+        pass
+    with open(mod._vai_quarantine_path(), encoding="utf-8") as fh:
+        assert "uncertain" in fh.read()
+    assert mod._vai_quarantined() is not None
+
+
+def test_recoverable_refuses_when_lock_unavailable(tmp_path):
+    bad_dir = tmp_path / "no-such-dir"
+    mod = load_daemon_module(DAEMON_PATHS[0], str(bad_dir / "vai.lock"))
+
+    def forbidden(_skill):
+        raise AssertionError("transmit ran without the cross-bridge lock")
+
+    mod._transmit_and_read = forbidden
+    try:
+        mod._execute_recoverable("1+1")
+        raise AssertionError("eval ran without the cross-bridge lock")
+    except mod.RequestNotStarted as exc:
+        assert "lock unavailable" in str(exc)
+
+
+def test_marker_write_failure_keeps_lock_held(tmp_path):
+    lock_path = str(tmp_path / "vai.lock")
+    mod = load_daemon_module(DAEMON_PATHS[0], lock_path)
+
+    def boom(_skill):
+        raise mod.ExecutionUncertain("simulated partial transmission")
+
+    mod._transmit_and_read = boom
+    mod._vai_enter_quarantine = lambda _reason: False
+    try:
+        mod._execute_recoverable("1+1")
+        raise AssertionError("expected ExecutionUncertain")
+    except mod.ExecutionUncertain:
+        pass
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        raise AssertionError("lock was released after a failed marker write")
+    except BlockingIOError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def test_unreadable_marker_treated_as_active(tmp_path):
+    lock_path = str(tmp_path / "vai.lock")
+    marker = lock_path + ".quarantine"
+    os.mkdir(marker)
+    mod = load_daemon_module(DAEMON_PATHS[0], lock_path)
+    reason = mod._vai_quarantined()
+    assert reason is not None
+    assert "UNREADABLE" in reason
+    try:
+        mod._execute_recoverable("1+1")
+        raise AssertionError("eval ran while the marker was unreadable")
+    except mod.RequestNotStarted as exc:
+        assert "UNREADABLE" in str(exc)
+
+
+def test_all_daemon_copies_refuse_and_hold_on_error():
+    for rel in DAEMON_PATHS:
+        with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as fh:
+            text = fh.read()
+        assert "_vai_enter_quarantine" in text, rel
+        assert "LockError: cross-bridge lock unavailable" in text, rel
+        assert "_vai_keep_lock" in text, rel

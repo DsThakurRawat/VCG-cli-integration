@@ -19,6 +19,38 @@ import traceback
 # kernel releases it if this daemon dies. Rationale: docs/decision-records/.
 _VAI_LOCK_PATH = os.environ.get("VAI_LOCK_FILE") or "/tmp/virtuoso-ai-bridge.lock"
 
+def _vai_quarantine_path():
+    return _VAI_LOCK_PATH + ".quarantine"
+
+
+def _vai_quarantined():
+    try:
+        with open(_vai_quarantine_path(), "r") as fh:
+            body = fh.read().strip()
+        return body if body else "reason not recorded"
+    except (IOError, OSError) as exc:
+        if getattr(exc, "errno", None) == errno.ENOENT:
+            return None
+        return "quarantine marker exists but is UNREADABLE: %s" % exc
+
+
+def _vai_enter_quarantine(reason):
+    try:
+        with open(_vai_quarantine_path(), "w") as fh:
+            fh.write(reason)
+        sys.stderr.write("[vai-lock] QUARANTINE entered: %s\n" % reason)
+        return True
+    except (IOError, OSError) as exc:
+        sys.stderr.write("[vai-lock] cannot write quarantine marker %s: %s; "
+                         "lock remains HELD. Recovery order: confirm the "
+                         "Virtuoso session is idle (or restart it) FIRST - "
+                         "restarting this daemon alone does not stop a remote "
+                         "evaluation that may still be running - then fix the "
+                         "filesystem, then restart this daemon to release the "
+                         "lock\n" % (_vai_quarantine_path(), exc))
+        return False
+
+
 
 def _vai_lock_acquire():
     try:
@@ -152,6 +184,15 @@ def handle_external_connection(conn, addr):
         timeout_flag = False
 
         _vai_fd = _vai_lock_acquire()
+        if _vai_fd is None:
+            conn.sendall(("\x15LockError: cross-bridge lock unavailable (%s); refusing to run uncoordinated" % _VAI_LOCK_PATH).encode("utf-8"))
+            return
+        _vai_q = _vai_quarantined()
+        if _vai_q is not None:
+            _vai_lock_release(_vai_fd)
+            conn.sendall(("\x15QuarantineError: cross-bridge quarantine active: %s (remove %s only after the Virtuoso session is confirmed idle)" % (_vai_q, _vai_quarantine_path())).encode("utf-8"))
+            return
+        _vai_keep_lock = False
         try:
             # Clear stdin buffer before writing
             while True:
@@ -171,8 +212,18 @@ def handle_external_connection(conn, addr):
             watchdog_timer.start()
 
             returnData = read_until_delimiter()
+            if timeout_flag:
+                if not _vai_enter_quarantine(
+                        "request timed out; remote SKILL completion uncertain (SIGINT sent)"):
+                    _vai_keep_lock = True
+        except Exception:
+            if not _vai_enter_quarantine(
+                    "daemon error mid-eval; remote SKILL completion uncertain"):
+                _vai_keep_lock = True
+            raise
         finally:
-            _vai_lock_release(_vai_fd)
+            if not _vai_keep_lock:
+                _vai_lock_release(_vai_fd)
 
         if not timeout_flag:
             timeout_flag = True

@@ -38,13 +38,19 @@ same cellView at the same moment.
 - It covers xdotool GUI input, which never enters the SKILL interpreter.
 - Opened O_RDWR: LOCK_EX on an O_RDONLY descriptor fails with EBADF on NFS,
   and EDA hosts often mount home/scratch over NFS.
-- Fail-open with a stderr warning if the lock file is unusable: a
-  coordination aid must not wedge a daemon on an odd filesystem.
+- Fail-closed on lock errors: if the lock file cannot be opened or flocked,
+  every mutation entry point (vcli daemon request handler, both bridge-lite
+  legacy handlers, both recoverable paths) refuses the request instead of
+  running uncoordinated; clients get a NAK / LockError naming the lock path.
+  The lock is what makes two bridges on one session safe, so proceeding
+  without it is never the safe direction.
 - Platform scope: flock exists only on Unix, and both daemons (and the
   Virtuoso host they run on) are always Linux. On non-Unix builds (the
   Windows client is ssh-only and never runs a local SKILL mutation),
-  `src/vai_lock.rs` compiles to an explicit no-op that logs a warning and
-  never claims to hold a lock. Mutual exclusion on the host is unchanged.
+  `src/vai_lock.rs` compiles to an explicit no-op that logs a warning,
+  reports coordination as unsupported so callers skip the fail-closed
+  refusal, and never claims to hold a lock. Mutual exclusion on the host is
+  unchanged.
 
 ## Consequences
 
@@ -59,11 +65,36 @@ same cellView at the same moment.
   mid-drag with the button still down, the guard's Drop issues a best-effort
   mouseup as a follow-up command so the session is not left with a pressed
   button.
-- Timeout boundary: if `wait_for_callback` times out, the RAII guard
-  releases while the remote SKILL may still be running in the CIW. The vcli
-  daemon then refuses further requests on that channel (stuck-call state),
-  but the bridge-lite daemon does not see that state, so after a timeout
-  cross-bridge serialization is not guaranteed until the Virtuoso session is
-  idle again. Recovery is to let the session go idle or restart it.
+- Timeout quarantine (fail-closed on uncertain completion): if
+  `wait_for_callback` times out or the callback read fails, the remote SKILL
+  may still be running in the CIW. Before releasing the lock the vcli daemon
+  writes a quarantine marker at `$VAI_LOCK_FILE.quarantine`; the bridge-lite
+  daemons write the same marker on their own uncertain outcomes
+  (ExecutionUncertain, watchdog timeout, mid-eval error). Every evaluation on
+  both bridges, and every wrapped xdotool GUI command, checks the marker
+  under the flock and refuses while it exists, so an uncertain remote
+  evaluation cannot overlap a new one or new GUI input. Recovery is explicit:
+  confirm the Virtuoso session is idle (or restart it), then remove the
+  marker file. A stale marker after a crash therefore blocks both bridges
+  until an operator confirms idle, which is the intended safe direction.
+  Error paths fail closed: an unreadable marker is treated as an active
+  quarantine (a marker that cannot be read cannot be distinguished from a
+  recorded uncertain outcome; the shell GUI gate uses an existence test for
+  the same reason), and if the marker itself cannot be WRITTEN after an
+  uncertain outcome, the daemon keeps the cross-bridge lock HELD instead of
+  releasing it - the sibling bridge then blocks on the flock rather than
+  mutating a session whose state is unknown. Recovery has a required order:
+  FIRST confirm the Virtuoso session is idle or restart it (restarting the
+  bridge daemon alone releases the leaked flock but does NOT stop a remote
+  evaluation that may still be running), THEN fix the filesystem, THEN
+  restart the bridge daemon; the kernel releases the held flock when the
+  daemon exits. One deliberate exception: the
+  MouseButtonGuard's best-effort mouseup bypasses the marker (restoring a
+  pressed button is safety cleanup, not new input; it is still flocked).
+  Trust model: the lock and marker coordinate daemons of the SAME user on
+  one host; they are not a security boundary. A local same-user process can
+  delete or replace either file (including symlink games), and this design
+  does not defend against that - it guards against overlapping automation,
+  not adversarial local users.
 - With several Virtuoso sessions on one host, set `VAI_LOCK_FILE` to a
   per-session path in each session's environment; the default is host-wide.

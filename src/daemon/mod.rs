@@ -234,7 +234,22 @@ pub fn handle_request(
         return nak_frame(&msg);
     }
 
-    let _vai_guard = crate::vai_lock::acquire();
+    let vai_guard = crate::vai_lock::acquire();
+    if vai_guard.coordination_supported() && !vai_guard.held() {
+        ERRORS.fetch_add(1, Ordering::Relaxed);
+        let msg = format!(
+            "cross-bridge lock unavailable ({}); refusing to run uncoordinated",
+            crate::vai_lock::lock_path()
+        );
+        eprintln!("[virtuoso-daemon] {msg}");
+        return nak_frame(&msg);
+    }
+
+    if let Some(msg) = crate::vai_lock::quarantined() {
+        ERRORS.fetch_add(1, Ordering::Relaxed);
+        eprintln!("[virtuoso-daemon] refusing request: {msg}");
+        return nak_frame(&msg);
+    }
 
     let started_at_unix = unix_now();
     let started_at = rfc3339_now();
@@ -262,6 +277,14 @@ pub fn handle_request(
                      and never returned.",
                 );
             }
+            if !crate::vai_lock::enter_quarantine(
+                "wait_for_callback timed out; remote SKILL completion uncertain",
+            ) {
+                msg.push_str(
+                    "\nWARNING: the cross-bridge quarantine marker could not be written; the cross-bridge lock remains HELD. Recovery order: confirm the Virtuoso session is idle or restart it FIRST (restarting the bridge daemon alone does not stop a remote evaluation that may still be running), then fix the filesystem, then restart the vcli daemon to release the held lock.",
+                );
+                std::mem::forget(vai_guard);
+            }
             state.mark_hung(stuck.clone());
             write_hung_record(port, &stuck);
             eprintln!("[virtuoso-daemon] {msg}");
@@ -269,7 +292,15 @@ pub fn handle_request(
         }
         Err(e) => {
             ERRORS.fetch_add(1, Ordering::Relaxed);
-            let msg = format!("callback read failed: {e}");
+            let mut msg = format!("callback read failed: {e}");
+            if !crate::vai_lock::enter_quarantine(
+                "callback read failed mid-eval; remote SKILL completion uncertain",
+            ) {
+                msg.push_str(
+                    "; WARNING: the cross-bridge quarantine marker could not be written; the cross-bridge lock remains HELD. Recovery order: confirm the Virtuoso session is idle or restart it FIRST (restarting the bridge daemon alone does not stop a remote evaluation that may still be running), then fix the filesystem, then restart the vcli daemon to release the held lock",
+                );
+                std::mem::forget(vai_guard);
+            }
             eprintln!("[virtuoso-daemon] {msg}");
             nak_frame(&msg)
         }

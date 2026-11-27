@@ -2609,7 +2609,7 @@ impl Drop for MouseButtonGuard<'_> {
             self.display_prefix, self.window_id, self.button,
         );
         let req = CommandRequest::with_exec_timeout(
-            vai_wrap(&remote_cmd),
+            vai_wrap_in_quarantine(&remote_cmd),
             Duration::from_secs(5), // bounded best-effort
         );
         if let Err(e) = self.runner.run_command(&req) {
@@ -3020,6 +3020,19 @@ pub fn resolve_unique_window(
 }
 
 fn vai_wrap(cmd: &str) -> String {
+    let gated = format!(
+        "if [ -e {0} ] || [ -L {0} ]; then echo 'cross-bridge quarantine active; refusing GUI input' >&2; exit 97; fi; {1}",
+        shell_escape(&crate::vai_lock::quarantine_path()),
+        cmd
+    );
+    format!(
+        "flock {} -c {}",
+        shell_escape(&crate::vai_lock::lock_path()),
+        shell_escape(&gated)
+    )
+}
+
+fn vai_wrap_in_quarantine(cmd: &str) -> String {
     format!(
         "flock {} -c {}",
         shell_escape(&crate::vai_lock::lock_path()),
@@ -5757,6 +5770,55 @@ mod tests {
         );
         assert!(joined.contains(" && "), "steps chained atomically");
         assert!(joined.contains("mousedown") && joined.contains("mouseup"));
+        assert!(
+            wrapped.contains(".quarantine"),
+            "GUI input gated on quarantine"
+        );
+        assert!(wrapped.contains("exit 97"));
+        assert!(
+            wrapped.contains("[ -e ") && wrapped.contains("[ -L "),
+            "gate must block on any existing marker path, including dangling symlinks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_gate_blocks_file_dir_and_dangling_symlink_markers() {
+        let base = std::env::temp_dir().join(format!("vai-gate-test-{}", std::process::id()));
+        let lock = base.join("lock");
+        let marker = format!("{}.quarantine", lock.to_string_lossy());
+        std::fs::create_dir_all(&base).unwrap();
+        std::env::set_var("VAI_LOCK_FILE", lock.to_string_lossy().to_string());
+        let wrapped = vai_wrap("exit 0");
+        let run = || {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&wrapped)
+                .status()
+                .expect("sh runs")
+                .code()
+        };
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_dir_all(&marker);
+        assert_eq!(run(), Some(0), "no marker: command runs");
+        std::fs::write(&marker, "timeout").unwrap();
+        assert_eq!(run(), Some(97), "regular marker: refused");
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert_eq!(run(), Some(97), "directory marker: refused");
+        std::fs::remove_dir_all(&marker).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-vai-target", &marker).unwrap();
+        assert_eq!(run(), Some(97), "dangling symlink marker: refused");
+        std::fs::remove_file(&marker).unwrap();
+        std::env::remove_var("VAI_LOCK_FILE");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_cleanup_mouseup_bypasses_quarantine_gate() {
+        let wrapped = vai_wrap_in_quarantine("xdotool mouseup --window 0x1 1");
+        assert!(!wrapped.contains(".quarantine"));
+        assert_eq!(wrapped.matches("flock").count(), 1);
     }
 
     #[test]
