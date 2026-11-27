@@ -7,7 +7,7 @@ jobs:
   unpack:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Unpack audited source and remove misnamed upload files
         run: |
           set -e
