@@ -36,6 +36,7 @@ mod tests;
 mod transaction;
 mod transport;
 mod tui;
+#[allow(dead_code)]
 mod vai_lock;
 mod version;
 
