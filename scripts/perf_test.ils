@@ -1,5 +1,12 @@
 ; perf_test.ils - Performance tests
 
+procedure(vaiElapsedMs(m)
+    if(and(listp(m) numberp(nth(2 m)))
+        1000.0 * nth(2 m)
+        1000.0 * (car(m) + cadr(m))
+    )
+)
+
 procedure(report(name cnt elapsed)
     let((per)
         per = float(elapsed) / float(cnt)
@@ -11,12 +18,11 @@ procedure(report(name cnt elapsed)
 procedure(test_cons(n)
     let((r)
         r = nil
-        t1 = getCurrentTime()
+        report("List cons" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = cons(i r)
         )
-        t2 = getCurrentTime()
-        report("List cons" n subtract(t2 t1))
+        ))))
     )
 )
 
@@ -24,12 +30,11 @@ procedure(test_cons(n)
 procedure(test_append(n)
     let((r)
         r = nil
-        t1 = getCurrentTime()
+        report("List append" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = append(r list(i))
         )
-        t2 = getCurrentTime()
-        report("List append" n subtract(t2 t1))
+        ))))
     )
 )
 
@@ -41,12 +46,11 @@ procedure(test_hash(n)
             ht[i] = i
         )
         v = 0
-        t1 = getCurrentTime()
+        report("Hash lookup" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             v = ht[i]
         )
-        t2 = getCurrentTime()
-        report("Hash lookup" n subtract(t2 t1))
+        ))))
     )
 )
 
@@ -58,12 +62,11 @@ procedure(test_nth(n)
             r = cons(i r)
         )
         v = 0
-        t1 = getCurrentTime()
+        report("List nth" 50 vaiElapsedMs(measureTime(progn(
         for(i 1 50
             v = car(nth(i r))
         )
-        t2 = getCurrentTime()
-        report("List nth" 50 subtract(t2 t1))
+        ))))
     )
 )
 
@@ -71,24 +74,22 @@ procedure(test_nth(n)
 procedure(test_strcat(n)
     let((s)
         s = ""
-        t1 = getCurrentTime()
+        report("Strcat" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             s = strcat(s "x")
         )
-        t2 = getCurrentTime()
-        report("Strcat" n subtract(t2 t1))
+        ))))
     )
 )
 
 ; Test 6: Eval string
 procedure(test_evalstr(n)
     let((v)
-        t1 = getCurrentTime()
+        report("Evalstring" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             v = evalstring(sprintf(nil "%d+1" i))
         )
-        t2 = getCurrentTime()
-        report("Evalstring" n subtract(t2 t1))
+        ))))
     )
 )
 

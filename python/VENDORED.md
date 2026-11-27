@@ -24,7 +24,9 @@ in academic use).
    shared with vcli's MCP server (`$VAI_AUDIT_LOG`, default
    `~/.local/state/virtuoso-ai/audit.jsonl`, `off` disables), and honours
    `VAI_DENY_TOOLS` (comma list, hidden from `tools/list` and refused on
-   call; the `scripts/vai-mcp` safe mode sets it). Tested by
+   call; the `scripts/vai-mcp` safe mode sets it), and finds the
+   `virtuoso-bridge` CLI on `PATH` when it is not next to the interpreter
+   (`startup`, `status`, `capture_session`). Tested by
    `../tests/python/test_agent_layer.py`.
 3. `src/virtuoso_bridge/virtuoso/basic/bridge.py`
    (`_ensure_daemon_capabilities`): in local mode (`VB_REMOTE_HOST=localhost`,

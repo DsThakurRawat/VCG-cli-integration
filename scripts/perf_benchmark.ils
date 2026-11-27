@@ -1,5 +1,12 @@
 ; perf_benchmark.ils - SKILL Performance Tests
 
+procedure(vaiElapsedMs(m)
+    if(and(listp(m) numberp(nth(2 m)))
+        1000.0 * nth(2 m)
+        1000.0 * (car(m) + cadr(m))
+    )
+)
+
 procedure(report(name cnt elapsed)
     let((per)
         per = float(elapsed) / float(cnt)
@@ -12,12 +19,11 @@ procedure(test_func_call(n)
     let((r)
         procedure(tf(x) x)
         r = nil
-        start = getCurrentTime()
+        report("Function call" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = cons(tf(i) r)
         )
-        end = getCurrentTime()
-        report("Function call" n subtract(end start))
+        ))))
         r
     )
 )
@@ -26,12 +32,11 @@ procedure(test_func_call(n)
 procedure(test_list_cons(n)
     let((r)
         r = nil
-        start = getCurrentTime()
+        report("List cons (fast)" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = cons(i r)
         )
-        end = getCurrentTime()
-        report("List cons (fast)" n subtract(end start))
+        ))))
         r
     )
 )
@@ -40,12 +45,11 @@ procedure(test_list_cons(n)
 procedure(test_list_append(n)
     let((r)
         r = nil
-        start = getCurrentTime()
+        report("List append (SLOW)" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = append(r list(i))
         )
-        end = getCurrentTime()
-        report("List append (SLOW)" n subtract(end start))
+        ))))
         r
     )
 )
@@ -58,12 +62,11 @@ procedure(test_list_car(n)
             r = cons(i r)
         )
         s = 0
-        start = getCurrentTime()
+        report("List car" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             s = plus(s car(r))
         )
-        end = getCurrentTime()
-        report("List car" n subtract(end start))
+        ))))
         s
     )
 )
@@ -76,12 +79,11 @@ procedure(test_list_nth(n)
             r = cons(i r)
         )
         s = 0
-        start = getCurrentTime()
+        report("List nth (slow)" 50 vaiElapsedMs(measureTime(progn(
         for(i 1 50
             s = car(nth(i r))
         )
-        end = getCurrentTime()
-        report("List nth (slow)" 50 subtract(end start))
+        ))))
         s
     )
 )
@@ -94,12 +96,11 @@ procedure(test_list_length(n)
             r = cons(i r)
         )
         l = 0
-        start = getCurrentTime()
+        report("List length O(n)" 50 vaiElapsedMs(measureTime(progn(
         for(i 1 50
             l = length(r)
         )
-        end = getCurrentTime()
-        report("List length O(n)" 50 subtract(end start))
+        ))))
         l
     )
 )
@@ -108,12 +109,11 @@ procedure(test_list_length(n)
 procedure(test_string_concat(n)
     let((s)
         s = ""
-        start = getCurrentTime()
+        report("String concat SLOW" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             s = strcat(s "x")
         )
-        end = getCurrentTime()
-        report("String concat SLOW" n subtract(end start))
+        ))))
         s
     )
 )
@@ -122,12 +122,11 @@ procedure(test_string_concat(n)
 procedure(test_string_sprintf(n)
     let((x)
         x = nil
-        start = getCurrentTime()
+        report("String sprintf" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             sprintf(x "val=%d" i)
         )
-        end = getCurrentTime()
-        report("String sprintf" n subtract(end start))
+        ))))
         x
     )
 )
@@ -135,13 +134,12 @@ procedure(test_string_sprintf(n)
 ; Hash table create
 procedure(test_hash_create(n)
     let((ht)
-        start = getCurrentTime()
+        report("Hash create" n vaiElapsedMs(measureTime(progn(
         ht = makeTable("t" nil)
         for(i 1 n
             ht[i] = i
         )
-        end = getCurrentTime()
-        report("Hash create" n subtract(end start))
+        ))))
         ht
     )
 )
@@ -154,12 +152,11 @@ procedure(test_hash_lookup(n)
             ht[i] = i
         )
         r = 0
-        start = getCurrentTime()
+        report("Hash lookup" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = ht[i]
         )
-        end = getCurrentTime()
-        report("Hash lookup" n subtract(end start))
+        ))))
         r
     )
 )
@@ -168,12 +165,11 @@ procedure(test_hash_lookup(n)
 procedure(test_int_add(n)
     let((r)
         r = 0
-        start = getCurrentTime()
+        report("Integer add" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = plus(r i)
         )
-        end = getCurrentTime()
-        report("Integer add" n subtract(end start))
+        ))))
         r
     )
 )
@@ -182,12 +178,11 @@ procedure(test_int_add(n)
 procedure(test_float_sqrt(n)
     let((r)
         r = 0.0
-        start = getCurrentTime()
+        report("Float sqrt" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = plus(r sqrt(float(i)))
         )
-        end = getCurrentTime()
-        report("Float sqrt" n subtract(end start))
+        ))))
         r
     )
 )
@@ -196,12 +191,11 @@ procedure(test_float_sqrt(n)
 procedure(test_trig_sin(n)
     let((r)
         r = 0.0
-        start = getCurrentTime()
+        report("Trig sin()" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = plus(r sin(float(i) / 1000.0))
         )
-        end = getCurrentTime()
-        report("Trig sin()" n subtract(end start))
+        ))))
         r
     )
 )
@@ -209,12 +203,11 @@ procedure(test_trig_sin(n)
 ; Eval list
 procedure(test_eval_list(n)
     let((r)
-        start = getCurrentTime()
+        report("Eval list" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = eval(list('plus i 1))
         )
-        end = getCurrentTime()
-        report("Eval list" n subtract(end start))
+        ))))
         r
     )
 )
@@ -222,12 +215,11 @@ procedure(test_eval_list(n)
 ; Eval string (VERY slow)
 procedure(test_eval_string(n)
     let((r)
-        start = getCurrentTime()
+        report("Evalstring PARSE" n vaiElapsedMs(measureTime(progn(
         for(i 1 n
             r = evalstring(sprintf(nil "%d + 1" i))
         )
-        end = getCurrentTime()
-        report("Evalstring PARSE" n subtract(end start))
+        ))))
         r
     )
 )

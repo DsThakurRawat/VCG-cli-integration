@@ -145,3 +145,22 @@ def test_bridge_audit_tightens_existing_file_permissions(tmp_path):
     run_launcher(tmp_path, "bridge", [call(3, "list_pdk", {})])
     assert oct(audit.stat().st_mode & 0o777) == "0o600"
     assert len(audit.read_text().splitlines()) == 1
+
+
+def test_bridge_cli_falls_back_to_path(tmp_path, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "mcp_server_under_test", os.path.join(REPO_ROOT, "python", "mcp_server.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    cli = bindir / "virtuoso-bridge"
+    cli.write_text("#!/bin/sh\n")
+    cli.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "elsewhere" / "python"))
+    monkeypatch.setenv("PATH", str(bindir))
+    assert mod._bridge_executable() == str(cli)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    with pytest.raises(FileNotFoundError):
+        mod._bridge_executable()

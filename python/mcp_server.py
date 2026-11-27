@@ -657,11 +657,22 @@ def _impl_bridge_status(a: dict) -> dict:
     return response
 
 
+def _bridge_executable() -> str:
+    import shutil
+    name = "virtuoso-bridge.exe" if sys.platform == "win32" else "virtuoso-bridge"
+    beside = Path(sys.executable).with_name(name)
+    if beside.exists():
+        return str(beside)
+    found = shutil.which("virtuoso-bridge")
+    if found:
+        return found
+    raise FileNotFoundError(
+        "virtuoso-bridge CLI not found next to %s or on PATH" % sys.executable)
+
+
 def _bridge_command(command: str):
     import subprocess
-    executable = str(Path(sys.executable).with_name(
-        "virtuoso-bridge.exe" if sys.platform == "win32" else "virtuoso-bridge"))
-    return subprocess.run([executable, command], capture_output=True,
+    return subprocess.run([_bridge_executable(), command], capture_output=True,
                           text=True, timeout=300)
 
 
@@ -1644,9 +1655,7 @@ def _impl_skill_info(a: dict) -> dict:
 def _impl_snapshot(a: dict) -> dict:
     import subprocess
     out = _safe_out_dir(a.get("out"), "snapshot_out")
-    cmd = [str(Path(sys.executable).with_name(
-        "virtuoso-bridge.exe" if sys.platform == "win32" else "virtuoso-bridge")),
-        "snapshot", "-o", str(out)]
+    cmd = [_bridge_executable(), "snapshot", "-o", str(out)]
     if a.get("history"):
         cmd += ["--history", a["history"]]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_SNAPSHOT)
