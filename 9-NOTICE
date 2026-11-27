@@ -1,0 +1,23 @@
+virtuoso-cli-integration
+========================
+
+Combined, experimental toolset for driving one Cadence Virtuoso session
+from two open-source bridges without them fighting over it.
+
+Built from (both MIT-licensed):
+
+  * virtuoso-cli (vcli) by deanyou
+    https://github.com/deanyou/virtuoso-cli
+    Base of this repository (fork, MIT license retained in LICENSE).
+
+  * virtuoso-bridge-lite by Arcadia-1 (Tsinghua University /
+    tokenzhang.com)
+    https://github.com/Arcadia-1/virtuoso-bridge-lite
+    Used as the second bridge via the patch in
+    docs/integration/bridge-lite-vai-lock.patch. If you use
+    virtuoso-bridge in academic work, cite Zhang et al. 2025
+    (see upstream CITATION.cff).
+
+Both upstream projects descend from the same "RAMIC Bridge" SKILL daemon,
+which is exactly why they collide when loaded into one Virtuoso session;
+this repo exists to fix that.

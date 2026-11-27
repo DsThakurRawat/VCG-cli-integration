@@ -1,0 +1,1411 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+## [Unreleased]
+
+### Added
+
+- **The `analog-artist-symbol` skill.** It draws a compact, readable functional
+  symbol for an analog block from that block's real interface, netlist and
+  topology, and converts the SVG back into native Cadence OA geometry
+  (`dbCreatePath` / `dbCreatePolygon` / `schCreateSymbolPin` / dynamic
+  `[@instanceName]` / `[@partName]` labels), so the symbol carries signal
+  direction, control role and output polarity into the parent schematic
+  instead of a generic block. The converter pins the drawing to an existing pin
+  frame (`--origin-x` / `--origin-y`) and fixes the terminal order
+  (`--pin-order`), which is what makes rewriting a library symbol in place
+  safe: the ports keep the coordinates the parent schematic is already wired
+  to. `references/verification.md` records the live Virtuoso evaluation and
+  the corrections the converter needed on a real library cell. The skill is
+  registered in `scripts/sync_skills.py` as a mirror, so the Codex tree gets
+  it too and CI runs both trees' suites.
+
+## [1.3.6] - 2026-11-11
+
+Reliability and verification release. Four strands:
+
+- **SKILL channel hang is now contained** (`#137`): after an evaluation
+  deadline expires the daemon records the in-flight call, stops delivering
+  SKILL to that pipe, declares the channel dead, and fails every later request
+  immediately with a bilingual diagnosis. The client surfaces that verdict
+  verbatim instead of a generic timeout. `window screenshot` now falls back
+  to a per-window X11 capture when the SKILL route fails, times out, or the
+  channel is hung; the accept loop also has a request-read deadline so a
+  half-open client cannot wedge it.
+- **Dual skill-tree sync** (`#136`): `.claude/skills/` is mirrored into
+  `.agents/skills/` through an explicit adaptation/manifest table, with a CI
+  drift gate that runs both trees' test suites.
+- **Persistent Maestro jobs and native cell verification** (`#122`): five
+  `vcli maestro job` subcommands and a read-only `vcli cell verify-native`
+  grid audit, rewritten against OpenAccess APIs verified on a live Virtuoso.
+- **Dependency** (`#135`): `russh` 0.64.1 → 0.65.0, picking up three SSH
+  security advisories.
+
+### Added
+
+- **Dual skill-tree sync with a CI drift gate.** The repository keeps two copies
+  of every agent skill — `.claude/skills/` (canonical, Claude Code host) and
+  `.agents/skills/` (Codex host) — and they had drifted apart: 89 files in the
+  Codex tree were stale copies, and its suites were never run by CI.
+  `scripts/sync_skills.py` now mirrors the canonical tree into the Codex tree
+  through an explicit, auditable table (6 host-adaptation rules, a per-skill
+  disposition manifest of mirror / link / exclude / pending, and file-level
+  exclusions) instead of a blind copy, so a new skill is never mirrored by
+  guesswork: an unclassified skill is reported as pending and left untouched.
+  `python3 scripts/sync_skills.py --check --strict-pending` is the drift gate;
+  CI runs it before the test suites and then runs **both** trees' unittest
+  suites (8 suites, Python 3.9 and 3.13), so a Codex-side-only skill can no
+  longer ship untested. Changing `.claude/skills/` now requires running
+  `python3 scripts/sync_skills.py` to update the mirror.
+- **`vcli window geometry`** (also `window.geometry` over RPC) — reports the
+  **client-area** geometry of one X11 window, which is the coordinate space
+  `action-x11 --direct` validates `--x`/`--y` against. Callers previously had
+  no way to learn this space: `list-windows-x11` reports the window *frame*
+  geometry (WM decorations included), and the two differ by the title-bar and
+  border widths — so a click computed from the frame geometry lands outside
+  the client area. Only the `--direct` path bounds-checks against the client
+  geometry (its errors carry a `direct: ` prefix); the non-direct path checks
+  against the frame geometry, so a frame-derived coordinate is not rejected
+  there — it silently misses.
+- **MCP resources and prompts.** `vcli mcp serve` now publishes the repository's
+  Claude skills as read-only MCP resources (`skill://<name>`) and three workflow
+  prompts (`maestro-run-and-check`, `spectre-failure-triage`, `cell-design-review`).
+  A resource URI carries a skill *name*, never a path, and a skill that resolves
+  outside the skills root is never listed or served.
+- **`VB_SKILLS_DIR`** — env override for the skills root published as MCP
+  resources. It is now registered in the README configuration table, and a
+  set-but-invalid value (not a directory) fails the server startup with a
+  configuration error naming the variable and the path, instead of silently
+  falling back to working-directory discovery.
+- **`vcli maestro job submit / status / list / logs / cancel`** — persistent Maestro
+  simulation job management. Jobs are stored as JSON in
+  `~/.cache/virtuoso_bridge/maestro/jobs/<id>.json`. Submit is fail-closed
+  (an unwritable session, a client-id mismatch and a duplicate run id are
+  all errors). Status reads the run directory — locally, or on the run host
+  when the job runs there — and never contacts CIW. Persisted from
+  Arcadia-1/virtuoso-bridge-lite PR #173.
+- **`vcli cell verify-native <lib/cell/view>`** — read-only cellview grid audit
+  and decorative supply-rail tail detection. Reports per-layer on/off-grid
+  shape counts and VDD*/VSS*/VPWR*/VGND* decorative tails. Exits non-zero only
+  when `off_grid > 0`. Persisted from Arcadia-1/virtuoso-bridge-lite PR #175.
+- **`src/maestro_jobs/`** — `MaestroJob`, `MaestroJobStatus`, `MaestroJobStore`
+  (file-backed JSON) module for Rust-side job lifecycle management.
+- **`src/client/cell_ops.rs`** — SKILL builders for `tech_grid_precision_skill`
+  and `shape_grid_audit_skill` (read-only grid drift detection).
+
+### Changed (MY-138 — persistent Maestro jobs and native cell verification)
+
+The first cut of MY-138 shipped SKILL that could never have produced a
+correct result, and fail-closed contracts that were not actually closed.
+This round rewrites the SKILL against the OpenAccess APIs that exist
+(verified against a live Virtuoso), closes the gates, and adds tests that
+exercise the real production paths:
+
+- **`vcli cell verify-native` now works.** The first cut called
+  `axlOpenCellViewByMode` and `axlGetTech` — neither exists in the OA
+  function database, and the shape accessors it used (`s~>layer~>name`,
+  `b~>x1`, `s~>kind`, `car(p)~>objType`) do not exist on real shapes. The
+  audit now opens the cellview with `dbOpenCellViewByType(lib cell view
+  viewType mode)` — the `viewType` argument is what makes the call return a
+  cellview rather than a window id — reads the grid from
+  `techGetMfgGridResolution(techGetTechFile(ddGetObj(lib)))`, and takes the
+  layer from `car(s~>lpp)`, the box from `s~>bBox` and the vertices from
+  `s~>points`. It was run end-to-end against a live bridge
+  (`st02/qvp20/layout`, 497 shapes, grid 0.005) and reports per-layer
+  on/off-grid counts.
+- **The audit's output format now matches its parser.** The SKILL emitted
+  one `(layer on)` tuple per *shape* with no counts and no aggregation, while
+  the parser read `(layer onCount offCount)` per *layer* — so the off-grid
+  count was always zero and the drift verdict could never fire. The SKILL now
+  aggregates per layer and the tests pin the SKILL's output format and the
+  parser's reading of it together.
+- **`vcli maestro job submit` records every simulation it starts.** The
+  first cut checked for a duplicate run id *after* `maeRunSimulation` had
+  already forked the Spectre child and then returned an error without writing
+  a record — an orphan simulation invisible to `job status`, `job list` and
+  `job cancel`. A record now always exists once the submit has been issued;
+  when the run id belongs to another job, the record says so instead of
+  being dropped. The run id is read from the submit itself
+  (`maeRunSimulation(?returnRunId t)`): `maeGetSetup` has no `?runId`
+  keyword, so the first cut's pre-submit probe could never have worked.
+- **The read-only gate fails closed.** The first cut judged the probe with
+  `ok()`, which only reports the transport layer — a probe that returned nil
+  or raised still counted as success. The probe now reports one of three
+  outcomes, and the session's existence is established before "not
+  read-only" is read as "writable" (`axlIsSessionReadOnly` returns nil for a
+  session that does not exist). Anything short of an explicit "writable"
+  refuses the submit.
+- **The profile gate compares the right identifier.** It compared the raw
+  `VB_PROFILE` against the session's client id, which both mis-fires (when
+  `VB_CLIENT_ID` is set) and is skipped entirely (when `VB_PROFILE` is not).
+  It now compares `resolve_client_id()` — the same resolution the rest of
+  the CLI uses — against the client ids recorded for the session.
+- **Job status works on a remote run host.** The status was derived by
+  stat-ing the run directory on the local filesystem, which in this repo's
+  primary deployment is on the compute host — so every remote job reported
+  `unknown`. The run host is now asked directly, over the same transport
+  `job logs` already uses. CIW is still never contacted, and a terminal
+  status is still sticky.
+- **`--status` filters on the status that is shown.** The filter used the
+  stored status while the list showed the derived one, and `completed` /
+  `failed` were never written back, so `--status completed` always came back
+  empty. Terminal states are now persisted when first observed.
+- **`job cancel` refuses to cancel a finished job** and reports that
+  `maeCloseSession` is session-wide — every other job in the session dies
+  with it and unsaved session state is lost.
+- **Terminal statuses are sticky.** A cancelled job never comes back as
+  completed, however healthy the run directory later looks.
+- **`vcli cell verify-native` exits non-zero on drift.** The dispatch in
+  `src/main.rs` converts the command's `Ok(json!({"status":"drift"}))`
+  into `Err(VirtuosoError::Execution(...))` so CI scripts and `set -e`
+  pipelines see the failure. `verify_native` itself still returns the
+  JSON breakdown so callers can read layer-by-layer off-grid counts.
+- **`parse_grid_audit_output` is `pub` (re-exported via
+  `virtuoso_cli::parse_grid_audit_output`).** Integration tests in
+  `tests/cell_verify.rs` exercise the real parser; the previous test-only
+  clone ("Mirrors the logic in commands/cell.rs") is gone.
+- **`MaestroJobStore::save` is atomic.** It writes `<id>.json.tmp` and
+  renames it onto `<id>.json` without removing the destination first — the
+  remove step opened a window in which the job record did not exist at all,
+  and that record is the only proof the job was submitted. `load` rejects
+  non-UUID job_id shapes (defence against `--job-id ../../x`);
+  `validate_job_id` is the gate.
+- **`vcli maestro job logs` single-quotes the remote path** so a path
+  with spaces / `;` / `$()` cannot inject a second command. The integer
+  `n` is `usize` from clap and is embedded unquoted.
+- **`vcli maestro job list` no longer accepts silent `--lib/--cell/--view`
+  no-op flags.** Round 3 should parse `run_dir/maestro.sdb` (or equivalent)
+  to get reliable per-row library / cell / view metadata; the round-1
+  substring stub was removed in favour of honest error semantics.
+
+- **`install.sh`** — shared/multi-user installer with `--system` (`/opt/virtuoso-cli`),
+  `--user` (`~/.local`), `--prefix DIR` and `--no-build`. Installs `vcli`/`vtui`/
+  `virtuoso-daemon` into `$PREFIX/bin` and `ramic_bridge.il` into
+  `$PREFIX/share/virtuoso-cli/` with `__DAEMON_PATH__` baked to the real daemon path,
+  so one shared install serves every user with zero per-user setup.
+- **`virastack-auto-allow` skill** —
+  `.claude/skills/virastack-auto-allow/scripts/auto_allow.py` polls a target
+  window for the ViraStack permission prompt, matches it against a template
+  that spans both option rows (so "Don't Allow" can never be matched on its
+  own), and clicks "Allow" through `vcli window action-x11`. A post-click
+  pixel check aborts instead of hammering a coordinate that did not land.
+  The loop survives a long cellview run (`--idle-polls 0` never stops on
+  idle) and re-resolves the daemon session and the X11 window id by itself
+  after a Virtuoso or daemon restart.
+  When the agent keeps re-running the same command, the loop fingerprints the
+  command line above the option rows — a pixel-tolerant comparison of the text
+  band, so a re-rendered command still counts as the same one — and, after
+  `--guide-threshold` consecutive identical approvals, types a guidance message
+  into the chat composer telling the agent to diagnose the root cause. The
+  message is only sent while no permission prompt is pending: the composer
+  itself is the guard, and a composer that already holds text is never typed
+  into, so neither a pending prompt nor the user's own text is overwritten.
+  The one exception is the text the loop itself typed and could not submit:
+  the loop keeps a snapshot of the composer holding its own message and
+  compares the composer with it before clearing it, so text the user has
+  typed over it is never wiped.
+  The delivery is verified with a screenshot.
+  `--timeout 0` runs the loop until it is stopped.
+
+### Fixed
+
+- **The crates.io package no longer ships repository-only agent tooling.**
+  The dual skill-tree work added `.agents/skills/` (the Codex mirror of
+  `.claude/skills/`) and the `.ua/` analysis archives, but `Cargo.toml`'s
+  `exclude` list only named `.claude/`. The 1.3.6 package would have been
+  50.5 MiB unpacked / 10.18 MiB compressed — eight times the 1.3.5 release
+  and just under crates.io's size cap — for files the binary never reads
+  (only `resources/` is embedded at compile time). The exclude list now names
+  the repository/agent directories explicitly; `cargo publish --dry-run`
+  reports 1.34 MiB compressed with `resources/`, `src/` and `tests/` intact.
+
+- **A timed-out SKILL evaluation no longer wedges the session with no
+  diagnosis** (`#137`). The daemon now writes an in-flight marker from the
+  IPC callback (`RBMarkEvalStart`), records the stuck call to
+  `/tmp/.ramic_hung_<port>.json` and into the stats file, and stops delivering
+  any further SKILL to that pipe. Once the channel is declared dead, every
+  later request gets an immediate NAK carrying a bilingual
+  `skill_channel_hung` message that names the stuck expression, its start
+  time and the deadline; the client surfaces it verbatim instead of rewriting
+  it into a generic "execution failed". Measured against a standalone daemon:
+  the second request drops from 5019 ms (and a second write into the dead
+  pipe) to 17 ms (and no write at all).
+- **`vcli window screenshot` falls back to X11 on SKILL failure, timeout or a
+  hung channel** (`#137`). It previously short-circuited on a timeout and
+  never tried the alternate route. The fallback picks `--window-id` when
+  supplied, otherwise scans the X11 window list, and reports both failure
+  reasons when neither route works. A missing capability or auth error is
+  deliberately not papered over. Verified live: with the SKILL route made
+  unreachable, the X11 route produced a 646×784 PNG in 0.48 s.
+- **A half-open TCP client can no longer hold the daemon's accept loop**
+  (`#137`). A connection that never sent its request blocked `read_to_end`
+  indefinitely, so no later client was served — including the fast "channel
+  is dead" answer owed on a hung channel. The request read now has a 2-second
+  backstop; in the measured case the next request went from a 4261 ms
+  client-side timeout to the daemon's verdict in 85 ms.
+
+- **RPC/MCP `window.screenshot` works under the default (Window) capability
+  again.** The RPC dispatcher routes the capture through the *unchecked* SKILL
+  executor: the dispatcher's own capability check (`permits_method` → Window)
+  is the permission check for that method. The checked executor demands the
+  Admin capability on top of it, so `vcli rpc call window.screenshot` and the
+  MCP `window_screenshot` tool failed for every default (non-Admin) client
+  with "raw SKILL exec is not permitted: use 'vcli rpc call' instead". The
+  CLI (`vcli window screenshot`) still runs raw SKILL and therefore still
+  needs Admin.
+- **The GUI-debug skill's CIW_INPUT step now fails loudly when the client
+  geometry cannot be read.** `vcli window geometry` used to be asked for the
+  client-area geometry and, when that failed, the step fell back to the
+  window *frame* geometry from `list-windows-x11` — the very coordinate space
+  this change exists to eliminate (WM decorations included). A click computed
+  from it lands outside the client area and silently misses. The step now
+  aborts with the reason instead.
+- **The screenshot fallback validates the artifact it captured.** `import
+  -window` can exit 0 and still leave nothing usable behind (an empty file, a
+  truncated PNG); the fallback reported `{"status": "saved", "capture":
+  "x11"}` regardless. It now runs the same PNG check the action-path
+  screenshot uses, deletes an invalid file, and reports the failure.
+- **`vcli window geometry` and the screenshot fallback pass the XAUTHORITY to
+  the X11 tools.** Both built an `env DISPLAY=… ` prefix without it, so
+  `xwininfo`/`import` failed with "No protocol specified" on a host whose
+  cookie is not at the default `~/.Xauthority`. The DISPLAY/XAUTHORITY are now
+  resolved exactly as the action path resolves them.
+- **`vcli window screenshot` failed on hosts whose X server refuses a root-window
+  grab.** The SKILL capture path runs `import -window root`, which some X servers
+  reject — ImageMagick reports "missing an image filename", while `xwd -root` on
+  the same display fails with `BadMatch`, so the daemon returned nil and the
+  command failed even though the session was healthy. A per-window grab
+  (`import -window <id>`) works on those hosts, so `vcli window screenshot`
+  now takes `--window-id` and falls back to a per-window capture when the root
+  grab fails. The fallback is reported as `"capture": "x11"` alongside the
+  original error. Without `--window-id` there is no window to fall back to, and
+  the error says so.
+- **`vcli window list-windows-x11` (and every other X11 helper call) failed with
+  `cannot open display XAUTHORITY=...`.** The Rust side appends
+  `XAUTHORITY=<path>` to the helper command line as a bare token, and the
+  helper treated *every* non-flag token as the DISPLAY — so the XAUTHORITY
+  value overwrote the display and the helper aborted before enumerating any
+  window. The helper now parses `KEY=VALUE` tokens as environment overrides
+  (and `DISPLAY=…` as the display), and the parsing was extracted into
+  `parse_args()` so it is unit-tested.
+- **The `XAUTHORITY=` token was not shell-escaped.** A path containing a space
+  was split into two arguments, and the second one was parsed as the DISPLAY —
+  the same failure mode as the bug above. The token is now quoted as a whole.
+- **The daemon-identity probe ignored the configured timeout.**
+  `VirtuosoClient::get_daemon_user()` hardcoded a 5-second budget and
+  `vcli session show` built its probe client with a hardcoded 3-second
+  timeout, so `VB_TIMEOUT` (documented as "raise it to 120 for busy
+  servers") had no effect on the identity check. On a busy daemon the probe
+  timed out, the daemon user stayed unknown, and the cross-user guard
+  silently skipped — the user who set `VB_REMOTE_USER` was told nothing.
+  The probe now spends the client's configured timeout, like every other
+  SKILL operation. The version probe (5s) and the liveness probe (3s) keep
+  their deliberately short budgets.
+- **The probe budget was honoured on Unix but not on Windows.**
+  An expired `SO_RCVTIMEO` surfaces as `ErrorKind::WouldBlock` on Unix but
+  as `ErrorKind::TimedOut` on Windows, and only the former was mapped to a
+  timeout — so on Windows a slow daemon was reported as "connection
+  failed" instead of "timed out", and the configured probe budget was
+  silently lost. Both error kinds now map to `VirtuosoError::Timeout`, so
+  the probe budget holds on every platform.
+- **`vcli session show` probed the identity before the liveness.**
+  The identity probe ran first and spent the whole configured timeout
+  (`VB_TIMEOUT`) on a daemon that was already dead or wedged, so the user
+  waited out the full budget before learning the daemon was gone. The
+  liveness probe now runs first (it keeps its own short 3-second budget);
+  when the daemon does not answer, the identity and version probes are
+  skipped entirely. The skip is reported through the existing
+  `probe.skipped` / `probe.skip_reason` fields (`daemon_not_alive`), the
+  cached values are shown (`data_source: "cached"`), and the stale-daemon
+  hint (`RBStop()` / reload `ramic_bridge.il`) still fires.
+- **The cross-user guard used a second, hand-rolled config parser.**
+  `guard_cross_user()` re-read `VB_PROFILE`, `VB_REMOTE_USER[_<profile>]`
+  and `VB_ALLOW_CROSS_USER_DAEMON` from the environment instead of using
+  the resolved `Config`, so it ignored `config.toml` and target overrides
+  and applied a different precedence rule than the rest of the CLI — an
+  empty `VB_REMOTE_USER_<profile>` masked the generic `VB_REMOTE_USER` and
+  silently disabled the guard. The guard now takes the expected user and
+  the override from the resolved config, exactly like every other command.
+- **An unconfirmed probe left a stale daemon identity in the session file.**
+  When the identity probe ran and confirmed nothing, `session show` kept
+  the previous probe's `daemon_user` in the session file — and the
+  connect-time guard then compared against that stale value as if it had
+  been verified. A probe that ran and confirmed nothing now clears the
+  stored `daemon_user`; a probe that was skipped keeps the cached value
+  (nothing was learned either way).
+- **"Identity unconfirmed" was indistinguishable from "identity OK".**
+  When an expected remote user was configured but the daemon user could not
+  be determined, `session show` returned no cross-user warning at all: the
+  check had not run, but the output looked exactly like a clean check. An
+  unconfirmed identity now produces its own warning that says the check was
+  NOT performed, and the connect-time guard logs the skip at WARN level
+  instead of DEBUG (it is still not a hard error — the daemon user is only
+  known after `session show`).
+- **`prompts/get` accepted a request with missing required arguments.** The
+  missing value silently rendered as `(not provided)`, handing the agent a
+  workflow with a hole in it. A missing or null required argument is now a
+  JSON-RPC `-32602` error naming the argument(s).
+- **`prompts/list` published prompts whose tools were unavailable.** The triage
+  prompt names `skill_exec`, which only exists under the Admin capability, so
+  the default capability set advertised a workflow the caller cannot finish.
+  A prompt is now published only when every tool it names is available under
+  the server's capabilities — the same list `tools/list` serves.
+- **The MCP `serverInfo.version` was hardcoded to `0.3.18`** while the crate is
+  at 1.3.5. It now reports the crate version.
+- **A missing MCP resource answered with `-32001`** (JSON-RPC "request
+  cancelled"). It is now `-32002` ("resource not found"), and an unreadable
+  resource is `-32603`.
+- **A SKILL.md `description: |` block was truncated at the first blank line.**
+  YAML block scalars may contain blank lines — the repository's own
+  `maestro-read-results` skill has one, so its description was cut short.
+- **`load_skills` published skills that escaped the skills root.** A symlinked
+  skill directory pointing outside the root was listed (leaking its frontmatter
+  description) although the read path refused to serve it. The list now applies
+  the same root-containment rule as the read path.
+- **The `maestro-run-and-check` prompt told the agent to "verify" a variable
+  with a same-scope readback.** `maestro_set_var`/`maestro_get_var` share one
+  Maestro-internal scope, so the readback agrees by construction and proves
+  nothing about the netlist. The prompt now names the generated netlist (the
+  `parameters` line of `input.scs`) as the ground truth and forbids reporting a
+  run's measurements as belonging to a value the netlist does not carry.
+- **The `list_vars` scope comment contradicted the repo convention.** It
+  claimed the Assembler-global scope reaches the netlist; per
+  `.claude/skills/_shared/convention.md` the simulator consumes the asi
+  design-var list. The comment now matches the convention.
+- **The `spectre-failure-triage` prompt read the current session's data.**
+  `maestro_get_history_list`/`maestro_list_vars` are current-session scoped, so
+  the prompt now aligns on the session first and says so.
+- **`cell-design-review` implied a schematic default.** `cell_open`'s real
+  defaults are view `layout` and mode `a` (append, which takes an edit lock).
+  The prompt now passes view `schematic` and mode `r` explicitly.
+- **The MCP integration test was not hermetic on Windows.** `dirs::home_dir()`
+  ignores `HOME` there, so the server could read the real `~/.vcli/targets.yaml`.
+  The harness now pins `VB_TARGETS_FILE` to a throwaway file.
+- **Daemon path resolution was split across two conflicting places.**
+  `_RBAutoStart()` unconditionally hardcoded `$HOME/.cargo/bin/virtuoso-daemon` and
+  silently overrode the top-level resolver — and therefore `RB_DAEMON_PATH`. Both now
+  call the new `RBResolveDaemonPath()`.
+- **`__DAEMON_PATH__` was a dead injection point.** `deploy_il_script()` substituted a
+  token that the shipped `ramic_bridge.il` no longer contained, so `vcli tunnel start`
+  uploaded the daemon while the bridge still looked under `~/.cargo/bin`. The token is
+  back in the bridge, so deploy-time path injection works again.
+
+### Changed
+
+- Daemon resolution is now an ordered search chain, first-existing-wins:
+  deploy-time `__DAEMON_PATH__` → `$RB_DAEMON_PATH` → `/opt/virtuoso-cli/bin`,
+  `/usr/local/bin` → `~/.local/bin`, `~/.cargo/bin`. Existing `cargo install` layouts
+  under `~/.cargo/bin` still work but are now the **lowest** priority: a shared install
+  wins over a per-user one. Set `RB_DAEMON_PATH` to force a specific binary.
+- **`.env` files are no longer read** (RFC #83). `Config::from_env()` used to walk
+  cwd → parent → … looking for a `.env` and load it into the process environment, so
+  a value's origin was invisible and a stray file two directories up could change
+  behaviour. Configuration now comes from the process environment only.
+- The user-level profile binding moved from `~/.vcli/.env` (`VB_PROFILE=…`) to
+  **`~/.vcli/profile`**, whose sole content is the profile name — the same format the
+  venv (`$VIRTUAL_ENV/.vcli-profile`) and local (`./.vcli-profile`) bindings already
+  use, so all three scopes now share one reader. `vcli profile bind <name> --user`
+  writes the new file; `vcli profile clear --user` removes it *and* strips the
+  `VB_PROFILE=` line from the legacy `~/.vcli/.env`.
+- **`vcli window dismiss-dialog --x11` / `dismiss-window` now fail closed**
+  (ported from virtuoso-bridge-lite PR #248). Sending the key no longer counts as a
+  dismissal: the X11 helper queries the exact window id with `XGetWindowAttributes`
+  (capturing X protocol errors through an error handler instead of parsing
+  `xwininfo` text, which defaulted a failed lookup to "closed") and only reports
+  `status: "closed"` with a `dismissed` id when the window is confirmed unmapped or
+  destroyed. A window that is still mapped — or a state check that failed, now
+  reported as `verification_error` — stays `status: "requested"` with no `dismissed`
+  id, makes the helper exit non-zero, and is surfaced as an error in the vcli result
+  (so `status` becomes `failed` rather than `dismissed`).
+- **`vcli window dismiss-dialog --x11` now exits non-zero when a dismissal could not
+  be verified.** The JSON result keeps its shape (`status` becomes `failed`, the
+  per-record errors stay in `errors`); the command additionally reports the exit code
+  it wants in a new top-level `exit_code` field, and the CLI exits with it. Callers
+  that only look at the exit status no longer read an unverified dismissal as a
+  success.
+- **The `dismissed` field of an X11 dismiss result record now carries the
+  child/resolved XID**, not the requested frame id — the frame id is reported
+  separately as `window_id` / `requested_window_id`. The dismissal is verified
+  against the exact window that received the key, so the id in `dismissed` is that
+  window's id.
+
+### Deprecated
+
+- `~/.vcli/.env` `VB_PROFILE=…` is still honoured as a **fallback** but logs a
+  deprecation warning pointing at `vcli profile bind <name> --user` or an exported
+  `VB_PROFILE`. The fallback goes away in a future release.
+- The `dotenvy` dependency is gone.
+
+## [1.3.4] - 2026-09-04
+
+CI green-up after the 1.3.3 IPC deadline work. The 1.3.3 release left the
+integration matrix red: `cargo fmt --check` and `cargo clippy -D warnings`
+failed on recent IPC deadline changes, and two platform-specific test failures
+surfaced on the matrix (macOS Unix-socket path length, Windows native-backend
+assertion). This release restores a fully green CI on all platforms.
+
+### Fixed
+
+- **rustfmt violations** (`src/transport/x11.rs`, `src/config.rs`,
+  `src/transport/backend.rs`, `src/transport/ipc/daemon.rs`,
+  `src/streaming/job_progress.rs`): reformatted long lines and chain calls so
+  `cargo fmt --check` passes again.
+- **clippy `byte_char_slices`** (`src/transport/ipc/daemon.rs`): replaced
+  `&[b'x']` with `b"x"` in the write back-pressure test so
+  `cargo clippy -- -D warnings` passes.
+- **macOS IPC test socket path** (`src/transport/ipc/daemon.rs`): added a
+  `short_socket_path` helper — macOS `$TMPDIR` (`/var/folders/.../T/`) plus the
+  descriptive socket filename exceeded `SUN_LEN` (104 bytes), making
+  `UnixListener::bind` fail with "path must be shorter than SUN_LEN". The five
+  IPC regression tests now use `/tmp` on macOS.
+- **Windows native-backend test assertion** (`src/transport/backend.rs`):
+  `native_path_enforces_the_capacity_invariant` now distinguishes unix (capacity
+  check reports `Configuration`) from non-unix (native backend is unsupported,
+  reports `UnsupportedBackend` before capacity validation).
+
+## [1.3.3] - 2026-09-04
+
+IPC deadline hardening. The 1.3.2 release introduced dynamic socket timeouts,
+but a multi-round audit found that the deadline was not truly end-to-end: lock
+waiting was unbounded, partial reads reset the timeout each iteration, and the
+write path had no deadline at all. This release makes the deadline cover every
+stage — lock acquisition, write, and read — and adds five regression tests.
+
+### Fixed
+
+- **Daemon startup dependency cycle** (`src/transport/backend.rs`,
+  `src/commands/transport_daemon.rs`): split `open_transport()` (business
+  side, goes through IPC) from `open_transport_for_daemon()` (daemon-internal,
+  direct SSH). The daemon no longer requires a running daemon to start.
+- **Unbounded lock wait** (`src/transport/ipc/daemon.rs`): `exchange()` now
+  uses `lock_with_deadline()` — a `try_lock` polling loop bounded by the
+  request's absolute deadline. A request whose deadline passes while waiting
+  for the lock returns `QueueTimeout` instead of blocking indefinitely.
+- **Post-lock deadline recheck** (`src/transport/ipc/daemon.rs`): after
+  acquiring the lock, `exchange()` re-checks the deadline before sending. A
+  request that spent its whole budget waiting for the lock is not sent.
+- **Read deadline per partial read** (`src/transport/ipc/framing.rs`,
+  `daemon.rs`): `read_frame_until_with()` re-applies `SO_RCVTIMEO` with the
+  **remaining** budget before every partial read. A multi-segment response can
+  no longer accumulate more than the total deadline across reads.
+- **Write deadline** (`src/transport/ipc/framing.rs`, `daemon.rs`):
+  `write_frame_with_deadline()` replaces `write_all()` with a manual partial-
+  write loop that re-applies `SO_SNDTIMEO` with the remaining budget before
+  every write. Back-pressure from a slow receiver can no longer cause writes
+  to exceed the deadline.
+- **Config Debug token leak** (`src/config.rs`): `Config` now has a manual
+  `Debug` impl that redacts `transport_daemon_token`. The derived impl would
+  have printed the token in any debug output.
+- **GUI test name collision** (`.claude/skills/virtuoso-gui-debug/`): two
+  test methods shared the name `test_recover_without_rollback_returns_error`,
+  causing the second to shadow the first and a net loss of one test. Renamed
+  to unique names; test count restored to 237.
+
+### Tests
+
+- `lock_with_deadline_bails_when_deadline_passes` — unit test for bounded
+  lock waiting.
+- `short_deadline_request_times_out_while_lock_held` — end-to-end test with a
+  real server holding the lock; a short-deadline request must time out.
+- `slow_chunked_response_hits_deadline` — server sends the response in slow
+  chunks; the client must hit the deadline rather than accumulating timeouts.
+- `frame_header_near_deadline_then_stop` — server sends the frame header at
+  0.9s then stops; a 1s deadline must fail in <1.3s (previously ~1.9s).
+- `large_request_to_nonreading_peer_hits_deadline` — 1 MiB upload to a peer
+  that never reads, with `SO_SNDBUF` capped at 8 KiB to guarantee write
+  back-pressure. The write must hit the 1s deadline.
+
+## [1.3.2] - 2026-09-04
+
+Second-round code audit fixes. The 1.3.1 release introduced native-ssh IPC
+daemon wiring and atomic file transfers; a follow-up audit found that the
+implementation had Windows build breaks, config bypasses, and a too-short
+IPC timeout. This release addresses all of them, plus tightens the GUI
+debug skill's recovery contract.
+
+### Fixed
+
+- **Windows native build** (`src/transport/backend.rs`): the IPC daemon
+  client is now `#[cfg(unix)]`-gated. On Windows the native backend returns
+  `UnsupportedBackend` instead of failing to compile (the IPC transport is
+  Unix-domain-socket only).
+- **Config bypass** (`src/config.rs`, `src/transport/backend.rs`):
+  `VB_TRANSPORT_DAEMON_SOCKET` and `VB_TRANSPORT_DAEMON_TOKEN` are now read
+  through `Config::from_env()` (with profile suffix support) instead of
+  direct `std::env::var` calls in the backend.
+- **Staging file concurrency** (`src/transport/native.rs`): upload and
+  download staging files now use a per-request `uuid::Uuid::new_v4()` suffix
+  instead of PID-only. Concurrent transfers to the same target can no longer
+  share, truncate, or prematurely publish each other's staging files.
+- **IPC socket timeout** (`src/transport/ipc/daemon.rs`): the fixed 5-second
+  socket timeout is gone. The default is now 300s; `exchange()` dynamically
+  tightens the read timeout to the request's remaining deadline before
+  reading the response, and the handshake uses a 5s timeout. Long-running
+  commands (large transfers, slow SKILL evals) are no longer cut off at 5s.
+- **Native backend fallback** (`src/transport/backend.rs`): removed the
+  silent direct-`NativeTransport` fallback when the daemon is unreachable.
+  The native backend now returns `DaemonUnavailable` per the design
+  specification — connecting directly would bypass the connection pool.
+- **GUI auto-dismiss** (`.claude/skills/virtuoso-gui-debug/`): removed the
+  automatic modal-dialog dismissal from both live and local executors'
+  normal action paths and `recover()`. Recovery now requires an explicit
+  validated rollback; auto-dismiss could close a non-target dialog and lose
+  user state. The `--no-auto-dismiss` CLI flag and plumbing are removed.
+- **GUI test contradiction** (`.claude/skills/virtuoso-gui-debug/tests/`):
+  updated recover tests to expect an error when no rollback is defined,
+  matching the strict recovery contract.
+
+### Internal
+
+- 8 test fixture `Config` constructors updated for the new
+  `transport_daemon_socket` / `transport_daemon_token` fields.
+
+## [1.3.1] - 2026-09-04
+
+### Fixed
+
+- **issue #55** (`src/transport/x11.rs`, `src/commands/window.rs`, `src/main.rs`):
+  `--pid` is now optional on `vcli window action-x11`. Windows that expose no
+  `_NET_WM_PID` (listed as `pid: null`) were previously unreachable because the
+  action path required a positive numeric PID. Supplying a PID still matches the
+  window exactly; omitting it resolves by window id alone. `X11ActionResult.pid`
+  now reports the window actually acted on.
+- **issue #54** (`src/transport/x11.rs`, `src/main.rs`, `README.md`): four missing
+  `action-x11` operations added — `click-abs` (absolute screen coordinates),
+  `minimize` (`windowminimize`), `double-click` (`click --repeat 2`), and
+  `maximize` (`windowstate --add MAXIMIZED_HORZ/VERT`). `maximize` needs
+  xdotool ≥ 3.20210804.1; the global minimum stays 3.20140419.1 (documented in
+  README) so the other operations keep working on older xdotool.
+- **issue #49** (`src/commands/window.rs`, `src/main.rs`, `src/rpc/dispatcher.rs`):
+  `vcli window dismiss-window-x11` now accepts `--window-id` (alongside the
+  positional id, backward compatible) and `--pid`. When no window id is given,
+  `--pid` resolves the target window from `list-windows-x11` (errors on
+  zero/multiple matches). The JSON-RPC `window.dismiss_window_x11` method accepts
+  `pid` the same way.
+- **issue #50** (`src/client/window_ops.rs`): `WindowOps::list_windows` now
+  surfaces the window `id` (`hiGetWindowId`) alongside `name`, so SKILL-side
+  window enumeration is targetable. `hiGetWindowId` is unbound in some IC
+  releases (verified missing on live IC25.1), so the SKILL attempts to read it
+  inside `errset` and **omits** the `id` field on those versions instead of
+  erroring — `vcli window list` thus works cross-version (`id` present on
+  IC23.1, name-only on IC25.1). The JSON is assembled with `strcat` (never
+  `sprintf`) and the id fragment defaults to `""`, because this daemon's SKILL
+  evaluator mis-evaluates `sprintf` as an `if`/`when` branch or top-level
+  expression and its `if`/`when` only accept self-evaluating (constant)
+  branches — both verified empirically on live IC25.1. Full
+  kind/mode/geometry/pid reflection still requires live-Virtuoso SKILL API
+  verification (`hiGetWindowType`, `hiGetWindowMode`, `hiGetWindowScreenBox`,
+  `hiGetProcessId`); all are unbound on IC25.1, so #50 stays closed and the
+  name-based heuristic `annotate_modes` remains the cross-version-safe path.
+
+## [1.3.0] - 2026-09-03
+
+X11 GUI automation comes of age. This release is dominated by a major
+expansion of `vcli window action-x11` — three performance features
+(`--direct`, `action-x11-batch`, P2 geometry precheck + geom cache), a
+new `SCROLL` operation, a `wait` operation, and two dozen boundary and
+correctness fixes validated on real Virtuoso IC25.1 sessions. The
+`virtuoso-gui-debug` skill is unified with a local xdotool executor and
+ships a multi-method operation playbook. 75 commits since 1.2.0.
+
+### Added (X11 GUI automation)
+
+- **`--direct` flag** (`src/transport/x11.rs`, `src/commands/window.rs`):
+  skips helper upload, env resolution, and list-windows scan. Trusts the
+  caller-provided `--window-id` and runs xdotool directly. ~4.7× faster
+  (1213ms → 260ms per action). Supports `activate`, `key`, `type`,
+  `click-rel`, `drag-rel`, `scroll`, `close`. Rejects `wait` and
+  `screenshot` with a clear config error.
+- **`action-x11-batch`** (`src/commands/window.rs`): JSONL batch mode
+  that merges all xdotool commands into one shell invocation with
+  per-command exit-code markers. 6 actions in 260ms (28× vs separate
+  calls). Each action may override `pid`/`display`; CLI flags are
+  defaults. Single-action failure does not abort the batch.
+- **`SCROLL` operation**: direction (`up`/`down`/`left`/`right`) with
+  optional count (1–100) and window-relative x/y. Maps to xdotool mouse
+  buttons 4/5/6/7. Full chain: Rust `X11Operation::Scroll` →
+  `build_xdotool_actions` → CLI → DSL → unit tests.
+- **`action-x11 wait`**: polls `list-windows-x11` for a title match,
+  with configurable timeout. Useful for waiting on dialog appearance
+  after a Browse/Open action.
+- **P2 geometry precheck** (`--direct` mode): `parse_xwininfo_geometry`
+  + `check_coords_in_bounds` validates the target window is non-zero-size
+  and coordinates are in-bounds before sending input. Zero-size or
+  out-of-bounds requests exit with code 2 and a clear message
+  (`coordinates (x, y) out of bounds for window size WxH`). Applies to
+  `click-rel`, `drag-rel`, and coordinate-bearing `scroll`.
+- **Batch shared list-windows** (non-direct mode): `CachedX11Context`
+  builds one window-list context per unique DISPLAY and reuses it across
+  all actions in the batch. 3 actions in 505ms (168ms/action) vs 940ms
+  per action previously.
+- **geom file cache** (`GeomCacheEntry`, `geom_cache_read/write`):
+  cross-platform `temp_dir()` path, 500ms TTL. Enables fast zero-size
+  rejection on repeated `--direct` calls to the same window (13ms cache
+  hit vs 30ms full check).
+- **MouseButtonGuard** (`--direct` drag path): ensures `mouseup` is
+  always sent even if the drag's `mousemove` fails, preventing stuck
+  mouse buttons.
+
+### Added (virtuoso-gui-debug skill)
+
+- **Unified skill** (`.claude/skills/virtuoso-gui-debug/`): merged the
+  old `gui-debugger` into `virtuoso-gui-debug` with three executors —
+  `fake` (deterministic offline), `live` (real vcli, session/PID/DISPLAY
+  bound), and `local` (direct xdotool, no vcli required).
+- **Local executor**: direct xdotool on a local DISPLAY, binds window by
+  PID or `--window-id`, supports SCROLL (buttons 4–7), uses ImageMagick
+  `import` for screenshots.
+- **Multi-method operation playbook**: every GUI operation has ≥2
+  independently-verified methods (click, type, coordinate acquisition,
+  window discovery, modal dialog handling, close/cancel).
+- **Performance optimization guide**: P0 (xdotool default 135×, xwininfo
+  313×), P1 (type delay 10ms, zero inter-op sleep), P2 (--direct, batch,
+  geom cache) with measured IC25.1 latencies.
+- **Python 3.6 compatibility**: the skill runs on the cloud machine's
+  Python 3.6 (no f-strings, no walrus).
+
+### Added (CI / build / release)
+
+- **Dependabot** for Cargo dependencies and GitHub Actions.
+- **cargo-audit** security vulnerability scan in CI (with
+  `RUSTSEC-2023-0071` rsa ignore).
+- **macOS + Windows binaries** in the release workflow.
+- **Cross-platform integration matrix**: ubuntu × macos × windows ×
+  {default, native-ssh}.
+
+### Fixed
+
+- **CentOS 7 glibc 2.17 link failure**: `renameat2` is not available on
+  glibc 2.17; resolved with a runtime fallback.
+- **list_dialogs exit code 1**: helper exit code 1 (healthy "no
+  dialogs") was incorrectly treated as a helper error. Now skipped.
+- **action-x11 window resolution + xdotool argv syntax**: repaired
+  window re-resolution and corrected xdotool argument construction.
+- **dismiss-dialog segfault**: ctypes `argtypes` now set so 64-bit
+  `Display*` isn't truncated to 32 bits.
+- **Minimized window handling**: screenshot and dismiss-dialog now
+  restore minimized windows before operating; `XSetInputFocus` guarded.
+- **WM class parsing**: reads from the last parenthesized group in
+  xwininfo output (handles windows with multiple class hints).
+- **xdotool `getwindowname` fallback**: used when xwininfo title is
+  empty.
+- **Key chord normalization**: hyphenated chords (`ctrl-a`) normalized
+  to xdotool `+` form (`ctrl+a`).
+- **list-windows-x11 "no Virtuoso windows"**: now treated as healthy
+  empty result, not an error.
+- **Multiple boundary fixes** (#52, #56, #57, #58, #59, #60, #61, #62,
+  #63, #64): multi-window disambiguation, dismiss default, type ASCII
+  restriction, key validation, timeout precision, dialog geometry
+  backfill, display env ordering.
+
+### Changed (dependencies)
+
+- `crossterm` 0.28 → 0.29
+- `sha2` 0.10 → 0.11 (with `LowerHex` → `hex::encode` code fix)
+- `ratatui` 0.29 → 0.30
+- `base64` 0.22 → 0.23
+- `dirs` 5 → 6
+- `toml` 0.8 → 1.1
+- `shlex` 1 → 2
+- `serial_test` 3 → 4
+- `actions/checkout` 4 → 7
+- `softprops/action-gh-release` 2 → 3
+
+### Changed (docs)
+
+- Interactive HTML architecture guide (`docs/virtuoso-gui-debug-architecture.html`)
+  and capability retrospective (`docs/vcli-gui-debug-retrospective.html`),
+  both pure-SVG (zero external CDN) and linked from README (EN + ZH).
+- Bilingual X11 GUI debugging section with multi-method playbook.
+- `AGENTS.md` / `CLAUDE.md` skill guidance for virtuoso-gui-debug.
+
+## [1.2.0] - 2026-09-01
+
+First release where the native (`russh`-based) SSH backend is documented
+and exercised end-to-end. OpenSSH remains the runtime default; users opt
+into `native` explicitly via `VB_SSH_BACKEND=native`. The native backend
+is now considered **stable** for single-hop direct-connection workloads
+that fit the capability matrix in the README's
+`SSH Backend Selection` section. There is no automatic backend migration;
+existing tunnels keep using whatever backend wrote their `state.json`
+until `tunnel stop && tunnel start`.
+
+### Added (native backend, single-hop)
+
+- **Pure-Rust native SSH transport** (`src/transport/native.rs`,
+  `native-ssh` Cargo feature, gated). Single-hop direct connection with
+  in-tree `known_hosts` host-key verification (legacy + `|1|salt|hash`
+  entries), public-key authentication, exec channel, **single-file
+  SFTP streaming** through the russh-sftp subsystem (64 KiB chunk
+  window), and an exec `cat` fallback when the remote does not
+  advertise `sftp`. Directory transfer still uses `tar-over-exec` so
+  the two backends agree on the remote toolchain.
+- **Backend selection** (`src/transport/backend.rs`,
+  `src/config.rs:115-119`). `VB_SSH_BACKEND` (`openssh` default,
+  `native` opt-in). Selecting `native` on a build without the
+  `native-ssh` feature returns a structured `UnsupportedBackend` rather
+  than silently falling back — see design L559.
+- **Endpoint pool + channel scheduler** (`src/transport/pool.rs`,
+  `src/transport/scheduler.rs`). Connection reuse keyed by
+  `EndpointKey` (SHA-256 digest, profile-isolated), three-level
+  priority channel scheduling (urgent reserved / FIFO / bulk-with-starve
+  grace / `QueueTimeout`), and the `total >= workers+2` capacity
+  invariant enforced at `open_transport`.
+- **Lifecyle primitives** (`src/transport/lifecycle.rs`).
+  `ReconnectPolicy` with exponential backoff + jitter,
+  `CircuitBreaker`→`Degraded` (only `reset` clears), `CancellationToken`,
+  `ShutdownCoordinator` three-phase teardown, `KeepalivePolicy`.
+  Five new env vars wired into `Config`:
+  `VB_SSH_RECONNECT_MAX_ATTEMPTS` / `_MAX_DELAY`,
+  `VB_SSH_KEEPALIVE_INTERVAL` / `_FAILURES`,
+  `VB_TRANSPORT_SHUTDOWN_GRACE`.
+- **Native consumes lifecycle** (`src/transport/native.rs`,
+  `src/transport/daemon_lifecycle.rs`, `src/transport/tunnel.rs`):
+  russh keepalive wired through, established-period transient retry
+  with deadline-bounded retry budget, SKILL `RetryPolicy::Never` /
+  `OutcomeUnknown` (no replay of unknown-outcome operations), idempotent
+  health probes, `tunnel stop` prefers IPC `request_shutdown()` over
+  raw signals when Tier-1 proves the daemon is alive.
+
+### Added (diagnostics)
+
+- **`tunnel status` backend diagnostics**
+  (`src/commands/tunnel.rs:backend_diagnostics`):
+  `config.backend.{selected, supported_in_build}` + `tunnel.backend`
+  + `config.backend_warning` on drift. `supported_in_build` mirrors
+  `cfg!(feature = "native-ssh")` so an operator asking for `native`
+  on an OpenSSH-only binary sees the truth from a status command.
+
+### Added (CI)
+
+- **Cross-platform integration matrix**
+  (`.github/workflows/integration.yml`): `ubuntu-latest` ×
+  `macos-latest` × `windows-latest` × `{default, native-ssh}` with
+  `fail-fast: false`. First CI build that compiles `identity.rs`'s
+  Windows branch (P1 highest-risk item previously unverified outside a
+  real Windows machine).
+- **`ci.yml` check job** now runs `cargo clippy --features native-ssh
+  -- -D warnings` in addition to the default-feature clippy.
+- **In-process SFTP roundtrip test** (`src/transport/native.rs`):
+  `tokio::io::duplex` + a minimal in-memory `russh_sftp::server::Handler`
+  fixture drives a real protocol roundtrip with a 200 KiB payload
+  (forces multi-chunk read/write through the production
+  `sftp_write_all` / `sftp_read_all` paths).
+
+### Changed (README)
+
+- New bilingual section `### SSH Backend Selection` / `### SSH 后端选择`
+  between `### SSH Remote Connection Setup` / `### SSH 远程连接配置`
+  and `### How It Works` / `### 工作原理`. Documents the
+  default-vs-opt-in contract, the feature gate, the diagnostics pointer,
+  and a 13-row capability matrix tying every "no" cell back to a code
+  return value. `### Key Features` / `### 核心特性` each gain a
+  one-line summary of the optional backend.
+
+### Design
+
+Closes step 8 of the native-transport delivery sequence
+(`docs/superpowers/specs/2026-08-29-native-remote-transport-design.md`):
+"publish diagnostics, migration documentation, and stable status."
+
+## [1.1.2] - 2026-09-01
+
+Closes the native-transport delivery sequence through step 3 (direct russh
+client) and the first useful cut of the step 6 daemon. Step 4 (channel pool)
+and step 6 reconnect/lifecycle/cancellation remain ahead, but the protocol
+surface, the IPC server, and the host-key / public-key-auth path are now real
+on Unix builds with `native-ssh`.
+
+### Added
+- **Native russh SSH backend** (`src/transport/native.rs`, `native-ssh`
+  feature). Single-hop direct connection with `known_hosts` host-key
+  verification and public-key authentication. Command exec plus file/text/dir
+  transfer over the exec channel (`tar -cf -` for directories, matching the
+  OpenSSH backend so the two backends do not diverge in remote toolchain
+  requirements). `backend::open_transport` wires it in for
+  `VB_SSH_BACKEND=native`. The OpenSSH backend stays the default.
+- **Real `__transport-daemon`** (`src/commands/transport_daemon.rs`,
+  `src/transport/ipc/server.rs`). The hidden subcommand now binds the Unix
+  domain socket at the recorded endpoint (mode `0600`), completes the `Hello`
+  handshake, and dispatches every operation onto a `RemoteTransport` built
+  from `Config::from_env()`. The wire-payload types and the dispatch loop
+  extracted from the old in-test `serve_one` into a `pub(crate)` server
+  module so production and the shared contract suite exercise the same code
+  path.
+- **`Operation::Challenge`** (`src/transport/ipc/messages.rs`). The Tier-1
+  liveness probe described in the design's "Stop and crash recovery"
+  section: the daemon echoes its nonce, the parent CLI compares the answer
+  to its recorded `daemon_nonce`, and equality proves the process on the
+  other end of the socket is the recorded daemon — no PID, no platform
+  identity check.
+
+### Changed (test infrastructure)
+- **`#[serial]`** on every env-touching test (`Cargo.toml`,
+  `src/tests.rs`, `src/client/bridge.rs`, `src/commands/session.rs`,
+  `src/runtime_paths.rs`, `src/transport/tunnel.rs`). The previous
+  `crate::test_env::ENV_LOCK` mutex only serialized env *writers*; tests that
+  read env (`Config::from_env()` in particular) raced against held locks
+  because they were never inside the critical section. `serial_test`'s
+  `#[serial]` covers both sides with one mechanism. The `test_env` module is
+  reduced to a placeholder.
+
+## [1.1.1] - 2026-08-31
+
+Complete stable cut for the tunnel-lifecycle hardening. `1.1.0` was published from a
+feature branch that predated 9 `main` commits, so this release folds those in and adds the
+merge-time fix below.
+
+### Added (from `main`, missing in `1.1.0`)
+- **`session_discovery` module**: locate live Virtuoso sessions without a saved state file.
+- **`vcli tunnel attach` / `vcli tunnel detach`** subcommands (attached vs deployed mode).
+- **`ramic_bridge` SSH port fix**: correct port forwarding for the ramic bridge path.
+
+### Fixed
+- **Attached/deployed mode gating on stop**: `stop_saved_tunnel` now honours the tunnel
+  `mode` — an `attached` daemon (owned by Virtuoso) is never `rm -rf`'d on the remote;
+  only a `deployed` tunnel whose stop decision authorizes clearing wipes its scratch dir.
+
+## [1.1.0] - 2026-08-31
+
+### Added
+- **Two-tier daemon lifecycle assessment** (`src/transport/daemon_lifecycle.rs`).
+  Native daemons record their OS process identity at startup; `tunnel stop`
+  now runs a `Verdict::{Alive, UnresponsiveButIdentified, Stale, Unverifiable}`
+  check and maps it to `StopDecision::{Signal, Skip{clear_state}}`. `--force`
+  never bypasses the identity verification for a recorded native daemon.
+- **Cross-platform `ProcessIdentity`** (`src/transport/identity.rs`): macOS
+  via `sysctl`, Linux via `/proc`, Windows via `OpenProcess` /
+  `QueryFullProcessImageNameW` / `GetProcessTimes`. Replaces the macOS
+  `/proc`-only check that was silently always-false.
+- **`classify_ssh_pid`** three-way verdict (`VerifiedSsh` / `Gone` /
+  `NotVerifiable`) so an OpenSSH/native tunnel pid is classified without
+  assuming `/proc` exists.
+
+### Fixed
+- **macOS `vcli tunnel stop` leaked the tunnel**: the old command path read
+  `/proc/{pid}/cmdline` (absent on macOS → always "not ssh" → skip kill) yet
+  *unconditionally* cleared the state file. The unified `stop_saved_tunnel()`
+  now clears state only when the process is proven gone or the decision
+  authorizes it; an unverifiable live process is refused and its state
+  preserved.
+- **Unified stop path**: `vcli tunnel stop` and `SSHClient::stop` now both
+  delegate to `stop_saved_tunnel()`, removing a duplicate command-layer
+  kill/cleanup that had become dead code after the 8/30 lifecycle hardening.
+  Remote scratch cleanup runs only after the decision authorizes clearing,
+  so a still-running daemon is never wiped.
+
+## [1.0.0] - 2026-08-29
+
+First stable release. (Changelog entries were not maintained between
+`0.4.0-alpha.11` and this cut; see git history for the full change list.)
+
+## [0.4.0-alpha.11] - 2026-06-18
+
+### Added
+- **Hostname verification in `tunnel status` and `diagnose`**
+  (`src/commands/tunnel.rs`, new `HostnameCheck` type). The status
+  command now runs `getHostName()` against the daemon and compares
+  to `VB_REMOTE_HOST`. On mismatch, a prominent `⚠ hostname mismatch`
+  warning is printed in Table mode and `daemon.hostname_check` is
+  added to the JSON output. Catches the most common EDA misconfig:
+  pointing `VB_REMOTE_HOST` at the jump host instead of the compute
+  host. Uses `execute_skill_unchecked` so it works without Admin
+  capability. 4 new unit tests cover the warning message and JSON
+  shape.
+- **Three-host model section in `AGENTS.md`**. Documents the
+  local → jump → compute host layout with a diagram, the single
+  rule (`VB_REMOTE_HOST` = compute host, `VB_JUMP_HOST` = jump host),
+  and a diagnostic flow using the new `daemon.hostname_check` field.
+- **Jump host misconfig cheat sheet in `.claude/skills/tunnel-connect/SKILL.md`**.
+  Symptoms table, diagnostic recipe (4-step), and fix matrix for
+  the most common "I connected but I don't see my cells" problem.
+
+### Fixed
+- `AGENTS.md` test count: was "91 unit tests" → now
+  "369 unit + 116 integration tests".
+
+### Borrowed from virtuoso-bridge-lite
+- `e179001` (issue #1): jump host docs, hostname check, SSH timeout
+- `685b7a5`: use `127.0.0.1` instead of `localhost` in `-L` flag
+  (already correct in vcli, no change needed)
+
+## [0.4.0-alpha.10] - 2026-06-13
+
+### Added
+- **Centralized `runtime_paths` module** (`src/runtime_paths.rs`, ported from
+  virtuoso-bridge-lite `6b9309d`). Honors XDG Base Directory spec
+  (`XDG_CACHE_HOME`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`) with `VB_*`
+  env-var overrides (`VB_CACHE_DIR`, `VB_LOG_DIR`, `VB_OUTPUT_DIR`,
+  `VB_TMP_DIR`, `VB_STATE_DIR`, `VB_CONFIG_DIR`) and a `VB_HOME` umbrella.
+  Backward-compatible default: `~/.cache/virtuoso_bridge/...` on Linux.
+  Eleven call sites migrated: `command_log`, `auth`, `config`, `history`,
+  `models`, `transaction/snapshot`, `transport/ssh`, `transport/tunnel`,
+  `plugins/registry`, `skill_finder`, `spectre/jobs`, `commands/process`.
+- **X11 helper structured errors** (`src/transport/x11.rs`). New
+  `extract_helper_errors()` surfaces three independent failure signal
+  sources — structured JSON errors on stdout, non-zero returncode with
+  stderr context, and non-empty stderr alone — deduped via `BTreeSet`.
+  Wired into `dismiss()`, `dismiss_window()`, `list_dialogs()`, and
+  `list_windows()`; the list paths now return `VirtuosoError::Execution`
+  when the helper dies, so "no windows" can no longer be confused with
+  "helper crashed".
+- **Digital import verification recipes** (`.claude/skills/digital-import/SKILL.md`,
+  ported from virtuoso-bridge-lite `1ae2156`). Step 1 (strmin) now
+  includes a `length(cv~>shapes) + length(cv~>instances) > 0` check
+  that catches the silent-stub failure mode where strmin prints
+  "Translation completed" and exits 0 but leaves an empty layout cell.
+  Step 2 (ihdl) adds a `ddGetObj(lib mod view)` check for `schematic`
+  + `symbol` views to catch ihdl's partial-import mode.
+
+### Tests
+- 13 unit tests in `runtime_paths` (env precedence, blank values,
+  profile variants, XDG fallback).
+- 6 unit tests in `transport::x11` (extract_helper_errors: JSON
+  errors, non-zero returncode, dedup, distinct-message preservation).
+- 2 integration tests in `daemon_user_guard.rs` (`VB_CACHE_DIR` /
+  `VB_LOG_DIR` end-to-end override via the public `runtime_paths` API).
+- Fixed pre-existing test isolation race: `save_to_session_file_*`
+  tests now hold `ENV_LOCK` to serialize `XDG_CACHE_HOME` mutations.
+
+## [0.4.0-alpha.9] - 2026-06-03
+
+### Fixed
+- **Multi-profile CIW setup-file collision** (ported from upstream
+  virtuoso-bridge-lite PR #86). Previously, two profiles on the
+  same remote host would both write to `/tmp/virtuoso_bridge/ramic_bridge.il`,
+  so the second profile's `tunnel start` would silently overwrite
+  the first profile's CIW setup file. The first profile's CIW `load()`
+  would then start the wrong daemon. After the fix:
+  - profile A's setup dir: `/tmp/virtuoso_bridge_analog/`
+  - profile B's setup dir: `/tmp/virtuoso_bridge_digital/`
+  - `tunnel stop` / `cleanup_remote` is now profile-scoped and never
+    wipes other profiles' dirs
+- **Tunnel cleanup wiping per-client scratch**: the previous
+  `rm -rf /tmp/virtuoso_bridge` in `cleanup_remote` was also
+  deleting all per-client `client_id` subdirs (those created by
+  the per-client scratch scoping feature). Now scoped to the
+  active profile's dir.
+
+### Added
+- **`vcli profile bind` / `vcli profile clear` extended with three
+  scopes** (was `--venv` only):
+  - `--venv`  → write `$VIRTUAL_ENV/.vcli-profile` (Python venv binding)
+  - `--user`  → write `~/.vcli/.env` `VB_PROFILE=...` line (user default)
+  - `--local` → write `./.vcli-profile` (current working dir)
+  Re-binding replaces the existing `VB_PROFILE=` line (no duplicate
+  append). Empty / whitespace-only / newline-injected names are
+  rejected. Other lines in `~/.vcli/.env` are preserved by `clear`.
+- **Public helpers** in `virtuoso_cli::transport::tunnel` for
+  external consumers:
+  - `profiled_bridge_leaf(Option<&str>) -> String`
+  - `profiled_env_key(&str, Option<&str>) -> String`
+  - `setup_dir_for_profile(Option<&str>) -> String`
+
+### Security
+- Profile name sanitization in setup-dir leaf: any char outside
+  `[A-Za-z0-9._-]` is replaced with `_`, length capped at 64.
+  Path-traversal attempts (`../etc/passwd`, etc.) are neutralized.
+  All-underscore results fall back to `virtuoso_bridge_profile` to
+  avoid shadowing the no-profile leaf.
+
+### Tests
+- +9 unit tests in `src/transport/tunnel.rs` (sanitization, length
+  cap, fallback, two-profile isolation)
+- +4 unit tests in `src/profile.rs` (bind/clear round-trip, line
+  preservation, empty/newline rejection) + `Mutex` for parallel
+  test safety on `~/.vcli/.env`
+- +7 integration tests in `tests/tunnel_profile.rs` (helper
+  invariants, CLI plumbing end-to-end, error handling)
+
+Total: 1133 tests pass, 0 clippy warnings.
+
+## [0.4.0-alpha.8] - 2026-06-03
+
+### Added
+- **aarch64 cross-compiled `virtuoso-daemon`** — ships at
+  `resources/daemons/virtuoso-daemon-aarch64` (398 KB, ELF AArch64).
+  Lets `vcli tunnel start` deploy to ARM64 hosts (AWS Graviton, Apple
+  Silicon Linux VMs, Ampere Altra) without needing a Rust toolchain
+  on the remote side. Architecture is auto-detected at deploy time
+  and the matching binary is uploaded.
+  - `docs/aarch64-cross-compile.md` documents the manual Ubuntu
+    22.04 aarch64 sysroot setup under `/usr/aarch64-linux-gnu/sys-root/`
+    (Rocky 8 has no aarch64 glibc in its dnf repos) and the
+    `cannot find -lgcc_s` linker trap that required the explicit
+    `-L` flag in the gcc wrapper.
+  - GitHub Actions release workflow now builds the aarch64 daemon
+    in CI via cross-compile (Ubuntu runner + gcc-aarch64-linux-gnu +
+    rustup target), so the binary in the GitHub release is rebuilt
+    fresh on every tag.
+
+### Changed
+- **README.md** — bilingual sync to v0.4.0-alpha.7+. Both English
+  and Chinese sections now document:
+  - `vcli session show` reports `daemon_version` + `version_skew`
+  - Stale-daemon recovery on `ramic_bridge.il` `load`
+  - Native cross-arch tunnel deploy (x86_64 / aarch64)
+  - Per-client scratch scoping via `VB_CLIENT_ID`
+  - Skill Finder 5 search modes (`vcli skill find --mode {fuzzy,prefix,suffix,exact,regex}`)
+  - Admin capability gate (`VCLI_CAPABILITY=admin`) for `skill broadcast` and raw SKILL exec
+  - Ready banner version: 0.3.18 → 0.4.0-alpha.7
+  - Command Reference: `skill broadcast` (admin), `skill find`, `skill info`
+  - Configuration table: `VB_CLIENT_ID`, `VCLI_CAPABILITY`
+- **Release workflow** (`release.yml`) — added `build-linux-aarch64`
+  job that cross-compiles `virtuoso-daemon` for aarch64 and uploads
+  the binary to the GitHub release.
+
+## [0.4.0-alpha.7] - 2026-06-02
+
+### Fixed
+- **`vcli skill find` end-to-end** — the .fnd parser in
+  `src/skill_finder/parser.rs` expected a fictional 3-line-per-entry
+  format that does not exist in Cadence's SKILL Finder database.
+  The real format is a SKILL list literal:
+  `("name" "syntax" "description")` per entry, with newlines
+  preserved inside the strings. The parser was rewritten as a small
+  state machine that correctly handles:
+    - 3-string entries (the common case, ~9808 of 9812 entries)
+    - 4-string entries with empty placeholder (4 entries in
+      `maeSKILLref.fnd`)
+    - Multi-line syntax and description strings
+    - Embedded `(` and `)` inside description text
+      (e.g. `deselected.)` at the end of a sentence)
+    - `;`-prefixed comments and blank lines between entries
+  The old parser returned 0 results for every search because
+  the first line of each entry was `("name"` (with the open paren)
+  which it then stored as the function name. `vcli skill find` now
+  returns real results for all 5 search modes (fuzzy, prefix,
+  suffix, exact, regex) and `--include-desc` matches against the
+  description field as designed.
+
+### Tests
+- 7 new parser unit tests, including verbatim samples from
+  `abstract.fnd` and `skdfref.fnd` plus a regression test that
+  reads `/opt/cadence/IC231/doc/finder/SKILL/SKILL/abstract.fnd`
+  directly and asserts > 50 well-formed entries (skips if the
+  fixture is absent).
+- Total: 1090 tests pass (was 1058).
+
+## [0.4.0-alpha.6] - 2026-06-02
+
+### Added
+- **CLI/daemon version unification** — `vcli session show` now reports
+  the daemon's version (from the SKILL global `RBDVersion`, populated by
+  `RBIpcErrHandler` parsing the `VERSION:x.x.x` line the Rust daemon prints
+  to stderr on startup) and warns when it does not match the vcli binary
+  version (`CARGO_PKG_VERSION`). Catches the common "I upgraded vcli but
+  forgot to reload `ramic_bridge.il`" footgun where the SKILL wrapper
+  falls out of sync with the binary.
+- **`SessionInfo.daemon_version`** — optional field with the same
+  backward-compat guarantees as `daemon_user` (older `ramic_bridge.il`
+  never writes it; legacy session files still parse via
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`).
+- **`VirtuosoClient::get_daemon_version()`** — narrow internal API
+  (fixed-literal SKILL payload, no capability required). Returns
+  `Ok(None)` for the empty/`"?"` placeholder so old daemons that never
+  emitted `VERSION:` are not falsely flagged.
+- **`check_version_skew()` helper in `commands::session`** — pure
+  function with 4 unit tests (match / mismatch / empty / `?`).
+- **`ramic_bridge.il` `; RB_VERSION: 0.4.0-alpha.6` stamp** — human-
+  readable top-of-file marker. Two new regression tests
+  (`ramic_bridge_has_rb_version_stamp`,
+  `ramic_bridge_version_stamp_matches_cargo_toml`) refuse to merge a
+  drift between the .il stamp and `Cargo.toml`.
+
+### Changed
+- `vcli session show` JSON now includes `daemon_version` and
+  `cli_version` in the `session` block, plus a new
+  `warnings.version_skew` field.
+
+## [0.4.0-alpha.5] - 2026-06-01
+
+### Added
+- **Cross-user daemon guard** — `vcli session show` queries the daemon's Unix
+  `$USER` via `getShellEnvVar` and warns when it does not match the configured
+  `VB_REMOTE_USER[<profile>]`. Suppressed by `VB_ALLOW_CROSS_USER_DAEMON=1`.
+  Catches SSH-tunnel-to-wrong-user misconfigurations that previously failed
+  silently with confusing SKILL output.
+- **Stale-daemon recovery hint** — `vcli session show` now prints a recovery
+  procedure (RBStop / RBStopAll / re-load) when the daemon port is bound but
+  the daemon is not responding to SKILL. Mirrors the new hint added to
+  `ramic_bridge.il` `RBStart()` "already running" branch.
+- **`VirtuosoClient::get_daemon_user()`** and **`daemon_alive()`** — narrow
+  internal API used by the session show probes. Both use fixed-literal SKILL
+  payloads so they require no SKILL capability.
+- **Per-client remote scratch scoping** — `load_il` now uses
+  `/tmp/virtuoso_bridge/{client_id}/{filename}` instead of the unscoped
+  `/tmp/virtuoso_bridge/{filename}`. Resolution order:
+  `VB_CLIENT_ID` > `VB_PROFILE` > `gethostname()`. Prevents name collisions
+  when multiple local machines share one remote Unix account.
+- **`SessionInfo.daemon_user`** — optional field, populated lazily by
+  `session show` and persisted to the per-session JSON file via the new
+  `save_to_session_file()` method. Backward-compatible with legacy session
+  files (older `ramic_bridge.il` versions never write this key).
+- **`--include-desc` flag for `vcli skill find`** — matches against the
+  description field, not just the function name. Prefix/suffix/exact
+  modes retain name-shape filtering; fuzzy and regex also check descriptions.
+- **SKILL Finder CLI** (`vcli skill find` / `vcli skill info`) with **remote
+  cache via SSH** — fetches `.fnd` corpus from the remote EDA host and caches
+  locally for offline search.
+- **New RPC methods** registered: `skill.eval`, `maestro.snapshot`,
+  `schematic.polish_label`, `spectre.max_workers`.
+- **Maestro CSV parser** with integration tests and helpers.
+- **Spectre pasc callback handler** (`08_set_simulator_mode.il`) plus
+  `VTTYPE` parameter update examples.
+- **Spectre sweep parser** enhancements and comprehensive test coverage.
+- **`VB_SPECTRE_BIN` env var** support for absolute spectre binary path.
+- **Pensieve frontmatter** added to 39 knowledge/decision/maxim files.
+
+### Fixed
+- **`ipcIsProcessRunning()` no-arg call returns nil** — all three call sites
+  (`bridge::ping`, `rpc::dispatcher::"ping"`, `VirtuosoClient::daemon_alive`)
+  replaced with the no-op SKILL probe `plus(1 1)`. The no-arg form of
+  `ipcIsProcessRunning()` was returning nil on every live daemon, causing
+  `vcli rpc call util.ping` to spuriously fail. **Live verified**:
+  `util.ping` now returns `{"status":"ok"}` on a clearly-alive daemon.
+- **`ensure_remote_dir` was a no-op in local mode** — `vcli skill load` in
+  local mode (no SSH tunnel) was returning "io error: No such file or
+  directory" for the per-client scratch dir. `ensure_remote_dir` now calls
+  `std::fs::create_dir_all` in local mode (mkdir -p via SSH in remote mode).
+- **`save_to_session_file` mkdir-p** — newly added method now creates the
+  parent directory if it doesn't exist, so cold callers (no prior SKILL
+  bridge init) work without manual setup.
+- **SKILL syntax errors in `pasc_callbacks.ils`** corrected.
+- **Addressed upstream `virtuoso-bridge-lite` issues #92 and #81**:
+  profile-aware `Skill` config init; ensure `RBStart()` is idempotent.
+- **`maestro.snapshot` 08_set_simulator_mode** made portable + verifiable.
+- **Clippy and fmt warnings** addressed across dispatcher and tests.
+
+### Security
+- **`ensure_remote_dir` now uses `shell_quote`** for defense-in-depth on the
+  SSH-side `mkdir -p` invocation. Current callers only pass sanitized
+  client_id (alnum + `-_.`), so no actual shell-injection surface, but
+  future callers passing user-controlled paths are protected.
+- **`shell_quote` promoted to `pub(crate)`** for cross-module reuse.
+
+### Tests
+- 1058+ passing tests, 0 failures (post-fix).
+- New integration tests: `tests/daemon_user_guard.rs` (18 tests),
+  `tests/skill_finder_include_desc.rs` (11 tests).
+- Regression tests pinning the `plus(1 1)` probe at all three call sites
+  and the `ipcIsProcessRunning()` ban.
+
+## [0.3.18] - 2026-05-01
+
+### Added
+- **Session history** — vcli now records two history streams per session:
+  - **SKILL layer** (`~/.cache/virtuoso_bridge/history/<session_id>.jsonl`): every `execute_skill()` call, timestamp + code + ok flag + output (first 512 chars); written only when a session is resolved (not on raw VB_PORT fallback)
+  - **CLI layer** (`~/.cache/virtuoso_bridge/history/cmd.jsonl`): every vcli invocation, timestamp + args + exit code + session ID; written for all commands including failures
+- **`vcli session history <id>`** — show SKILL and CLI history for a session; supports `--skill` (SKILL only), `--cmd` (CLI only), `--limit N` (default 50)
+- `VirtuosoClient::session_id` field — the resolved bridge session ID is now available on the client struct for tooling and introspection
+
+## [0.3.17] - 2026-05-01
+
+### Fixed
+- **Stale session auto-cleanup in `from_env()`** — `VirtuosoClient::from_env()` now filters dead sessions (port not open) before raising "multiple sessions active"; previously a crashed Virtuoso's leftover session file would permanently block all commands until manually deleted
+
+### Added
+- **`vcli session current`** — dry-run of session auto-discovery: shows which session would be selected (or "ambiguous" if multiple live sessions exist)
+- **`vcli session cleanup`** — removes session files for daemons that are no longer running; returns JSON with count and list of removed IDs
+- **Stale/live session cleanup tests** — `stale_session_filtered_in_cleanup` and `live_session_not_removed_by_cleanup` cover the cleanup() boundary
+
+## [0.3.16] - 2026-05-01
+
+### Fixed
+- **Multi-Virtuoso session collision** — `ramic_bridge.il` now uses the OS-assigned port as the session ID suffix (`hostname-user-<port>`) instead of a per-process sequence counter (`hostname-user-1`); when two Virtuoso instances ran concurrently, both generated `hostname-user-1` and the second `RBWriteSession` silently overwrote the first session file, making the original session invisible to `vcli`
+- Removed the now-dead `RBSessionSeq` global (was only used as a placeholder immediately overwritten by the port-based ID)
+
+### Added
+- **Session coexistence tests** — `session_info_tests` covers: two port-based sessions coexist without collision, session ID suffix equals port field, port survives JSON round-trip, all sessions visible for `--session` disambiguation
+
+## [0.3.15] - 2026-05-01
+
+### Fixed
+- **`ramic_bridge.il` multi-statement SKILL truncation** — `evalstring(data)` replaced with `evalstring(strcat("(progn " data ")"))` so that SKILL payloads containing multiple expressions (e.g. `let(...)` blocks) execute fully; previously only the first top-level form was evaluated and the rest were silently discarded
+
+## [0.3.14] - 2026-04-30
+
+### Added
+- **`virtuoso-daemon --version`** — prints the semver and exits; previously the only way to check the daemon version was `strings(1)` on the binary
+
+### Changed
+- **vtui daemon stats caching** — `DaemonStats` is now refreshed on the 500ms tick and cached in `App::daemon_stats`; previously loaded from disk on every render frame, causing unnecessary I/O
+- **`DaemonStats::path(port)`** — centralizes the stats file path; `render_detail` and `write_stats` both derive the path from this single source
+
+## [0.3.13] - 2026-04-29
+
+### Added
+- **SSH login shell hardening** — `run_command_inner()` now invokes `sh -l -s` instead of `sh -s`; sources `/etc/profile` and `~/.profile` on EDA hosts where the login shell is csh/tcsh, ensuring PATH is populated correctly
+- **Daemon runtime metrics** — `virtuoso-daemon` tracks total calls, error count, and uptime using `AtomicU64` + `OnceLock<Instant>`; writes `{"calls":N,"errors":N,"uptime_secs":N}` to `/tmp/.ramic_stats_{port}` after each request
+- **`DaemonStats::load(port)`** — reads the stats file from a running daemon; returns `None` if the daemon has never written stats (e.g. pre-0.3.13 or not yet started)
+- **vtui Sessions detail pane** — shows Calls / Errors / Uptime rows when a daemon stats file is available for the selected session's port
+
+## [0.3.12] - 2026-04-27
+
+### Changed
+- **`.env` upward discovery** — `Config::from_env()` now walks from the current directory up to the filesystem root looking for a `.env` file; previously only the working directory was checked, causing config to silently disappear when `cd`-ing into a project subdirectory
+
+## [0.3.11] - 2026-04-26
+
+### Fixed
+- **`maestro session-info`** — when the focused window is not an ADE window (e.g. waveform viewer or file browser), auto-selects if exactly one Maestro session exists; previously all fields were null in this case
+- **`VirtuosoResult::ok_or_exec()`** — error message now includes the daemon error text for NAK responses; previously showed an empty message when SKILL threw an exception (as opposed to returning nil)
+
+## [0.3.10] - 2026-04-26
+
+### Fixed
+- **`maestro get-analyses`** — `analyses` field is now a JSON array `["ac","dc"]` instead of a raw SKILL sexp string `"(\"ac\" \"dc\")"`; parsed with `parse_sexp` at the command layer
+- **`maestro sim-messages`** — `messages` field now strips surrounding SKILL quotes; was returning `"\"\""` for empty messages instead of `""`
+
+## [0.3.9] - 2026-04-26
+
+### Refactored
+- **`VirtuosoResult::ok_or_exec(context)`** — collapses the 16 repetitive `if !r.skill_ok() { return Err(...) }` blocks in `maestro.rs` into a single chained method call; error message format unchanged
+- **`VirtuosoResult::output_unquoted()`** — replaces 7 inline `trim_matches('"')` sites
+- **`SexpVal::as_str()`** — simplifies the `get_current_design()` closure in `bridge.rs`
+- **`error.rs` nil suggestion** — narrowed `contains("nil")` to `ends_with(": nil")` to avoid false hints on unrelated error messages containing "nil" as a substring
+
+## [0.3.8] - 2026-04-25
+
+### Changed
+- **All maestro commands** — SKILL failures now return `Err(VirtuosoError::Execution)` (exit 1) instead of `Ok({status:"error"})` (exit 0); LLM tool callers can now rely on exit code alone
+- **`get_current_design()`** — replaced `split_whitespace` with `parse_sexp`; cellview names containing spaces no longer cause parse failures
+- **`get_analyses()`** — added missing `status` field for consistency with all other commands
+- **Success responses** — removed raw SKILL `output` fields from `close`, `set_var`, `add_output`, `open_results`, `run`; success paths only contain structured data
+- **`run()`** — error path now returns `Err()` (exit 1); success still returns `{"status":"launched"}` to indicate async dispatch
+
+### Added
+- **`error::suggestion()`** — hints for `Execution` errors containing `nil`/`unbound` and for `NotFound` errors
+
+### Removed
+- **`DaemonNotReady`** error variant — never instantiated; removed from all match arms
+- **`print_table` / `print_section`** in `output.rs` — never called
+- **`skill_str()` helper** in `maestro.rs` — inlined into call sites after error-path removal
+
+## [0.3.7] - 2026-04-25
+
+### Added
+- **`src/client/skill_sexp.rs`** — SKILL s-expression parser (`SexpVal` enum + `parse_sexp` + `sexp_to_str_list`); replaces the `sprintf`-JSON approach in `execute_skill_fetch` that silently corrupted field values containing `"` or `\n`
+- **`SSHRunner::is_cm_failure()`** — detects ControlMaster failure patterns (`mux_client_request_session`, `could not create named pipe`, `ControlPath`, etc.)
+- **`VB_SSH_CONFIG`** env var — path to a custom SSH config file, passed as `-F` to all SSH invocations
+- **`VB_DISABLE_CONTROL_MASTER`** env var — pre-emptively disable CM (useful on WSL2/Windows where socket paths contain non-ASCII chars)
+- Debug logging for `.env` load path and session directory on startup
+
+### Changed
+- **`build_fetch_skill`** — now emits `mapcar(lambda((o) list(o~>f1 ...)) expr)` (native SKILL list-of-lists) instead of `sprintf`-JSON; parsed with the new sexp parser
+- **`SSHRunner`** — added `use_control_master: Cell<bool>`; `run_command` and `test_connection` automatically retry without CM on failure, persisting the disabled state
+- **`try_ssh_tunnel`** — respects `use_control_master` flag and forwards `ssh_config_path`
+
+## [0.3.6] - 2026-04-25
+
+### Added
+- **`execute_skill_fetch()`** — batch-fetch multiple `~>slot` fields from a SKILL list in a single bridge RTT; returns `Vec<HashMap<String, String>>`
+
+### Fixed
+- **`#[allow(dead_code)]`** — suppress clippy warnings on `get_outputs` and `get_current_session` APIs reserved for future use
+
+### Changed
+- **`add_output` version branch** — removed dead IC25 branch and redundant `raw` field; IC23/IC25 dispatch unified
+
+## [0.3.5] - 2026-04-24
+
+### Fixed
+- **SSH `sh -c` argument passing** — `upload()` and `upload_text()` now pass `"sh -c 'command'"` as a single SSH argument, fixing `&&`-chained commands that were silently broken
+- **`maestro history-list`** — no longer requires `--session` arg; uses `asiGetResultsDir` to discover runs from the current session
+- **`get_current_session`** — returns `"nil"` string instead of SKILL nil on no-session, avoiding `skill_ok()` false negative
+
+### Added
+- **SSH port in RAMIC Bridge banner** — `ramic_bridge.il` displays `SSH: <port>` in the ready banner for quick tunnel setup
+- **`tunnel-connect` skill** — Quick Connect section: extract Session/Port/SSH directly from the banner
+- **`maestro get-analyses`** — version-aware IC23/IC25 dispatch via `VirtuosoVersion`
+- **`maestro add-output`** — takes `VirtuosoVersion` parameter for future IC25 divergence
+- **`maestro get-outputs`** — uses struct accessors (`~>name`, `~>outputType`, `~>signalName`, `~>expr`) matching IC23.1/IC25.1 actual return type
+
+### Changed
+- **`maestro get-result-tests`** — inline JSON serialization replacing `skill_strings_to_json` helper (avoids double-wrapping)
+- **`maestro get-result-outputs`** — same inline serialization fix
+
+## [0.3.4] - 2026-04-24
+
+### Fixed
+- **`vcli tunnel start` SSH upload bug** — `upload()` and `upload_text()` were passing "sh", "-c", and command as three separate arguments to SSH, which concatenated them without quotes, breaking commands with `&&`. Now passes `"sh -c 'command'"` as a single argument.
+
+### Added
+- **SSH port in RAMIC Bridge banner** — `ramic_bridge.il` now displays the SSH port number in the Ready banner, making it easier to extract connection parameters at a glance.
+- **`tunnel-connect` skill updated** — documents how to connect from the banner, extracting Session, Port, and SSH values directly.
+
+## [0.3.0] - 2026-04-19
+
+### Added
+- **`vcli maestro session-info`** — inspect the focused ADE Assembler/Explorer window; returns `lib`, `cell`, `view`, `editable`, `unsaved_changes`, and `run_dir` as structured JSON
+- **Callback File IPC** — replaces `ipcWriteProcess` with a temp-file pair protocol (`/tmp/.ramic_cb_{port+1}` + `.done` marker); fixes IC23.1/RHEL8 platform bug where `ipcWriteProcess` data handler stops firing after the first call
+- **`spectre-netlist-template` skill** — 9 circuit-type templates (OTA, diff-OTA, LDO, comparator, bandgap reference, current mirror, active filter, VCO, LNA) with verified vsource/isource/analysis syntax from IC231 documentation
+- **`inject_stimulus.py` script** — standalone Python helper (no deps) that auto-detects circuit type from `subckt` port names and writes a complete Spectre testbench wrapper with stimulus + analysis statements
+
+### Fixed
+- **Callback file `cb_port` arithmetic** — daemon now derives `cb_port = actual_port + 1` from `listener.local_addr()` instead of `argv[2]`; previously the OS-assigned port was never propagated so all callback files were written to `/tmp/.ramic_cb_1`
+
+### Changed
+- **Release workflow** — new `.github/workflows/release.yml` builds Linux x86_64 release binaries and publishes to crates.io on `v*` tags
+
+## [0.2.0] - 2026-04-18
+
+### Changed
+- **`vcli optim` removed** — migrated to `circuit-optimizer` skill script (`scripts/run_bandgap_sweep.py`); deleted 650 lines of Rust and the `serde_yaml` dependency
+- **Zombie job fix** — `jobs.rs::refresh()` no longer marks a spectre process as alive based on PID alone; validates against the simulation log file to detect completed runs whose OS process has already exited
+
+## [0.1.5] - 2026-04-15
+
+### Added
+- **`Orient` enum** for schematic instance orientation — type-safe replacement for `String`, derives `clap::ValueEnum` + `serde::Deserialize` so both CLI (`--orient`) and JSON spec (`build --spec`) reject invalid values at the boundary. Accepts exactly the 8 Cadence orientations: R0, R90, R180, R270, MX, MY, MXR90, MYR90
+- **`maestro add-output` now resolves setup name from session internally** — previously passed session ID as SKILL output name and user name as setup name, causing `maeAddOutput` to always return nil
+
+### Fixed
+- **`sim::job_list` no longer uses `unwrap_or_default()`** — propagates serialization errors via `VirtuosoError::Execution` per project convention
+- **`parse_skill_json` returns `Result<Value>`** instead of silently falling back to `{"raw": output}` — surfaces SKILL output corruption instead of masking it; all call sites updated to propagate the error
+- **`cv_guard` injection in `schematic_ops.rs`** — every schematic operation now validates the `RB_SCH_CV` global SKILL variable is bound before use, surfacing clear errors instead of cryptic SKILL failures
+
+### Refactored
+- **`main.rs` dispatcher extraction** — 239-line central match reduced to 12 lines by extracting 9 `dispatch_*` functions (one per command group)
+- **`measure` expression validation** — new `validate_measure_expr` blocks destructive SKILL calls (`system`, `ipcBeginProcess`, `deleteFile`, `load`, `evalstring`, …) before execution
+
+## [0.1.4] - 2026-04-15
+
+### Added
+- **`vcli window` subcommand group** — `list`, `dismiss-dialog`, `screenshot`
+  - `list`: enumerate all open Virtuoso windows with derived mode labels (`ade-editing`, `ade-reading`, `schematic`, `layout`, `other`); handles SKILL octal escapes (`\256` = ®) that break standard JSON parsers
+  - `dismiss-dialog [--action ok|cancel] [--dry-run]`: programmatically cancel or confirm a blocking GUI dialog
+  - `screenshot --path FILE [--window PATTERN]`: capture via X11 ImageMagick `import -window root` (IC23.1 fallback — `hiGetWindowScreenDump` is IC25+ only)
+- **`vcli maestro set-analysis`** — enable an analysis type (ac/dc/tran/noise/…) on a setup by session name; resolves setup internally via `maeGetSetup`
+
+### Fixed
+- **`maestro add-output`** — parameter order was completely wrong: session ID was passed as SKILL output name and user-supplied name as setup name, causing `maeAddOutput` to always return nil; now resolves setup from session automatically
+- **`maestro get-analyses`** — `maeGetEnabledAnalysis` takes a positional setup name (not `?session` keyword) in IC23.1; setup name is now resolved via `maeGetSetup` internally
+- **`--session` global arg no longer clobbers `VB_SESSION`** — bridge session ID and Maestro session name can coexist without conflict
+
+## [0.1.3] - 2026-04-15
+
+### Fixed
+- **format tracing::debug line in bridge.rs** — fix log formatting issue
+- **maestro: align SKILL function signatures with IC25.1 official documentation** — fixes Maestro operations compatibility
+
+### Added
+- **New skills** — `circuit-optimizer`, `sim-plot`, `schematic-gen`, `spectre-netlist-gotchas` — see [.claude/skills/](.claude/skills/)
+- **Maestro skill** and Virtuoso reference documentation
+
+### Dependencies
+- Updated various dependencies for stability
+
+## [0.1.2] - 2026-04-13
+
+### Added
+- **Interactive TUI Dashboard** — `vtui` binary with Sessions/Jobs/Config tabs
+- **Remote Session Auto-Discovery** — `vcli tunnel start` syncs remote sessions
+- **Remote Async Spectre Simulation** — `vcli sim run-async` works via SSH nohup
+- **SSH Configuration** — `VB_SSH_PORT`, `VB_SSH_KEY` support
+- **IC23.1+ Maestro Explorer Support** — `vcli maestro` commands
+
+## [0.1.1] - Previous release
+
+See [release history](https://github.com/deanyou/virtuoso-cli/releases)

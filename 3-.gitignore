@@ -1,0 +1,13 @@
+# PDK / licensed-data hygiene: never commit foundry PDK material,
+# private alias maps, transcripts or simulation outputs.
+pdk_map_private.il
+*.sp
+*.scs
+*.lis
+*.mt0
+*.measure
+*.cdslck
+psf*
+target/
+__pycache__/
+*.pyc
