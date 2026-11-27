@@ -577,10 +577,12 @@ pub fn polish_label(
     let skill = client
         .schematic
         .polish_labels(net, preset, auto_rotate, offset);
-    let r = client.execute_skill_unchecked(&skill, None)?;
+    let r = client
+        .execute_skill_unchecked(&skill, None)?
+        .ok_or_exec_nil_ok("schematic polish-label")?;
     let labels_updated = r.output_unquoted().parse::<usize>().unwrap_or(0);
     Ok(json!({
-        "status": if r.skill_ok() { "success" } else { "error" },
+        "status": "success",
         "net": net,
         "labels_updated": labels_updated,
         "preset": preset,

@@ -386,8 +386,8 @@ fn find_skill_finder_dir(cfg: &Config) -> Result<Option<std::path::PathBuf>> {
 
     if !cfg.is_remote() {
         for bin in ["virtuoso", "spectre"] {
-            let Ok(out) = std::process::Command::new("command")
-                .args(["-v", bin])
+            let Ok(out) = std::process::Command::new("sh")
+                .args(["-c", "command -v \"$1\"", "_", bin])
                 .output()
                 .or_else(|_| std::process::Command::new("which").arg(bin).output())
             else {
