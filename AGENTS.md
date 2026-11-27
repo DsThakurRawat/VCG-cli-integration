@@ -33,12 +33,11 @@ server, plus vcli's prompts `maestro-run-and-check`,
    session, only write to a throwaway library the human named.
 2. **Never retry after a timeout or uncertain result.** SKILL is not
    replayed automatically for a reason: the first call may have landed.
-   Inspect the outcome (read the cellview back, check history) before
-   sending anything again. After a timeout the cross-bridge lock is also
-   **no longer a guarantee**: the timed-out SKILL may still be running in
-   the CIW, vcli refuses further requests on that channel but bridge-lite
-   does not know. Stop, tell the human, and wait until the session is idle
-   (or restarted) before using either server again.
+   After a timeout the daemons write a quarantine marker
+   (`$VAI_LOCK_FILE.quarantine`) and **both** bridges refuse every SKILL
+   eval and GUI action until a human removes it. When you see
+   "cross-bridge quarantine active", stop and tell the human. Never delete
+   the marker yourself: only the human can confirm the CIW is idle.
 3. **Do not touch dialogs.** A popup in the shared CIW cannot be attributed
    to you or the human. Never press Enter/Cancel or close a form to unblock
    yourself; report it and wait. `virtuoso-bridge inspect-dialogs` is
