@@ -1,0 +1,32 @@
+name: unpack-source
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Replace tracked files with audited candidate and verify tree
+        run: |
+          set -e
+          f=$(ls [0-9]*-vci3.tgz | head -1)
+          mkdir /tmp/new
+          tar xzf "$f" -C /tmp/new
+          git ls-files | grep -v '^\.github/workflows/' | grep -v -x "$f" > /tmp/old.txt || true
+          xargs -d '\n' git rm -q -f -- < /tmp/old.txt
+          git rm -q -f -- "$f"
+          cp -a /tmp/new/. .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -f
+          git commit -q -m "Replace source with combined candidate ef80377 (vendored bridge-lite, restored src/target)"
+          export GIT_INDEX_FILE=/tmp/idx
+          git read-tree HEAD
+          git rm --cached -q .github/workflows/unpack.yml
+          got=$(git write-tree)
+          echo "tree $got expected 634a9db46f65aa4592ad33a1a6b171d997fc0b4e"
+          test "$got" = "634a9db46f65aa4592ad33a1a6b171d997fc0b4e"
+          unset GIT_INDEX_FILE
+          git push
