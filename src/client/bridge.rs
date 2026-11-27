@@ -35,10 +35,13 @@ const READ_TIMEOUT_GRACE_SECS: u64 = 2;
 /// The socket read timeout for a request with a `timeout`-second budget.
 ///
 /// The budget plus a grace, so the daemon's own answer can still arrive.
-/// The grace never exceeds half the requested budget: a one-second probe
-/// must still fail inside its own second, not three seconds later.
+/// The grace is half the budget, clamped to 1..=2 s: at least one second so
+/// the daemon's verdict (and its quarantine) always lands before we give up.
 fn read_timeout_secs(timeout: u64) -> u64 {
-    let grace = READ_TIMEOUT_GRACE_SECS.min(timeout / 2);
+    if timeout == 0 {
+        return 0;
+    }
+    let grace = (timeout / 2).clamp(1, READ_TIMEOUT_GRACE_SECS);
     timeout.saturating_add(grace)
 }
 
@@ -2166,11 +2169,11 @@ mod hung_channel_tests {
         );
     }
 
-    /// A short budget must not be stretched: a one-second probe still fails
-    /// inside its own second.
+    /// Even a one-second request waits one more second for the daemon's
+    /// verdict, so a timeout's quarantine is never reported late (issue #10).
     #[test]
-    fn the_grace_never_exceeds_half_the_budget() {
-        assert_eq!(read_timeout_secs(1), 1);
+    fn the_grace_is_at_least_one_second_and_at_most_two() {
+        assert_eq!(read_timeout_secs(1), 2);
         assert_eq!(read_timeout_secs(2), 3);
         assert_eq!(read_timeout_secs(30), 32);
         assert_eq!(read_timeout_secs(0), 0);

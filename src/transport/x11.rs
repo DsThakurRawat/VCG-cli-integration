@@ -1445,7 +1445,11 @@ fn action_x11_cached(
                 Duration::from_secs(*timeout_secs),
             )) {
                 Ok(out) => {
-                    guard.mark_released();
+                    if out.success {
+                        guard.mark_released();
+                    } else {
+                        guard.arm();
+                    }
                     results.push(out);
                 }
                 Err(err) => {
@@ -1470,7 +1474,11 @@ fn action_x11_cached(
                     vai_wrap(&remote_cmd),
                     Duration::from_secs(*timeout_secs),
                 ))?;
+                let failed = !out.success;
                 results.push(out);
+                if failed {
+                    break;
+                }
             }
         }
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -1487,10 +1495,13 @@ fn action_x11_cached(
                 }
             }
         }
-        let success = results.last().map(|r| r.success).unwrap_or(true);
+        let first_failure = results.iter().position(|r| !r.success);
+        let success = first_failure.is_none();
 
         if operation == X11Operation::Maximize && !success {
-            let stderr = results.last().map(|r| r.stderr.as_str()).unwrap_or("");
+            let stderr = first_failure
+                .map(|i| results[i].stderr.as_str())
+                .unwrap_or("");
             if stderr.contains("Unknown command") || stderr.contains("windowstate") {
                 return Err(VirtuosoError::Config(
                     "maximize requires xdotool >= 3.20210804.1 (windowstate subcommand); \
@@ -1521,6 +1532,9 @@ fn action_x11_cached(
             }
             _ => None,
         };
+        if let Some(i) = first_failure {
+            return Err(x11_step_failure(operation, i, results.len(), &results[i]));
+        }
         return Ok(X11ActionResult {
             status: if success { "success" } else { "failure" }.to_string(),
             operation: operation.as_str().to_string(),
@@ -1748,7 +1762,11 @@ fn action_x11_cached(
             Duration::from_secs(*timeout_secs),
         )) {
             Ok(out) => {
-                guard.mark_released();
+                if out.success {
+                    guard.mark_released();
+                } else {
+                    guard.arm();
+                }
                 (vec![out], None)
             }
             Err(err) => {
@@ -1775,7 +1793,11 @@ fn action_x11_cached(
                 vai_wrap(&remote_cmd),
                 Duration::from_secs(*timeout_secs),
             ))?;
+            let failed = !out.success;
             outs.push(out);
+            if failed {
+                break;
+            }
         }
         (outs, None)
     };
@@ -1796,14 +1818,21 @@ fn action_x11_cached(
         }
     }
 
+    let first_failure = if operation == X11Operation::Wait {
+        None
+    } else {
+        results.iter().position(|r| !r.success)
+    };
     let success = if operation == X11Operation::Wait {
         wait_succeeded
     } else {
-        results.last().map(|r| r.success).unwrap_or(true)
+        first_failure.is_none()
     };
 
     if operation == X11Operation::Maximize && !success {
-        let stderr = results.last().map(|r| r.stderr.as_str()).unwrap_or("");
+        let stderr = first_failure
+            .map(|i| results[i].stderr.as_str())
+            .unwrap_or("");
         if stderr.contains("Unknown command") || stderr.contains("windowstate") {
             return Err(VirtuosoError::Config(
                 "maximize requires xdotool >= 3.20210804.1 (windowstate subcommand); \
@@ -1851,6 +1880,9 @@ fn action_x11_cached(
         )),
     };
 
+    if let Some(i) = first_failure {
+        return Err(x11_step_failure(operation, i, results.len(), &results[i]));
+    }
     Ok(X11ActionResult {
         status: if success { "success" } else { "failure" }.to_string(),
         operation: operation.as_str().to_string(),
@@ -3019,25 +3051,62 @@ pub fn resolve_unique_window(
     }
 }
 
-fn vai_wrap(cmd: &str) -> String {
-    let gated = format!(
-        "if [ -e {0} ] || [ -L {0} ]; then echo 'cross-bridge quarantine active; refusing GUI input' >&2; exit 97; fi; {1}",
-        shell_escape(&crate::vai_lock::quarantine_path()),
-        cmd
-    );
+fn x11_step_failure(
+    operation: X11Operation,
+    index: usize,
+    total: usize,
+    out: &crate::transport::contract::CommandResult,
+) -> VirtuosoError {
+    let reason = if out.exit_status == 97 {
+        "refused: cross-bridge quarantine active".to_string()
+    } else {
+        format!("exit {}: {}", out.exit_status, out.stderr.trim())
+    };
+    VirtuosoError::Execution(format!(
+        "x11 {} failed at step {}/{} ({reason})",
+        operation.as_str(),
+        index + 1,
+        total
+    ))
+}
+
+const VAI_PY_LOCK: &str = "import fcntl,os,subprocess,sys\nfd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o600)\nfcntl.flock(fd,fcntl.LOCK_EX)\nsys.exit(subprocess.call(['sh','-c',sys.argv[2],'_',sys.argv[1]]))";
+
+fn remote_lock_expr() -> String {
+    match std::env::var("VAI_REMOTE_LOCK_FILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(path) => shell_escape(&path),
+        None => format!(
+            "\"${{VAI_LOCK_FILE:-{}}}\"",
+            crate::vai_lock::DEFAULT_LOCK_PATH
+        ),
+    }
+}
+
+fn locked_shell(lock_expr: &str, inner: &str) -> String {
     format!(
-        "flock {} -c {}",
-        shell_escape(&crate::vai_lock::lock_path()),
-        shell_escape(&gated)
+        "L={lock_expr}; if command -v flock >/dev/null 2>&1; then {{ flock 9 && sh -c {inner} _ \"$L\"; }} 9<>\"$L\"; \
+         elif command -v python3 >/dev/null 2>&1; then python3 -c {py} \"$L\" {inner}; \
+         else echo 'no flock(1) or python3 on the GUI host; refusing unlocked GUI input' >&2; exit 98; fi",
+        inner = shell_escape(inner),
+        py = shell_escape(VAI_PY_LOCK),
     )
 }
 
-fn vai_wrap_in_quarantine(cmd: &str) -> String {
+fn quarantine_gated(cmd: &str) -> String {
     format!(
-        "flock {} -c {}",
-        shell_escape(&crate::vai_lock::lock_path()),
-        shell_escape(cmd)
+        "if [ -e \"$1.quarantine\" ] || [ -L \"$1.quarantine\" ]; then echo 'cross-bridge quarantine active; refusing GUI input' >&2; exit 97; fi; {cmd}"
     )
+}
+
+fn vai_wrap(cmd: &str) -> String {
+    locked_shell(&remote_lock_expr(), &quarantine_gated(cmd))
+}
+
+fn vai_wrap_in_quarantine(cmd: &str) -> String {
+    locked_shell(&remote_lock_expr(), cmd)
 }
 
 fn join_xdotool_commands(display_prefix: &str, cmds: Vec<(String, Vec<String>)>) -> String {
@@ -4605,12 +4674,21 @@ mod tests {
     /// Used to assert a mid-drag failure still triggers a mouseup release.
     struct MidDragFailingTransport {
         commands: std::sync::Mutex<Vec<String>>,
+        drag_exit: Option<i32>,
     }
 
     impl MidDragFailingTransport {
         fn new() -> Self {
             Self {
                 commands: std::sync::Mutex::new(Vec::new()),
+                drag_exit: None,
+            }
+        }
+
+        fn exiting(code: i32) -> Self {
+            Self {
+                commands: std::sync::Mutex::new(Vec::new()),
+                drag_exit: Some(code),
             }
         }
     }
@@ -4632,9 +4710,12 @@ mod tests {
             cmds.push(req.command.clone());
             drop(cmds);
             if req.command.contains("mousedown") {
-                Err(crate::transport::contract::TransportError::LocalIo(
-                    "simulated mid-drag failure".into(),
-                ))
+                match self.drag_exit {
+                    Some(code) => Ok(mk_result("", "simulated drag stderr", code)),
+                    None => Err(crate::transport::contract::TransportError::LocalIo(
+                        "simulated mid-drag failure".into(),
+                    )),
+                }
             } else {
                 Ok(mk_result("", "", 0))
             }
@@ -5068,6 +5149,35 @@ mod tests {
     }
 
     #[test]
+    fn action_x11_direct_drag_nonzero_exit_errors_and_recovers_mouse() {
+        for (code, needle) in [(97, "quarantine"), (1, "exit 1: simulated drag stderr")] {
+            let transport = MidDragFailingTransport::exiting(code);
+            let inputs = ActionX11Inputs {
+                window_id: "0x123",
+                pid: Some(12345),
+                display: ":0",
+                operation: X11Operation::DragRel,
+                x: Some(10),
+                y: Some(20),
+                button: Some(1),
+                text: None,
+                output_dir: None,
+                timeout_secs: 5,
+                direct: true,
+            };
+            let err = action_x11(&transport, "client1", Some("user1"), &inputs)
+                .expect_err("a drag that exits non-zero must be an error, not a status field");
+            assert!(err.to_string().contains(needle), "exit {code}: {err}");
+            let cmds = transport.commands.lock().unwrap();
+            assert!(
+                cmds.iter()
+                    .any(|c| c.contains("mouseup") && !c.contains("mousedown")),
+                "exit {code}: the guard must still send a recovery mouseup: {cmds:?}"
+            );
+        }
+    }
+
+    #[test]
     fn action_x11_direct_drag_issues_mouseup_on_failure() {
         let transport = MidDragFailingTransport::new();
         let inputs = ActionX11Inputs {
@@ -5101,7 +5211,7 @@ mod tests {
             "drag must be issued as ONE atomically-locked command, got: {cmds:?}"
         );
         assert!(
-            drags[0].contains(" && ") && drags[0].starts_with("flock "),
+            drags[0].contains(" && ") && drags[0].contains("flock 9"),
             "drag command must be a single flock-wrapped sequence, got: {}",
             drags[0]
         );
@@ -5759,9 +5869,9 @@ mod tests {
         let joined = join_xdotool_commands("DISPLAY=:0 ", action);
         let wrapped = vai_wrap(&joined);
         assert_eq!(
-            wrapped.matches("flock").count(),
-            1,
-            "one lock hold per drag"
+            wrapped.matches("mousedown").count(),
+            2,
+            "the whole drag sits inside each of the two exclusive lock branches"
         );
         assert_eq!(
             joined.matches("xdotool").count(),
@@ -5782,44 +5892,105 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn shell_gate_blocks_file_dir_and_dangling_symlink_markers() {
-        let has_flock = std::process::Command::new("sh")
-            .args(["-c", "command -v flock"])
-            .stdout(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !has_flock {
-            eprintln!("skipping shell gate test: flock(1) is not installed on this host");
-            return;
+    fn tool_path(base: &std::path::Path, tools: &[&str]) -> std::path::PathBuf {
+        let dir = base.join(format!("bin-{}", tools.join("-")));
+        std::fs::create_dir_all(&dir).unwrap();
+        for t in tools {
+            let found = std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {t}")])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            if let Some(real) = found {
+                let _ = std::os::unix::fs::symlink(real, dir.join(t));
+            }
         }
+        dir
+    }
+
+    #[cfg(unix)]
+    fn run_wrapped(wrapped: &str, path: &std::path::Path) -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(wrapped)
+            .env("PATH", path)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sh runs")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_gate_blocks_markers_and_locks_with_flock_or_python() {
+        use std::os::unix::io::AsRawFd;
         let base = std::env::temp_dir().join(format!("vai-gate-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
         let lock = base.join("lock");
         let marker = format!("{}.quarantine", lock.to_string_lossy());
-        std::fs::create_dir_all(&base).unwrap();
-        crate::vai_lock::set_test_lock_path(&lock.to_string_lossy());
-        let wrapped = vai_wrap("exit 0");
-        let run = || {
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&wrapped)
-                .status()
-                .expect("sh runs")
-                .code()
-        };
-        let _ = std::fs::remove_file(&marker);
-        let _ = std::fs::remove_dir_all(&marker);
-        assert_eq!(run(), Some(0), "no marker: command runs");
-        std::fs::write(&marker, "timeout").unwrap();
-        assert_eq!(run(), Some(97), "regular marker: refused");
-        std::fs::remove_file(&marker).unwrap();
-        std::fs::create_dir(&marker).unwrap();
-        assert_eq!(run(), Some(97), "directory marker: refused");
-        std::fs::remove_dir_all(&marker).unwrap();
-        std::os::unix::fs::symlink("/nonexistent-vai-target", &marker).unwrap();
-        assert_eq!(run(), Some(97), "dangling symlink marker: refused");
-        std::fs::remove_file(&marker).unwrap();
+        let wrapped = locked_shell(
+            &shell_escape(&lock.to_string_lossy()),
+            &quarantine_gated("exit 0"),
+        );
+        let mut branches = Vec::new();
+        let with_flock = tool_path(&base, &["sh", "flock", "python3"]);
+        if with_flock.join("flock").exists() {
+            branches.push(("flock", with_flock));
+        }
+        let python_only = tool_path(&base, &["sh", "python3"]);
+        if python_only.join("python3").exists() {
+            branches.push(("python3", python_only));
+        }
+        assert!(
+            !branches.is_empty(),
+            "neither flock(1) nor python3 is available to test"
+        );
+        for (name, path) in &branches {
+            let code = |m: &str| {
+                let c = run_wrapped(&wrapped, path).wait_with_output().unwrap();
+                (m.to_string(), c.status.code())
+            };
+            let _ = std::fs::remove_file(&marker);
+            assert_eq!(code(name).1, Some(0), "{name}: no marker, command runs");
+            std::fs::write(&marker, "timeout").unwrap();
+            assert_eq!(code(name).1, Some(97), "{name}: regular marker refused");
+            std::fs::remove_file(&marker).unwrap();
+            std::fs::create_dir(&marker).unwrap();
+            assert_eq!(code(name).1, Some(97), "{name}: directory marker refused");
+            std::fs::remove_dir_all(&marker).unwrap();
+            std::os::unix::fs::symlink("/nonexistent-vai-target", &marker).unwrap();
+            assert_eq!(code(name).1, Some(97), "{name}: dangling symlink refused");
+            std::fs::remove_file(&marker).unwrap();
+
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock)
+                .unwrap();
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+            let mut child = run_wrapped(&wrapped, path);
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "{name}: wrapper must wait while the lock is held"
+            );
+            drop(held);
+            assert_eq!(
+                child.wait().unwrap().code(),
+                Some(0),
+                "{name}: runs after release"
+            );
+        }
+        let neither = tool_path(&base, &["sh"]);
+        let refused = run_wrapped(&wrapped, &neither).wait().unwrap().code();
+        assert_eq!(
+            refused,
+            Some(98),
+            "no lock tool: refuse, never run unlocked"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -5827,7 +5998,7 @@ mod tests {
     fn guard_cleanup_mouseup_bypasses_quarantine_gate() {
         let wrapped = vai_wrap_in_quarantine("xdotool mouseup --window 0x1 1");
         assert!(!wrapped.contains(".quarantine"));
-        assert_eq!(wrapped.matches("flock").count(), 1);
+        assert!(wrapped.contains("flock 9"), "still taken under the lock");
     }
 
     #[test]

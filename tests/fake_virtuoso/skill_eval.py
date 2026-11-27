@@ -201,13 +201,16 @@ def _sprintf(fmt, *args):
             return format_value(next(it))
         if spec[-1] == "n":
             return str(next(it))
+        if spec[-1] == "c":
+            val = next(it)
+            return val if isinstance(val, str) else chr(int(val))
         if spec[-1] in "dix":
             return (spec[:-1] + ("x" if spec[-1] == "x" else "d")) % int(next(it))
         if spec[-1] in "fge":
             return spec % float(next(it))
         val = next(it)
         return spec % (val if isinstance(val, str) else format_value(val))
-    out.append(re.sub(r"%[-+ 0#]*\d*(?:\.\d+)?[sdixfgeLn%]", repl, fmt))
+    out.append(re.sub(r"%[-+ 0#]*\d*(?:\.\d+)?[sdixfgeLnc%]", repl, fmt))
     return "".join(out)
 
 
@@ -398,6 +401,12 @@ def _sp_foreach(s, rest, scopes):
     return seq
 
 
+def _sp_while(s, rest, scopes):
+    while s.eval(rest[0], scopes) is not None:
+        s.body(rest[1:], scopes)
+    return T
+
+
 def _sp_procedure(s, rest, scopes):
     sig = rest[0]
     s.globals["__proc__" + sig[0]] = (list(sig[1:]), rest[1:])
@@ -414,6 +423,7 @@ _SPECIAL = {
     "if": _sp_if, "when": _sp_when, "unless": _sp_unless, "and": _sp_and, "or": _sp_or,
     "__op__&&": _sp_and, "__op__||": _sp_or, "errset": _sp_errset, "foreach": _sp_foreach,
     "procedure": _sp_procedure, "__getattr__": _sp_getattr, "lambda": _sp_lambda,
+    "while": _sp_while,
 }
 
 
@@ -462,6 +472,33 @@ def _mapcar(s, fn, seq):
     return [apply_fn(s, fn, [x]) for x in seq or []] or None
 
 
+def _index(s, text, sub):
+    pos = text.find(sub)
+    return None if pos < 0 else text[pos:]
+
+
+def _outfile(s, path, mode="w"):
+    return open(path, "a" if mode == "a" else "w", encoding="utf-8")
+
+
+def _fprintf(s, port, fmt, *args):
+    port.write(_sprintf(fmt, *args))
+    return T
+
+
+def _close(s, port):
+    port.close()
+    return T
+
+
+def _ipc_write(s, ipc, data):
+    writer = s.globals.get("__ipc_writer__")
+    if writer is None:
+        raise SkillError("*Error* ipcWriteProcess: no IPC process bound")
+    writer(ipc, data)
+    return T
+
+
 def _nth(s, n, seq):
     return seq[n] if seq and 0 <= n < len(seq) else None
 
@@ -489,8 +526,41 @@ _BUILTINS = {
     "hiFlush": lambda s: T, "getVersion": lambda s: "fake-virtuoso",
     "ipcGetPid": lambda s: os.getpid(), "getHostName": lambda s: __import__("socket").gethostname(),
     "load": _load, "substring": _substring,
-    "buildString": _build_string, "mapcar": _mapcar, "apply": lambda s, f, a: apply_fn(s, f, a or []),
+    "buildString": _build_string, "mapcar": _mapcar, "index": _index,
+    "greaterp": lambda s, a, b: T if a > b else None, "lessp": lambda s, a, b: T if a < b else None,
+    "outfile": _outfile, "fprintf": _fprintf, "close": _close, "ipcWriteProcess": _ipc_write, "apply": lambda s, f, a: apply_fn(s, f, a or []),
 }
+
+
+def extract_procedures(text, names):
+    found = {}
+    for name in names:
+        start = text.find("procedure(%s(" % name)
+        if start < 0:
+            raise SkillError("procedure %s not found" % name)
+        depth, i, in_str, in_comment = 0, start, False, False
+        while i < len(text):
+            c = text[i]
+            if in_comment:
+                in_comment = c != "\n"
+            elif in_str:
+                if c == "\\":
+                    i += 1
+                elif c == '"':
+                    in_str = False
+            elif c == ";":
+                in_comment = True
+            elif c == '"':
+                in_str = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    found[name] = text[start:i + 1]
+                    break
+            i += 1
+    return found
 
 
 def builtin_names():
