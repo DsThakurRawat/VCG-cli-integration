@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "vb": {
-      "command": "/path/to/.venv/bin/python",
-      "args": ["/path/to/virtuoso-bridge-lite/mcp_server.py"],
+    "virtuoso-bridge": {
+      "command": "/path/to/virtuoso-cli-integration/scripts/vai-mcp",
+      "args": ["bridge"],
       "env": {
         "VB_REMOTE_HOST": "localhost",
         "VB_WORK_DIR": "/path/to/agent/work",

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+PY="${VAI_PYTHON:-$REPO/python/.venv/bin/python}"
+[[ -x "$PY" ]] || PY="$(command -v python3)"
+"$PY" -c 'import virtuoso_bridge, pytest' 2>/dev/null || {
+    echo "need virtuoso_bridge + pytest for $PY (uv pip install --python $PY ./python pytest)" >&2
+    exit 1
+}
+command -v bwrap >/dev/null || { echo "bubblewrap (bwrap) is required" >&2; exit 1; }
+
+if [[ "${VAI_SKIP_BUILD:-0}" != 1 ]]; then
+    (cd "$REPO" && cargo build --quiet --features daemon --bins)
+fi
+BIN="${VAI_TARGET_DIR:-$REPO/target/debug}"
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/vai-sandbox.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/home" "$WORK/state"
+
+ARGS=(
+    --ro-bind / /
+    --tmpfs /tmp
+    --bind "$WORK" "$WORK"
+    --dev /dev
+    --proc /proc
+    --unshare-pid --unshare-net --unshare-ipc --unshare-uts
+    --hostname fake-virtuoso
+    --die-with-parent
+    --clearenv
+    --setenv HOME "$WORK/home"
+    --setenv USER "${USER:-tester}"
+    --setenv PATH "$BIN:$(dirname "$PY"):/usr/local/bin:/usr/bin:/bin"
+    --setenv LANG C.UTF-8
+    --setenv PYTHONDONTWRITEBYTECODE 1
+    --setenv VAI_SANDBOX 1
+    --setenv VAI_WORK "$WORK"
+    --setenv VAI_BIN "$BIN"
+    --setenv VAI_PYTHON "$PY"
+    --chdir "$REPO"
+)
+exec bwrap "${ARGS[@]}" "$PY" -m pytest -p no:cacheprovider -v "$REPO/tests/fake_virtuoso" "$@"

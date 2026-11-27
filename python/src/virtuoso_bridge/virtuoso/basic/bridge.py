@@ -2343,6 +2343,14 @@ let((result winName ciwNum)
                 self._selection_reconciled = True
         elif expected is not None and not isinstance(expected, dict):
             raise daemon_auth.DaemonAuthError("Invalid expected instance record")
+        # virtuoso-cli-integration: local mode (no SSH runner) never reached
+        # warm()/ensure_ready() from the CLI eval or MCP paths, so the first
+        # hello went out without a token and the daemon refused it. Provision
+        # the local token here, at first authenticated use.
+        if (self._daemon_token is None and self._tunnel is not None
+                and hasattr(self._tunnel, "ensure_daemon_token")
+                and getattr(self._tunnel, "_ssh_runner", True) is None):
+            self.daemon_token = self._tunnel.ensure_daemon_token()
         if (self._daemon_caps is not None and not refresh
                 and (not expected or self._daemon_caps.get("instance_record") == expected)):
             return self._daemon_caps

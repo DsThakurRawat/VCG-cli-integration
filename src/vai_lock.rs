@@ -8,11 +8,57 @@ use std::os::unix::io::AsRawFd;
 
 pub const DEFAULT_LOCK_PATH: &str = "/tmp/virtuoso-ai-bridge.lock";
 
-pub fn lock_path() -> String {
-    std::env::var("VAI_LOCK_FILE")
-        .ok()
-        .filter(|s| !s.is_empty())
+fn resolve_lock_path(env: Option<String>) -> String {
+    env.filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_LOCK_PATH.to_string())
+}
+
+#[cfg(not(test))]
+pub fn lock_path() -> String {
+    resolve_lock_path(std::env::var("VAI_LOCK_FILE").ok())
+}
+
+#[cfg(test)]
+struct TestLockPath(String);
+
+#[cfg(test)]
+impl Drop for TestLockPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(quarantine_marker_for(&self.0));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LOCK_PATH: std::cell::RefCell<Option<TestLockPath>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+static TEST_LOCK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub fn set_test_lock_path(path: &str) {
+    TEST_LOCK_PATH.with(|c| *c.borrow_mut() = Some(TestLockPath(path.to_string())));
+}
+
+#[cfg(test)]
+pub fn lock_path() -> String {
+    TEST_LOCK_PATH.with(|c| {
+        c.borrow_mut()
+            .get_or_insert_with(|| {
+                let seq = TEST_LOCK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                TestLockPath(
+                    std::env::temp_dir()
+                        .join(format!("vai-test-{}-{seq}.lock", std::process::id()))
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+            .0
+            .clone()
+    })
 }
 
 pub struct VaiLock {
@@ -21,13 +67,10 @@ pub struct VaiLock {
 }
 
 impl VaiLock {
-    /// True when this handle holds the kernel lock.
     pub fn held(&self) -> bool {
         self.file.is_some()
     }
 
-    /// False on platforms with no flock: callers must not treat
-    /// `!held()` there as an acquisition error.
     pub fn coordination_supported(&self) -> bool {
         self.supported
     }
@@ -150,13 +193,22 @@ mod tests {
 
     #[test]
     fn lock_path_resolution() {
-        std::env::remove_var("VAI_LOCK_FILE");
-        assert_eq!(lock_path(), DEFAULT_LOCK_PATH);
-        std::env::set_var("VAI_LOCK_FILE", "/tmp/vai-test-override.lock");
-        assert_eq!(lock_path(), "/tmp/vai-test-override.lock");
-        std::env::set_var("VAI_LOCK_FILE", "");
-        assert_eq!(lock_path(), DEFAULT_LOCK_PATH);
-        std::env::remove_var("VAI_LOCK_FILE");
+        assert_eq!(resolve_lock_path(None), DEFAULT_LOCK_PATH);
+        assert_eq!(
+            resolve_lock_path(Some("/tmp/vai-test-override.lock".into())),
+            "/tmp/vai-test-override.lock"
+        );
+        assert_eq!(resolve_lock_path(Some(String::new())), DEFAULT_LOCK_PATH);
+    }
+
+    #[test]
+    fn tests_never_use_the_production_lock() {
+        let mine = lock_path();
+        assert_ne!(mine, DEFAULT_LOCK_PATH);
+        assert_eq!(lock_path(), mine);
+        let other = std::thread::spawn(lock_path).join().unwrap();
+        assert_ne!(other, mine);
+        assert_ne!(other, DEFAULT_LOCK_PATH);
     }
 
     #[test]
@@ -204,22 +256,21 @@ mod tests {
     fn held_reports_lock_state() {
         let p = std::env::temp_dir().join(format!("vai-test-held-{}.lock", std::process::id()));
         let ps = p.to_string_lossy().to_string();
-        std::env::set_var("VAI_LOCK_FILE", &ps);
+        set_test_lock_path(&ps);
         let guard = acquire();
         assert!(guard.coordination_supported());
         assert!(guard.held());
         drop(guard);
-        std::env::remove_var("VAI_LOCK_FILE");
-        let _ = std::fs::remove_file(&ps);
     }
 
     #[cfg(unix)]
     #[test]
     fn second_acquire_blocks_until_first_releases() {
-        std::env::set_var("VAI_LOCK_FILE", "/tmp/vai-test-serialize.lock");
+        let shared = lock_path();
         let first = acquire();
         let (tx, rx) = std::sync::mpsc::channel();
         let t = std::thread::spawn(move || {
+            set_test_lock_path(&shared);
             tx.send("waiting").unwrap();
             let _second = acquire();
             tx.send("acquired").unwrap()
@@ -230,7 +281,5 @@ mod tests {
         drop(first);
         assert_eq!(rx.recv().unwrap(), "acquired");
         t.join().unwrap();
-        std::env::remove_var("VAI_LOCK_FILE");
-        let _ = std::fs::remove_file("/tmp/vai-test-serialize.lock");
     }
 }

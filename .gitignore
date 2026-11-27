@@ -15,3 +15,5 @@ __pycache__/
 # Vendored bridge-lite: upstream tracks these; the generic sim-output rules above must not hide them
 !python/src/virtuoso_bridge/spectre/psf.py
 !python/**/*.scs
+python/build/
+.venv/

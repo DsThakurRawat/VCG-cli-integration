@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import datetime
 import hashlib
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -438,8 +440,87 @@ def _tool_defs() -> list[dict]:
          {"destructiveHint": False, "idempotentHint": False, "openWorldHint": True}),
     ]
     t.sort(key=lambda x: x[0])
+    denied = _denied_tools()
+    t = [x for x in t if x[0] not in denied]
     return [{"name": n, "title": n.replace("_", " "),
              "description": d, "inputSchema": s, "annotations": a} for n, d, s, a in t]
+
+
+# ---------------------------------------------------------------- agent audit
+# virtuoso-cli-integration: VAI_DENY_TOOLS hides/refuses tools (the vai-mcp
+# launcher's safe mode uses it), and every tools/call is appended to the
+# JSONL log shared with vcli's MCP server ($VAI_AUDIT_LOG, "off" disables).
+
+_AUDIT_ARGS_LIMIT = 4000
+_AUDIT_ERROR_LIMIT = 500
+_AUDIT_CLIENT = "unknown"
+
+
+def _denied_tools() -> set:
+    raw = os.environ.get("VAI_DENY_TOOLS") or ""
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _audit_path():
+    v = (os.environ.get("VAI_AUDIT_LOG") or "").strip()
+    if v.lower() in ("0", "off", "false", "none"):
+        return None
+    if v:
+        return Path(v)
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "virtuoso-ai" / "audit.jsonl"
+
+
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return "%s...[+%d chars]" % (text[:limit], len(text) - limit)
+
+
+def _set_audit_client(params: dict) -> None:
+    global _AUDIT_CLIENT
+    p = params or {}
+    info = p.get("clientInfo") or _meta_of(p).get(META_INFO) or {}
+    if isinstance(info, dict) and info.get("name"):
+        _AUDIT_CLIENT = str(info["name"])
+
+
+def _audit(tool: str, args, error, started: float) -> None:
+    path = _audit_path()
+    if path is None:
+        return
+    try:
+        args_text = json.dumps(args if args is not None else {}, default=str)
+        args_value = args if len(args_text) <= _AUDIT_ARGS_LIMIT else _clip(args_text, _AUDIT_ARGS_LIMIT)
+        entry = {
+            "ts": datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "server": "bridge", "client": _AUDIT_CLIENT,
+            "user": os.environ.get("USER", ""), "pid": os.getpid(),
+            "tool": tool, "args": args_value, "ok": error is None,
+            "error": None if error is None else _clip(str(error), _AUDIT_ERROR_LIMIT),
+            "ms": int((time.monotonic() - started) * 1000),
+        }
+        if not path.parent.exists():
+            os.makedirs(str(path.parent), mode=0o700, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(path), flags, 0o600)
+        try:
+            if os.name == "posix" and os.fstat(fd).st_mode & 0o077:
+                os.fchmod(fd, 0o600)
+            os.write(fd, (json.dumps(entry, default=str) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception as exc:
+        logger.warning("audit write failed: %s", exc)
+
+
+def _result_error(result):
+    if not (isinstance(result, dict) and result.get("isError")):
+        return None
+    try:
+        return result["content"][0]["text"]
+    except Exception:
+        return "tool reported isError"
 
 
 TOOL_NAMES = [d["name"] for d in _tool_defs()]
@@ -1668,6 +1749,8 @@ def dispatch_tool(name: str, args: dict, params: dict) -> dict:
     name = ALIASES.get(name, name)
     if name not in IMPL:
         raise ValueError("unknown tool: " + name)
+    if name in _denied_tools():
+        return _tool_error("tool %s is disabled by VAI_DENY_TOOLS on this server" % name)
     if not _UNLIMITED:
         lim = _RATE_LIMITS.get(name)
         if lim is not None and not _rate_ok(name, limit=lim):
@@ -1876,6 +1959,7 @@ def handle(req: dict):
                 {"supported": SUPPORTED_VERSIONS, "requested": ver}))
         return
     if method in ("server/discover", "initialize"):
+        _set_audit_client(params)
         if method == "initialize":
             p = params or {}
             want = p.get("protocolVersion")
@@ -1908,7 +1992,15 @@ def handle(req: dict):
             _reply(rid, r)
         elif method == "tools/call":
             name = (params or {}).get("name", "")
-            _reply(rid, dispatch_tool(name, (params or {}).get("arguments"), params))
+            args = (params or {}).get("arguments")
+            started = time.monotonic()
+            try:
+                result = dispatch_tool(name, args, params)
+            except Exception as exc:
+                _audit(name, args, exc, started)
+                raise
+            _audit(name, args, _result_error(result), started)
+            _reply(rid, result)
         elif method == "resources/list":
             items = _resource_list()
             chunk, nxt = _page(items, (params or {}).get("cursor"), "resources")

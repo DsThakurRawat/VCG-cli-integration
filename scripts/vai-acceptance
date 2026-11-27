@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Run ACCEPTANCE.md against a live Virtuoso session and print PASS/FAIL per step.
+
+Read-only by default. --scratch-lib LIB adds one write per bridge into a new
+cell in LIB (step 9). --quarantine adds the timeout-quarantine check, which
+leaves the vcli daemon refusing work until you run VCStop()/VCStart().
+"""
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+LAUNCHER = REPO / "scripts" / "vai-mcp"
+CLIENT = "vai-acceptance"
+RESULTS = []
+
+
+def record(step, name, status, detail=""):
+    RESULTS.append({"step": step, "name": name, "status": status, "detail": detail})
+    mark = {"PASS": "\033[32mPASS\033[0m", "FAIL": "\033[31mFAIL\033[0m",
+            "SKIP": "\033[33mSKIP\033[0m"}.get(status, status) if sys.stdout.isatty() else status
+    print("%-5s %-4s %-58s %s" % (step, mark, name, detail[:150]), flush=True)
+
+
+def find_vcli():
+    out = subprocess.run(["bash", str(LAUNCHER), "doctor"], capture_output=True, text=True)
+    for line in out.stdout.splitlines():
+        if line.startswith("vcli ") and " ok " in line:
+            return line.split()[2]
+    return None
+
+
+def bridge_cli():
+    for c in (REPO / "python/.venv/bin/virtuoso-bridge", REPO / ".venv/bin/virtuoso-bridge"):
+        if c.exists():
+            return str(c)
+    return shutil.which("virtuoso-bridge")
+
+
+class Live:
+    def __init__(self, args):
+        self.args = args
+        self.vcli_bin = find_vcli()
+        self.bridge_bin = bridge_cli()
+        self.env = dict(os.environ)
+
+    def vcli(self, code, timeout=30):
+        if not self.vcli_bin:
+            return {"status": "error", "message": "no verified vcli build"}
+        p = subprocess.run([self.vcli_bin, "--format", "json", "skill", "exec", code, "--timeout", str(timeout)],
+                           capture_output=True, text=True, timeout=timeout + 60,
+                           env=dict(self.env, VCLI_CAPABILITY="admin"))
+        try:
+            return json.loads(p.stdout)
+        except ValueError:
+            return {"status": "error", "message": (p.stderr or p.stdout)[-400:]}
+
+    def bridge(self, code, timeout=30):
+        if not self.bridge_bin:
+            return {"status": "error", "errors": ["virtuoso-bridge CLI not found"]}
+        p = subprocess.run([self.bridge_bin, "eval", "--timeout", str(timeout), code],
+                           capture_output=True, text=True, timeout=timeout + 60, env=self.env)
+        try:
+            return json.loads(p.stdout)
+        except ValueError:
+            return {"status": "error", "errors": [(p.stderr or p.stdout)[-400:]]}
+
+    def mcp(self, server, calls, extra_env):
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                           "clientInfo": {"name": CLIENT, "version": "1"}}}
+        reqs = [init] + [{"jsonrpc": "2.0", "id": i + 2, "method": "tools/call",
+                          "params": {"name": n, "arguments": a}} for i, (n, a) in enumerate(calls)]
+        reqs.insert(1, {"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}})
+        p = subprocess.run(["bash", str(LAUNCHER), server], capture_output=True, text=True, timeout=300,
+                           input="".join(json.dumps(r) + "\n" for r in reqs), env=dict(self.env, **extra_env))
+        replies = {}
+        for line in p.stdout.splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if "id" in r:
+                replies[r["id"]] = r
+        return replies, p.stderr
+
+
+def ok_value(r, expect=None):
+    if r.get("status") != "success":
+        return False
+    return expect is None or str(r.get("output", "")).strip() == expect
+
+
+def short(r):
+    return json.dumps({k: r.get(k) for k in ("status", "output", "errors", "message") if r.get(k)})[:150]
+
+
+def failed(reply):
+    res = reply.get("result") or {}
+    return bool(reply.get("error")) or bool(res.get("isError"))
+
+
+def lock_probe(path):
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        return "error: %s" % exc
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return "free"
+    except BlockingIOError:
+        return "held"
+    finally:
+        os.close(fd)
+
+
+def in_background(fn, *a, **kw):
+    box = {}
+    t = threading.Thread(target=lambda: box.update(r=fn(*a, **kw)))
+    t.start()
+    return t, box
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scratch-lib", help="throwaway library for the write test (step 9); omit to skip writes")
+    ap.add_argument("--quarantine", action="store_true", help="also run the timeout-quarantine check (needs VCStop()/VCStart() afterwards)")
+    ap.add_argument("--sleep", type=int, default=4, help="seconds of the long eval used for lock checks (default 4)")
+    ap.add_argument("--report", type=Path, default=Path("vai-acceptance-report.json"))
+    a = ap.parse_args()
+    live = Live(a)
+    print("Virtuoso acceptance run - %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    doc = subprocess.run(["bash", str(LAUNCHER), "doctor"], capture_output=True, text=True).stdout
+    ready = live.vcli_bin and " ok " in next((l for l in doc.splitlines() if l.startswith("bridge-lite")), "")
+    record("10", "vai-mcp doctor: verified vcli + bridge-lite", "PASS" if ready else "FAIL",
+           "" if ready else "run scripts/vai-mcp doctor")
+    if "quarantine    ACTIVE" in doc:
+        record("--", "quarantine marker is active: stopping", "FAIL", "confirm the CIW is idle, then remove the marker")
+        return finish(a)
+
+    r = live.bridge("1+2")
+    record("3", "bridge-lite read: eval '1+2' -> 3", "PASS" if ok_value(r, "3") else "FAIL", "" if ok_value(r, "3") else short(r))
+    v = live.vcli("1+1")
+    record("4", "vcli read: skill exec '1+1' -> 2", "PASS" if ok_value(v, "2") else "FAIL", "" if ok_value(v, "2") else short(v))
+    if not (ok_value(r, "3") and ok_value(v, "2")):
+        record("--", "basic reads failed: remaining live steps skipped", "SKIP", "fix connectivity first")
+        return finish(a)
+
+    remote_lock = live.bridge('getShellEnvVar("VAI_LOCK_FILE")').get("output", "").strip().strip('"')
+    lock = remote_lock if remote_lock and remote_lock != "nil" else "/tmp/virtuoso-ai-bridge.lock"
+    host = live.bridge("getHostName()").get("output", "").strip().strip('"')
+    local = host.split(".")[0] == socket.gethostname().split(".")[0]
+    local_lock = os.environ.get("VAI_LOCK_FILE") or "/tmp/virtuoso-ai-bridge.lock"
+    record("10b", "session VAI_LOCK_FILE matches this shell", "PASS" if lock == local_lock else "FAIL",
+           "session=%s shell=%s" % (lock, local_lock))
+
+    for step, side, run in (("5a", "bridge-lite", live.bridge), ("5b", "vcli", live.vcli)):
+        if not local:
+            record(step, "%s daemon holds the lock for the whole eval" % side, "SKIP",
+                   "run this script on the Virtuoso host (%s) to probe the lock" % host)
+            continue
+        t, box = in_background(run, "sleep(%d) 1" % a.sleep, a.sleep + 30)
+        time.sleep(1.0)
+        mid = lock_probe(lock)
+        t.join()
+        after = lock_probe(lock)
+        good = mid == "held" and after == "free" and ok_value(box["r"], "1")
+        record(step, "%s daemon holds the lock for the whole eval" % side, "PASS" if good else "FAIL",
+               "mid-eval=%s after=%s" % (mid, after))
+
+    for step, first, second in (("5c", live.bridge, live.vcli), ("5d", live.vcli, live.bridge)):
+        t, box = in_background(first, "sleep(%d) 1" % a.sleep, a.sleep + 30)
+        time.sleep(1.0)
+        started = time.monotonic()
+        res = second("1+1")
+        waited = time.monotonic() - started
+        t.join()
+        good = ok_value(res, "2") and waited >= a.sleep - 2
+        record(step, "second bridge waits for the first, then answers", "PASS" if good else "FAIL",
+               "waited %.1fs" % waited)
+
+    e1, e2 = live.bridge("vaiNoSuchFunction(1)"), live.vcli("vaiNoSuchFunction(1)")
+    good = e1.get("status") != "success" and e2.get("status") != "success"
+    record("3b", "SKILL errors are reported as errors on both CLIs", "PASS" if good else "FAIL",
+           "" if good else "bridge=%s vcli=%s" % (short(e1), short(e2)))
+
+    audit = Path(tempfile.mkdtemp(prefix="vai-accept-")) / "audit.jsonl"
+    full = {"VAI_MODE": "full", "VAI_AUDIT_LOG": str(audit)}
+    rv, err_v = live.mcp("vcli", [("skill_exec", {"code": "3+4"}), ("skill_exec", {"code": "vaiNoSuchFunction()"})], full)
+    rb, err_b = live.mcp("bridge", [("evaluate", {"expr": "5+6"})], full)
+    listed = rv.get(99) and rb.get(99)
+    record("11", "both MCP servers start and list tools", "PASS" if listed else "FAIL",
+           "" if listed else (err_v or err_b)[-200:])
+    good = "7" in json.dumps(rv.get(2, {}).get("result")) and "11" in json.dumps(rb.get(2, {}).get("result"))
+    record("12", "agent reads via MCP (vcli skill_exec, bridge evaluate)", "PASS" if good else "FAIL",
+           "" if good else json.dumps([rv.get(2), rb.get(2)])[:150])
+    record("12b", "failed SKILL via MCP is an error, not a success", "PASS" if failed(rv.get(3, {})) else "FAIL",
+           "" if failed(rv.get(3, {})) else json.dumps(rv.get(3))[:150])
+    entries = [json.loads(l) for l in audit.read_text().splitlines()] if audit.exists() else []
+    good = ([(e["server"], e["tool"], e["ok"]) for e in entries] ==
+            [("vcli", "skill_exec", True), ("vcli", "skill_exec", False), ("bridge", "evaluate", True)]
+            and all(e["client"] == CLIENT for e in entries)
+            and oct(audit.stat().st_mode & 0o777) == "0o600")
+    record("13", "audit log: 3 calls, right ok flags, client name, mode 0600", "PASS" if good else "FAIL",
+           "" if good else "%d entries at %s" % (len(entries), audit))
+
+    safe = {"VAI_MODE": "safe", "VCLI_CAPABILITY": "admin", "VAI_AUDIT_LOG": str(audit)}
+    sv, _ = live.mcp("vcli", [("skill_exec", {"code": "vaiSafeProbeV = 1"})], safe)
+    sb, _ = live.mcp("bridge", [("evaluate", {"expr": "vaiSafeProbeB = 1"})], safe)
+    names = {t["name"] for t in (sv.get(99, {}).get("result") or {}).get("tools", [])} | \
+            {t["name"] for t in (sb.get(99, {}).get("result") or {}).get("tools", [])}
+    leaked = live.bridge("list(boundp('vaiSafeProbeV) boundp('vaiSafeProbeB))").get("output", "").strip()
+    good = (not names & {"skill_exec", "skill_load", "skill_eval", "evaluate", "load_file"}
+            and failed(sv.get(2, {})) and failed(sb.get(2, {})) and leaked == "(nil nil)")
+    record("15", "safe mode hides + refuses raw SKILL; nothing reached the CIW", "PASS" if good else "FAIL",
+           "" if good else "probe globals: %s" % leaked)
+
+    if a.scratch_lib:
+        cell = "vai_accept_%s" % time.strftime("%H%M%S")
+        lib = a.scratch_lib
+        make = ('let((cv m) cv = dbOpenCellViewByType("%s" "%s" "schematic" "schematic" "a") '
+                'm = dbOpenCellViewByType("analogLib" "res" "symbol") '
+                'schCreateInst(cv m "%s" %s "R0") schCheck(cv) dbSave(cv) dbClose(cv) t)')
+        w1 = live.bridge(make % (lib, cell, "R_BRIDGE", "0:0"), 60)
+        w2 = live.vcli(make % (lib, cell, "R_VCLI", "2:0"), 60)
+        names = live.bridge('let((cv n) cv = dbOpenCellViewByType("%s" "%s" "schematic" "schematic" "r") '
+                            'n = sort(cv~>instances~>name nil) dbClose(cv) n)' % (lib, cell)).get("output", "")
+        good = ok_value(w1) and ok_value(w2) and "R_BRIDGE" in names and "R_VCLI" in names
+        record("9", "one write per bridge lands in %s/%s" % (lib, cell), "PASS" if good else "FAIL",
+               names if good else "bridge=%s vcli=%s read=%s" % (short(w1), short(w2), names))
+    else:
+        record("9", "write test", "SKIP", "pass --scratch-lib LIB to place one instance per bridge")
+
+    if a.quarantine and local:
+        marker = lock + ".quarantine"
+        r = live.vcli("sleep(%d) 1" % (a.sleep + 2), 1)
+        made = os.path.lexists(marker)
+        refused = live.bridge("1+1")
+        good = r.get("status") != "success" and made and "quarantine" in json.dumps(refused).lower()
+        record("Q", "timeout writes the marker; the other bridge refuses", "PASS" if good else "FAIL",
+               "marker=%s" % made)
+        time.sleep(a.sleep + 3)
+        if made:
+            os.unlink(marker)
+        record("Q2", "after the CIW is idle and the marker is removed, bridge-lite works",
+               "PASS" if ok_value(live.bridge("1+1"), "2") else "FAIL",
+               "now run VCStop() then VCStart() in the CIW: the vcli daemon stays hung by design")
+    elif a.quarantine:
+        record("Q", "timeout quarantine", "SKIP", "must run on the Virtuoso host")
+    else:
+        record("Q", "timeout quarantine", "SKIP", "pass --quarantine (needs VCStop()/VCStart() afterwards)")
+
+    for step, text in (("6", "GUI lock proof (vcli screenshot/click during a bridge eval)"),
+                       ("7", "kill -9 the vcli daemon mid-eval; bridge-lite keeps working"),
+                       ("8", "VCStopAll()/RBStopAll() stop only their own daemon (VCStopAll kills ALL vcli daemons on the host)"),
+                       ("16", "agent tx_begin/place/tx_diff/tx_rollback, then tx_commit, in the scratch library"),
+                       ("17", "repeat 11-12 from a second agent (Codex/Cursor/Gemini)")):
+        record(step, text, "MANUAL", "see ACCEPTANCE.md")
+    return finish(a)
+
+
+def finish(a):
+    a.report.write_text(json.dumps({"when": time.strftime("%Y-%m-%dT%H:%M:%S"), "results": RESULTS}, indent=2))
+    fails = [r for r in RESULTS if r["status"] == "FAIL"]
+    print("\n%d passed, %d failed, %d skipped, %d manual. Report: %s" % (
+        sum(r["status"] == "PASS" for r in RESULTS), len(fails),
+        sum(r["status"] == "SKIP" for r in RESULTS), sum(r["status"] == "MANUAL" for r in RESULTS), a.report))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

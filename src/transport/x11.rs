@@ -5784,11 +5784,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_gate_blocks_file_dir_and_dangling_symlink_markers() {
+        let has_flock = std::process::Command::new("sh")
+            .args(["-c", "command -v flock"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !has_flock {
+            eprintln!("skipping shell gate test: flock(1) is not installed on this host");
+            return;
+        }
         let base = std::env::temp_dir().join(format!("vai-gate-test-{}", std::process::id()));
         let lock = base.join("lock");
         let marker = format!("{}.quarantine", lock.to_string_lossy());
         std::fs::create_dir_all(&base).unwrap();
-        std::env::set_var("VAI_LOCK_FILE", lock.to_string_lossy().to_string());
+        crate::vai_lock::set_test_lock_path(&lock.to_string_lossy());
         let wrapped = vai_wrap("exit 0");
         let run = || {
             std::process::Command::new("sh")
@@ -5810,7 +5820,6 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent-vai-target", &marker).unwrap();
         assert_eq!(run(), Some(97), "dangling symlink marker: refused");
         std::fs::remove_file(&marker).unwrap();
-        std::env::remove_var("VAI_LOCK_FILE");
         let _ = std::fs::remove_dir_all(&base);
     }
 

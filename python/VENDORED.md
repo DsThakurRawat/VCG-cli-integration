@@ -20,7 +20,25 @@ in academic use).
    `$VAI_LOCK_FILE`, default `/tmp/virtuoso-ai-bridge.lock`), taken for the
    whole of every evaluation. Design rationale:
    `../docs/decision-records/0001-dual-bridge-coexistence.md`.
-2. This directory is excluded from the repo's comment-budget gate
+2. `mcp_server.py`: appends every `tools/call` to the JSONL audit log
+   shared with vcli's MCP server (`$VAI_AUDIT_LOG`, default
+   `~/.local/state/virtuoso-ai/audit.jsonl`, `off` disables), and honours
+   `VAI_DENY_TOOLS` (comma list, hidden from `tools/list` and refused on
+   call; the `scripts/vai-mcp` safe mode sets it). Tested by
+   `../tests/python/test_agent_layer.py`.
+3. `src/virtuoso_bridge/virtuoso/basic/bridge.py`
+   (`_ensure_daemon_capabilities`): in local mode (`VB_REMOTE_HOST=localhost`,
+   no SSH runner) the CLI `eval` and the MCP server never reached
+   `warm()`/`ensure_ready()`, so the first hello was sent without the local
+   token and the daemon refused it ("bridge token required"). The local
+   token is now provisioned at first authenticated use. Found and covered by
+   `../tests/fake_virtuoso/` (`test_bridge_cli_roundtrip_local_mode`).
+4. `tests/conftest.py`: autouse `_private_cross_bridge_lock` gives every
+   test its own `VAI_LOCK_FILE`. Without it, daemon tests that time out
+   wrote the real `/tmp/virtuoso-ai-bridge.lock.quarantine`, which
+   quarantined both bridges on the host (and made later tests in the same
+   run fail on the leaked marker).
+5. This directory is excluded from the repo's comment-budget gate
    (`../scripts/check-comment-budget.py`), the same way `resources/` is:
    vendored code keeps upstream's comment surface.
 
@@ -32,7 +50,7 @@ Get them from the upstream repo if needed.
 
 ## Updating
 
-Re-copy from a newer upstream commit, re-apply modification 1 (or port it if
-the daemon files changed), run `tests/` plus
+Re-copy from a newer upstream commit, re-apply modifications 1-4 (or port them if
+the files changed), run `tests/` plus
 `../tests/python/test_vai_lock_integration.py`, then update the base commit
 above.
