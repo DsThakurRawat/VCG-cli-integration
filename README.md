@@ -58,7 +58,9 @@ tool.
 
 Both bridges are MCP servers, started through one launcher:
 `scripts/vai-mcp vcli` and `scripts/vai-mcp bridge`. Run
-`scripts/vai-mcp doctor` to check the install.
+`scripts/vai-mcp doctor` to check the install,
+`tests/fake_virtuoso/run-sandboxed` to test everything end to end without
+Cadence, and `scripts/vai-acceptance` against a live session.
 
 - **Claude Code** (`.mcp.json`) and **opencode** (`opencode.json`): ready in
   the repo root, so start the agent here.

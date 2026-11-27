@@ -230,3 +230,17 @@ def test_timeout_quarantines_both_bridges_until_marker_removed(fresh):
     os.unlink(MARKER)
     ok = fresh.bridge("1+1")
     assert ok["status"] == "success" and ok["output"] == "2", ok
+
+
+def test_live_acceptance_script_passes_against_the_fake(fresh):
+    report = WORK / "acceptance-report.json"
+    env = dict(fresh.env, VAI_CONFIG_DIR=str(WORK / "no-conf"), VAI_PYTHON=PY)
+    env.pop("VCLI_CAPABILITY", None)
+    p = subprocess.run([PY, str(REPO / "scripts" / "vai-acceptance"), "--quarantine", "--sleep", "3",
+                        "--report", str(report)], env=env, capture_output=True, text=True, timeout=600)
+    print(p.stdout)
+    results = json.loads(report.read_text())["results"]
+    failures = [r for r in results if r["status"] == "FAIL"]
+    assert not failures, p.stdout + p.stderr
+    passed = {r["step"] for r in results if r["status"] == "PASS"}
+    assert {"3", "4", "5a", "5b", "5c", "5d", "11", "12", "12b", "13", "15", "Q", "Q2"} <= passed, p.stdout

@@ -3,6 +3,20 @@
 Run on the lab machine in a throwaway library. Until every box passes,
 this toolset is experimental.
 
+Automated runner: once steps 1-2 are done (both `.il` files loaded),
+`scripts/vai-acceptance` checks steps 3, 4, 5, 9, 10-13 and 15 against the
+live session and prints PASS/FAIL per step, plus a JSON report to share:
+
+```sh
+scripts/vai-acceptance                              # read-only
+scripts/vai-acceptance --scratch-lib MY_SCRATCH     # + step 9 (one new cell)
+scripts/vai-acceptance --quarantine                 # + timeout quarantine;
+                                                    #   then VCStop()/VCStart()
+```
+
+Run it on the Virtuoso host itself so the lock checks (5a/5b) can probe the
+flock directly. Steps 6, 7, 8, 16 and 17 stay manual.
+
 0. [ ] Before touching the lab session: `tests/fake_virtuoso/run-sandboxed`
       passes on the lab host (needs `bwrap`). It drives both real daemons,
       both CLIs and both MCP servers against a stand-in CIW inside a

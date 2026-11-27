@@ -487,7 +487,8 @@ _BUILTINS = {
     "boundp": lambda s, x: T if str(x) in s.globals else None,
     "fboundp": lambda s, x: T if str(x) in _BUILTINS or ("__proc__" + str(x)) in s.globals else None,
     "hiFlush": lambda s: T, "getVersion": lambda s: "fake-virtuoso",
-    "ipcGetPid": lambda s: os.getpid(), "load": _load, "substring": _substring,
+    "ipcGetPid": lambda s: os.getpid(), "getHostName": lambda s: __import__("socket").gethostname(),
+    "load": _load, "substring": _substring,
     "buildString": _build_string, "mapcar": _mapcar, "apply": lambda s, f, a: apply_fn(s, f, a or []),
 }
 
