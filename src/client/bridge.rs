@@ -901,7 +901,7 @@ impl VirtuosoClient {
     /// missing. See `daemon_alive()` for the same pattern.
     pub fn ping(&self) -> Result<()> {
         let skill = "plus(1 1)";
-        let result = self.execute_skill_unchecked(skill, Some(5000))?;
+        let result = self.execute_skill_unchecked(skill, Some(5))?;
         if result.skill_ok() {
             Ok(())
         } else {

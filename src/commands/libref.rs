@@ -82,8 +82,8 @@ fn find_local_doc_root() -> Result<Option<std::path::PathBuf>> {
     }
 
     for bin in ["virtuoso", "spectre"] {
-        let Ok(out) = std::process::Command::new("command")
-            .args(["-v", bin])
+        let Ok(out) = std::process::Command::new("sh")
+            .args(["-c", "command -v \"$1\"", "_", bin])
             .output()
             .or_else(|_| std::process::Command::new("which").arg(bin).output())
         else {

@@ -826,7 +826,7 @@ impl RpcDispatcher {
                 let window_id = params.get("window_id").and_then(|v| v.as_str());
                 let ctx = &self.ctx;
                 crate::commands::window::dismiss_dialog_x11(
-                    ctx, &action, dry_run, window_id, display,
+                    ctx, &action, dry_run, display, window_id,
                 )
             }
             "list_windows_x11" => {
@@ -1037,7 +1037,7 @@ impl RpcDispatcher {
                 }))
             }
             "ping" => {
-                let r = client.execute_skill_idempotent_probe("plus(1 1)", Some(5000))?;
+                let r = client.execute_skill_idempotent_probe("plus(1 1)", Some(5))?;
                 if r.skill_ok() {
                     Ok(serde_json::json!({ "status": "ok" }))
                 } else {
@@ -1121,7 +1121,7 @@ impl RpcDispatcher {
             "sync" => {
                 let ctx = &self.ctx;
                 let host = params.get("host").and_then(|v| v.as_str());
-                commands::skill::sync_cache(ctx, None, host, false)
+                commands::skill::sync_cache(ctx, host, None, false)
             }
             "cache" => {
                 let ctx = &self.ctx;
@@ -1346,6 +1346,17 @@ fn json_f64(value: Option<&Value>, field: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarded_arguments_keep_their_order_and_units() {
+        let src = include_str!("dispatcher.rs");
+        let compact: String = src.split_whitespace().collect();
+        assert!(compact.contains("dismiss_dialog_x11(ctx,&action,dry_run,display,window_id,)"));
+        assert!(compact.contains("commands::skill::sync_cache(ctx,host,None,false)"));
+        let five_thousand = ["Some(", "5000)"].concat();
+        assert!(!src.contains(&five_thousand));
+        assert!(!include_str!("../client/bridge.rs").contains(&five_thousand));
+    }
 
     #[test]
     fn skill_failure_maps_only_failed_results() {
