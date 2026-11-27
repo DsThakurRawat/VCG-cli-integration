@@ -111,6 +111,10 @@ fn status_for(report: &ConfigReport, require_explicit: bool) -> &'static str {
 /// precedence block. Designed for terminal scrollback — wide values are
 /// preserved verbatim because transport-daemon tokens and SSH key paths
 /// cannot be truncated without misleading the reader.
+fn display_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
 fn render_table(report: &ConfigReport, status: &'static str) -> Value {
     let mut lines: Vec<String> = Vec::new();
 
@@ -138,7 +142,7 @@ fn render_table(report: &ConfigReport, status: &'static str) -> Value {
     let val_width = report
         .entries
         .iter()
-        .map(|e| e.value.len())
+        .map(|e| display_width(&e.value))
         .max()
         .unwrap_or(10)
         .min(60);
@@ -158,18 +162,13 @@ fn render_table(report: &ConfigReport, status: &'static str) -> Value {
         "-".repeat(20)
     ));
     for e in &report.entries {
-        let truncated = if e.value.len() > val_width {
-            format!("{}…", &e.value[..val_width.saturating_sub(1)])
-        } else {
-            e.value.clone()
-        };
+        let pad = val_width.saturating_sub(display_width(&e.value));
+        let padded = format!("{}{}", e.value, " ".repeat(pad));
         lines.push(format!(
-            "{:<key_w$}  {:<val_w$}  {source}",
+            "{:<key_w$}  {padded}  {source}",
             e.key,
-            truncated,
             source = source_label(&e.source),
             key_w = key_width,
-            val_w = val_width
         ));
     }
 
@@ -193,4 +192,54 @@ fn render_table(report: &ConfigReport, status: &'static str) -> Value {
         obj.insert("status".into(), Value::String(status.to_string()));
         obj
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ConfigEntry, ConfigReport, ConfigSource};
+
+    fn report(entries: Vec<ConfigEntry>) -> ConfigReport {
+        ConfigReport {
+            profile: None,
+            active_target: None,
+            config_file: None,
+            targets_file: None,
+            precedence: ["a", "b", "c", "d"],
+            entries,
+            warnings: vec![],
+            diagnostics: vec![],
+            valid: true,
+            digest: None,
+        }
+    }
+
+    #[test]
+    fn wide_and_multibyte_values_are_rendered_verbatim() {
+        let long = format!("{}é{}", "x".repeat(58), "/tail/of/a/long/ssh/key/path");
+        let short = "日本語".to_string();
+        let r = report(vec![
+            ConfigEntry {
+                key: "ssh_key",
+                value: long.clone(),
+                source: ConfigSource::Env {
+                    var: "VB_SSH_KEY".into(),
+                },
+            },
+            ConfigEntry {
+                key: "remote_host",
+                value: short.clone(),
+                source: ConfigSource::Env {
+                    var: "VB_REMOTE_HOST".into(),
+                },
+            },
+        ]);
+        let rendered = render_table(&r, "ok")["rendered"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(rendered.contains(&long), "{rendered}");
+        assert!(rendered.contains(&short));
+        assert!(!rendered.contains('…'));
+    }
 }

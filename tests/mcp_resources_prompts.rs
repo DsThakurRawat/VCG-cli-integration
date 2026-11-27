@@ -458,3 +458,27 @@ fn skills_are_discovered_from_the_working_directory_tree() {
     let _ = child.wait();
     let _ = skills_root(tmp.path());
 }
+
+#[test]
+fn notifications_get_no_reply_even_without_params() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::start(dir.path());
+    for note in [
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "no/such/notification"}),
+    ] {
+        writeln!(server.stdin, "{note}").expect("write notification");
+    }
+    writeln!(
+        server.stdin,
+        "{}",
+        serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}})
+    )
+    .expect("write request");
+    server.stdin.flush().expect("flush");
+    let mut first = String::new();
+    server.stdout.read_line(&mut first).expect("read");
+    let first: Value = serde_json::from_str(first.trim()).expect("json line");
+    assert_eq!(first["id"], 7, "the first line must answer the request, not a notification: {first}");
+}

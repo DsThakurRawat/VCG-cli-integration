@@ -36,6 +36,7 @@ pub struct McpRequest {
     #[allow(dead_code)]
     jsonrpc: String,
     method: String,
+    #[serde(default)]
     params: serde_json::Value,
     id: Option<serde_json::Value>,
 }
@@ -132,9 +133,10 @@ impl McpServer {
     pub fn run(&self) -> Result<()> {
         let stdin = io::stdin();
         let mut stdout = io::stdout().lock();
-        let mut lines = stdin.lock().lines();
+        let lines = stdin.lock().lines();
 
-        while let Some(Ok(line)) = lines.next() {
+        for next in lines {
+            let line = next?;
             if line.trim().is_empty() {
                 continue;
             }
@@ -149,7 +151,11 @@ impl McpServer {
                 }
             };
 
+            let is_notification = request.id.is_none();
             let response = self.handle_request(request);
+            if is_notification {
+                continue;
+            }
             writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).ok();
             stdout.flush().ok();
         }

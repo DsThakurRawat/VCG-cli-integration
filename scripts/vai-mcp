@@ -136,7 +136,13 @@ run_bridge() {
 
 has() { if [[ -f "$1" ]]; then echo "present"; else echo "not set (optional)"; fi; }
 
-check() { if "$@" >/dev/null 2>&1; then echo "ok"; else echo "MISSING"; fi; }
+writable() {
+    if [[ -e "$1" ]]; then
+        [[ -w "$1" ]] && echo "ok" || echo "NOT WRITABLE"
+    else
+        [[ -w "$(dirname "$1")" ]] && echo "ok, will be created on first use" || echo "NOT CREATABLE"
+    fi
+}
 
 doctor() {
     common
@@ -149,14 +155,14 @@ doctor() {
     else
         echo "vcli          NOT READY  no verified fork build found (./install.sh --user, or cargo build --release; upstream vcli is rejected)"
     fi
-    echo "vcli caps     $(effective_caps)"
-    echo "bridge deny   $(effective_deny)"
+    echo "vcli caps     $(load_env vcli; common; echo "$(effective_caps)  (mode $VAI_MODE)")"
+    echo "bridge deny   $(load_env bridge; common; echo "$(effective_deny)  (mode $VAI_MODE)")"
     if py="$(find_python)"; then
         echo "bridge-lite   ok   $py"
     else
         echo "bridge-lite   MISSING  (uv venv python/.venv && uv pip install --python python/.venv/bin/python ./python)"
     fi
-    echo "lock file     $VAI_LOCK_FILE ($(check touch "$VAI_LOCK_FILE"))"
+    echo "lock file     $VAI_LOCK_FILE ($(writable "$VAI_LOCK_FILE"))"
     echo "audit log     $VAI_AUDIT_LOG"
     if [[ -e "$VAI_LOCK_FILE.quarantine" || -L "$VAI_LOCK_FILE.quarantine" ]]; then
         echo "quarantine    ACTIVE  $VAI_LOCK_FILE.quarantine: $(head -c 300 "$VAI_LOCK_FILE.quarantine" 2>/dev/null)"

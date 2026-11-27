@@ -176,6 +176,8 @@ fn parse_batch_output(stdout: &str, paths: &[String]) -> Vec<CdsLockInfo> {
     for chunk in stdout.split("---LOCK---").skip(1) {
         let stat_split: Vec<&str> = chunk.splitn(2, "---STAT---").collect();
         if stat_split.len() != 2 {
+            let owner_record = chunk.split("---END---").next().unwrap_or("").trim();
+            out.push((owner_record.to_string(), None, None));
             continue;
         }
         let owner_record = stat_split[0].trim().to_string();
@@ -330,6 +332,24 @@ mod tests {
         assert_eq!(locks[0].pid, Some(12345));
         assert_eq!(locks[1].owner.as_deref(), Some("alice"));
         assert_eq!(locks[2].owner, None);
+    }
+
+    #[test]
+    fn a_chunk_without_stat_keeps_later_records_on_their_own_paths() {
+        let stdout = "---LOCK---\nalice@a:1:1\n---END---\n\
+                      ---LOCK---\nbob@b:2:2\n---STAT---\n1717820000\n---END---\n";
+        let paths = vec![
+            "/lib/first/schematic/.cdslck".to_string(),
+            "/lib/second/schematic/.cdslck".to_string(),
+        ];
+        let locks = parse_batch_output(stdout, &paths);
+        assert_eq!(locks.len(), 2);
+        assert_eq!(locks[0].path, paths[0]);
+        assert_eq!(locks[0].mtime, None);
+        assert!(locks[0].owner_record.contains("alice"));
+        assert_eq!(locks[1].path, paths[1]);
+        assert!(locks[1].owner_record.contains("bob"));
+        assert_eq!(locks[1].mtime, Some(1717820000));
     }
 
     #[test]
