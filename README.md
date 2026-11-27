@@ -5,9 +5,13 @@ bridges — [virtuoso-cli](https://github.com/deanyou/virtuoso-cli) (vcli) and
 [virtuoso-bridge-lite](https://github.com/Arcadia-1/virtuoso-bridge-lite) —
 without them corrupting each other's control of the session.
 
-Status: builds and passes its full automated test suite (details below).
-**Not yet run against a licensed Virtuoso session.** Treat it as experimental
-until the checklist in `ACCEPTANCE.md` passes on a scratch library.
+Status: **the currently published revision fails CI** (the build is broken:
+two source files under `src/target/` were left out of this upload, and the
+comment-budget check is over its baseline). The test counts quoted below came
+from a working copy, not from this published tree. A corrected, self-contained
+revision is in progress. **Not yet run against a licensed Virtuoso session**;
+treat it as experimental until the checklist in `ACCEPTANCE.md` passes on a
+scratch library.
 
 ## Why this exists
 
