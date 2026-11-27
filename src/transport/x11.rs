@@ -1439,20 +1439,7 @@ fn action_x11_cached(
         let mut results = Vec::with_capacity(cmds.len());
         if operation == X11Operation::DragRel {
             let mut guard = MouseButtonGuard::new(runner, &display_prefix, &resolved, *button);
-            let joined = cmds
-                .into_iter()
-                .map(|(_sub, argv)| {
-                    format!(
-                        "{}xdotool {}",
-                        display_prefix,
-                        argv.iter()
-                            .map(|a| shell_escape(a))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" && ");
+            let joined = join_xdotool_commands(&display_prefix, cmds);
             match runner.run_command(&CommandRequest::with_exec_timeout(
                 vai_wrap(&joined),
                 Duration::from_secs(*timeout_secs),
@@ -1754,39 +1741,24 @@ fn action_x11_cached(
         (outs, None)
     } else if operation == X11Operation::DragRel {
         let cmds = build_xdotool_actions(&resolved, operation, *x, *y, *button, *text)?;
-        let mut outs = Vec::with_capacity(cmds.len());
         let mut guard = MouseButtonGuard::new(runner, &display_prefix, &resolved, *button);
-
-        for (i, (_sub, argv)) in cmds.into_iter().enumerate() {
-            let remote_cmd = format!(
-                "{}xdotool {}",
-                display_prefix,
-                argv.iter()
-                    .map(|a| shell_escape(a))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            match runner.run_command(&CommandRequest::with_exec_timeout(
-                vai_wrap(&remote_cmd),
-                Duration::from_secs(*timeout_secs),
-            )) {
-                Ok(cmd_out) => {
-                    if i == 0 {
-                        guard.arm();
-                    } else if i == 2 {
-                        guard.mark_released();
-                    }
-                    outs.push(cmd_out);
-                }
-                Err(err) => {
-                    return Err(VirtuosoError::Execution(format!(
-                        "xdotool {} failed: {}",
-                        _sub, err
-                    )));
-                }
+        let joined = join_xdotool_commands(&display_prefix, cmds);
+        match runner.run_command(&CommandRequest::with_exec_timeout(
+            vai_wrap(&joined),
+            Duration::from_secs(*timeout_secs),
+        )) {
+            Ok(out) => {
+                guard.mark_released();
+                (vec![out], None)
+            }
+            Err(err) => {
+                guard.arm();
+                return Err(VirtuosoError::Execution(format!(
+                    "xdotool drag sequence failed: {}",
+                    err
+                )));
             }
         }
-        (outs, None)
     } else {
         let cmds = build_xdotool_actions(&resolved, operation, *x, *y, *button, *text)?;
         let mut outs = Vec::with_capacity(cmds.len());
@@ -3053,6 +3025,22 @@ fn vai_wrap(cmd: &str) -> String {
         shell_escape(&crate::vai_lock::lock_path()),
         shell_escape(cmd)
     )
+}
+
+fn join_xdotool_commands(display_prefix: &str, cmds: Vec<(String, Vec<String>)>) -> String {
+    cmds.into_iter()
+        .map(|(_sub, argv)| {
+            format!(
+                "{}xdotool {}",
+                display_prefix,
+                argv.iter()
+                    .map(|a| shell_escape(a))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
 }
 
 fn shell_escape(s: &str) -> String {
@@ -5742,6 +5730,33 @@ mod tests {
                 .unwrap_or_else(|| panic!("{sub} missing --window"));
             assert_eq!(argv[wid_i + 1], "0x400002", "window id at fixed position");
         }
+    }
+
+    #[test]
+    fn drag_rel_joins_to_one_flocked_command() {
+        let action = build_xdotool_actions(
+            &mk_action_window("0x400002"),
+            X11Operation::DragRel,
+            Some(50),
+            Some(-10),
+            Some(2),
+            None,
+        )
+        .expect("drag-rel ok");
+        let joined = join_xdotool_commands("DISPLAY=:0 ", action);
+        let wrapped = vai_wrap(&joined);
+        assert_eq!(
+            wrapped.matches("flock").count(),
+            1,
+            "one lock hold per drag"
+        );
+        assert_eq!(
+            joined.matches("xdotool").count(),
+            3,
+            "all three steps inside"
+        );
+        assert!(joined.contains(" && "), "steps chained atomically");
+        assert!(joined.contains("mousedown") && joined.contains("mouseup"));
     }
 
     #[test]

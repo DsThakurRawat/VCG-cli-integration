@@ -54,8 +54,16 @@ same cellView at the same moment.
   own requests, so this costs nothing in practice.
 - A drag is mousedown + moves + mouseup and must run under ONE lock hold;
   locking each step separately would let the other bridge inject input
-  between mousedown and mouseup. If a locked drag sequence stops mid-drag
-  with the button still down, the guard's Drop issues a best-effort mouseup
-  as a follow-up command so the session is not left with a pressed button.
+  between mousedown and mouseup. Both DragRel code paths therefore join the
+  whole sequence into one flocked command. If a locked drag sequence stops
+  mid-drag with the button still down, the guard's Drop issues a best-effort
+  mouseup as a follow-up command so the session is not left with a pressed
+  button.
+- Timeout boundary: if `wait_for_callback` times out, the RAII guard
+  releases while the remote SKILL may still be running in the CIW. The vcli
+  daemon then refuses further requests on that channel (stuck-call state),
+  but the bridge-lite daemon does not see that state, so after a timeout
+  cross-bridge serialization is not guaranteed until the Virtuoso session is
+  idle again. Recovery is to let the session go idle or restart it.
 - With several Virtuoso sessions on one host, set `VAI_LOCK_FILE` to a
   per-session path in each session's environment; the default is host-wide.
