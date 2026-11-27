@@ -5788,7 +5788,7 @@ mod tests {
         let lock = base.join("lock");
         let marker = format!("{}.quarantine", lock.to_string_lossy());
         std::fs::create_dir_all(&base).unwrap();
-        std::env::set_var("VAI_LOCK_FILE", lock.to_string_lossy().to_string());
+        crate::vai_lock::set_test_lock_path(&lock.to_string_lossy());
         let wrapped = vai_wrap("exit 0");
         let run = || {
             std::process::Command::new("sh")
@@ -5810,7 +5810,6 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent-vai-target", &marker).unwrap();
         assert_eq!(run(), Some(97), "dangling symlink marker: refused");
         std::fs::remove_file(&marker).unwrap();
-        std::env::remove_var("VAI_LOCK_FILE");
         let _ = std::fs::remove_dir_all(&base);
     }
 
