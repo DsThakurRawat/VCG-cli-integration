@@ -1419,7 +1419,12 @@ mod output_format_tests {
 
     #[test]
     fn resolve_none_in_non_tty_is_json() {
-        assert_eq!(OutputFormat::resolve(None), OutputFormat::Json);
+        assert_eq!(OutputFormat::resolve_for(None, false), OutputFormat::Json);
+        assert_eq!(OutputFormat::resolve_for(None, true), OutputFormat::Table);
+        assert_eq!(
+            OutputFormat::resolve_for(Some("json"), true),
+            OutputFormat::Json
+        );
     }
 
     #[test]

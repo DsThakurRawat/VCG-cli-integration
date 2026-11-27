@@ -20,9 +20,9 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo clippy --features daemon -- -D warnings
-      - run: cargo clippy --features native-ssh -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --features daemon --all-targets -- -D warnings
+      - run: cargo clippy --features native-ssh --all-targets -- -D warnings
 
   comment-budget:
     name: Comment Budget

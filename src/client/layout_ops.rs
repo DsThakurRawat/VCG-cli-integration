@@ -2,74 +2,6 @@
 
 use crate::client::bridge::escape_skill_string;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ops() -> LayoutOps {
-        LayoutOps::new()
-    }
-
-    #[test]
-    fn create_rect_skill_format() {
-        let s = ops().create_rect("M1", "drawing", &[(0, 0), (100, 200)]);
-        assert_eq!(
-            s,
-            r#"rodCreateRect(?layer "M1" ?purpose "drawing" ?bBox ((0 0) (100 200)))"#
-        );
-    }
-
-    #[test]
-    fn create_rect_escapes_layer() {
-        let s = ops().create_rect(r#"M"1"#, "drawing", &[(0, 0), (1, 1)]);
-        assert!(s.contains(r#""M\"1""#), "layer must be escaped: {s}");
-    }
-
-    #[test]
-    fn create_polygon_skill_format() {
-        let pts = vec![(0, 0), (10, 0), (10, 10)];
-        let s = ops().create_polygon("poly", "drawing", &pts);
-        assert!(s.contains("rodCreatePolygon"), "{s}");
-        assert!(s.contains("0 0"), "{s}");
-        assert!(s.contains("10 10"), "{s}");
-    }
-
-    #[test]
-    fn create_path_includes_width() {
-        let pts = vec![(0, 0), (50, 0)];
-        let s = ops().create_path("M2", "drawing", 5, &pts);
-        assert!(s.contains("?width 5"), "{s}");
-    }
-
-    #[test]
-    fn create_instance_orientation() {
-        let s = ops().create_instance("tsmc", "nmos", "layout", (10, 20), "MY");
-        assert!(s.contains("\"MY\""), "orient must appear: {s}");
-        assert!(
-            s.contains("10:20") || s.contains("10 20"),
-            "origin must appear: {s}"
-        );
-    }
-
-    #[test]
-    fn xstream_out_escapes_all_paths_and_disables_dialog() {
-        let req = XstreamOutRequest {
-            library: "lib\"x",
-            top_cell: "top",
-            view: "layout",
-            stream_file: "/tmp/out.gds",
-            layer_map: "/tmp/map",
-            log_file: "/tmp/log",
-            run_dir: "/tmp/run",
-        };
-        let s = ops().xstream_out(&req);
-        assert!(s.contains("xstOutDoTranslate()"));
-        assert!(s.contains("xstSetField(\"showCompletionMsgBox\" \"false\")"));
-        assert!(s.contains("lib\\\"x"));
-        assert!(s.contains("xstSetField(\"strmFile\" \"/tmp/out.gds\")"));
-    }
-}
-
 pub struct XstreamOutRequest<'a> {
     pub library: &'a str,
     pub top_cell: &'a str,
@@ -226,5 +158,73 @@ impl LayoutOps {
         format!(
             r#"let((cv net) cv = geGetEditCellView() net = dbFindNetByName(cv "{net_name}") when(net hiHighlight(net)))"#
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ops() -> LayoutOps {
+        LayoutOps::new()
+    }
+
+    #[test]
+    fn create_rect_skill_format() {
+        let s = ops().create_rect("M1", "drawing", &[(0, 0), (100, 200)]);
+        assert_eq!(
+            s,
+            r#"rodCreateRect(?layer "M1" ?purpose "drawing" ?bBox ((0 0) (100 200)))"#
+        );
+    }
+
+    #[test]
+    fn create_rect_escapes_layer() {
+        let s = ops().create_rect(r#"M"1"#, "drawing", &[(0, 0), (1, 1)]);
+        assert!(s.contains(r#""M\"1""#), "layer must be escaped: {s}");
+    }
+
+    #[test]
+    fn create_polygon_skill_format() {
+        let pts = vec![(0, 0), (10, 0), (10, 10)];
+        let s = ops().create_polygon("poly", "drawing", &pts);
+        assert!(s.contains("rodCreatePolygon"), "{s}");
+        assert!(s.contains("0 0"), "{s}");
+        assert!(s.contains("10 10"), "{s}");
+    }
+
+    #[test]
+    fn create_path_includes_width() {
+        let pts = vec![(0, 0), (50, 0)];
+        let s = ops().create_path("M2", "drawing", 5, &pts);
+        assert!(s.contains("?width 5"), "{s}");
+    }
+
+    #[test]
+    fn create_instance_orientation() {
+        let s = ops().create_instance("tsmc", "nmos", "layout", (10, 20), "MY");
+        assert!(s.contains("\"MY\""), "orient must appear: {s}");
+        assert!(
+            s.contains("10:20") || s.contains("10 20"),
+            "origin must appear: {s}"
+        );
+    }
+
+    #[test]
+    fn xstream_out_escapes_all_paths_and_disables_dialog() {
+        let req = XstreamOutRequest {
+            library: "lib\"x",
+            top_cell: "top",
+            view: "layout",
+            stream_file: "/tmp/out.gds",
+            layer_map: "/tmp/map",
+            log_file: "/tmp/log",
+            run_dir: "/tmp/run",
+        };
+        let s = ops().xstream_out(&req);
+        assert!(s.contains("xstOutDoTranslate()"));
+        assert!(s.contains("xstSetField(\"showCompletionMsgBox\" \"false\")"));
+        assert!(s.contains("lib\\\"x"));
+        assert!(s.contains("xstSetField(\"strmFile\" \"/tmp/out.gds\")"));
     }
 }

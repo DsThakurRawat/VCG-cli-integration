@@ -10,17 +10,16 @@ pub enum OutputFormat {
 
 impl OutputFormat {
     pub fn resolve(explicit: Option<&str>) -> Self {
+        Self::resolve_for(explicit, io::stdout().is_terminal())
+    }
+
+    pub fn resolve_for(explicit: Option<&str>, stdout_is_terminal: bool) -> Self {
         match explicit {
             Some("json") => OutputFormat::Json,
             Some("table") => OutputFormat::Table,
             Some(_) => OutputFormat::Table,
-            None => {
-                if io::stdout().is_terminal() {
-                    OutputFormat::Table
-                } else {
-                    OutputFormat::Json
-                }
-            }
+            None if stdout_is_terminal => OutputFormat::Table,
+            None => OutputFormat::Json,
         }
     }
 }
