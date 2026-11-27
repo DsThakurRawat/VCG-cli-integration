@@ -27,6 +27,46 @@ server, plus vcli's prompts `maestro-run-and-check`,
 `spectre-failure-triage` and `cell-design-review`. On disk they are under
 `python/skills/`. Read the branch you need; do not load the whole catalog.
 
+## No MCP? Use the CLIs directly
+
+If your agent has a shell but no MCP servers configured, the same work is
+available from the two CLIs. Run them from this repo (the human installed
+them; check with `scripts/vai-mcp doctor`). Both print JSON when piped; add
+`--format json` to `vcli` to be explicit. Discover everything with
+`vcli schema --all` and `virtuoso-bridge --help`.
+
+| Task | Command |
+| --- | --- |
+| Raw SKILL (vcli) | `VCLI_CAPABILITY=admin vcli --format json skill exec 'EXPR' --timeout 60` |
+| Raw SKILL (bridge-lite) | `virtuoso-bridge eval 'EXPR'` (multi-line: `virtuoso-bridge eval --stdin <<'EOF'`) |
+| Load a `.il` file | `virtuoso-bridge load FILE.il` or `VCLI_CAPABILITY=admin vcli skill load FILE.il` |
+| Libraries / cells | `vcli library list`, `vcli library list-cells LIB` |
+| Open / inspect a cellview | `vcli cell open --lib L --cell C`, `vcli cell info`, `vcli cell save`, `vcli cell close` |
+| Schematic edit | `vcli schematic open --lib L --cell C`, `vcli schematic place --master LIB/CELL --name I1 --x 0 --y 0`, `vcli schematic conn`, `vcli schematic pin`, `vcli schematic label`, `vcli schematic set-param` |
+| Schematic readback | `vcli schematic list-instances`, `list-nets`, `list-pins`, `get-params`, then `vcli schematic check` |
+| Transactions | `vcli tx begin --id T1 --lib L --cell C` → edits → `vcli tx diff` → `vcli tx commit` or `vcli tx rollback` |
+| Maestro | `vcli maestro list-sessions`, `set-var`, `run`, `history-list`, `get-output-value`, `sim-messages` |
+| Standalone Spectre | `vcli sim run`, `vcli sim run-async` / `job-status`, `vcli sim check-license` |
+| SKILL / doc lookup | `vcli skill find QUERY`, `virtuoso-bridge skill-find`, `skill-info`, `doc-search` |
+| Screenshots / windows | `vcli window screenshot --path out.png`, `vcli window list`, `virtuoso-bridge screenshot` |
+| Dialogs (read-only) | `virtuoso-bridge inspect-dialogs --json`, `vcli window list-dialogs-x11` |
+| Health | `scripts/vai-mcp doctor`, `virtuoso-bridge status` |
+
+Differences from the MCP path. Tell the human you are using it:
+
+- **Nothing here goes to the shared audit log**, and `scripts/vai-audit`
+  will not show it. vcli records the SKILL text it sends (not your
+  name or the result) in `~/.cache/virtuoso_bridge/logs/commands.log`;
+  bridge-lite records nothing comparable. Say what you ran in your replies.
+- **Safe mode is not enforced for you.** If the human asked for safe mode,
+  do not use `vcli skill exec`/`skill load`, `virtuoso-bridge eval`/`load`
+  or `gui`. Stick to the structured commands.
+- **Still enforced:** the cross-bridge lock and the timeout quarantine live
+  in the daemons, so they apply to every CLI call too. Rule 2 below holds.
+- Never use `virtuoso-bridge dismiss-dialog`/`dismiss-window`,
+  `vcli window dismiss-dialog`/`dismiss-window-x11` or `virtuoso-bridge gui`
+  unless the human explicitly asks (rule 3).
+
 ## Rules (learned the hard way by both upstream projects)
 
 1. **Scratch library first.** Until `ACCEPTANCE.md` passes on a real
