@@ -81,5 +81,4 @@ tool. Agent use: point your MCP client at vcli's MCP server and/or
 
 ## Licenses
 
-MIT (both upstreams). See `LICENSE` (vcli), `python/LICENSE` (bridge-lite)
-and `NOTICE` for attribution.
+MIT 
