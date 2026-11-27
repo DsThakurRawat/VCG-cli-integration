@@ -1,0 +1,23 @@
+name: Python bridge
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Vendored bridge-lite install + lock tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install vendored package
+        run: pip install ./python pytest
+      - name: Byte-compile vendored package
+        run: python -m compileall -q python/src
+      - name: Cross-bridge lock tests
+        run: python -m pytest tests/python -v
