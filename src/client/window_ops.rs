@@ -1,0 +1,524 @@
+use crate::client::bridge::escape_skill_string;
+use crate::error::{Result, VirtuosoError};
+use std::path::{Path, PathBuf};
+
+pub struct WindowOps;
+
+/// Target window for a safe bootstrap operation.
+///
+/// The window_id comes from `WindowOps::list_windows` (X11-style id,
+/// 32-bit unsigned). Bootstrap operations require an explicit ID —
+/// there is no "current focused window" shortcut, because the
+/// caller's view of focus may differ from Virtuoso's and accidental
+/// targeting is the single biggest risk in the bootstrap path.
+///
+/// expected_name_pattern enforces a CIW-style check on the window
+/// name (via `hiGetWindowName`) before any side-effecting SKILL is
+/// sent. Default pattern accepts any window; callers should supply a
+/// narrow pattern (e.g. `"^Library Manager"` for the Library
+/// Manager window) to follow the principle of least authority.
+pub struct BootstrapTarget {
+    pub window_id: u32,
+    pub expected_name_pattern: Option<String>,
+}
+
+/// Side-effecting bootstrap actions available through the safe
+/// bootstrap interface.
+///
+/// `LoadFile` loads a SKILL program from a path under the
+/// caller-supplied scratch root. The path is canonicalized and
+/// containment-checked so callers cannot escape the scratch dir.
+/// `EvalString` and other raw-text variants are intentionally absent
+/// — the bootstrap interface must NEVER accept raw SKILL source from
+/// the caller, since this is the path that bypasses the capability
+/// whitelist.
+pub enum BootstrapAction {
+    /// Load a SKILL program file from a path.
+    LoadFile(PathBuf),
+}
+
+impl WindowOps {
+    /// SKILL expression yielding the list of forms that are **actually on
+    /// screen**, current one first.
+    ///
+    /// `hiGetCurrentForm()` alone is not enough. Its own definition is "the
+    /// form that the cursor was last located" — it keeps returning a form long
+    /// after that form is gone. Measured on a live IC23.1 with no dialog open
+    /// at all (2026-09-10): it returned the schematic **Descend** form, and
+    /// `hiIsFormDisplayed` on that form returned `nil`. Trusting it would make
+    /// `dismiss_dialog` cancel an invisible stale form and report success —
+    /// the same "no error, wrong answer" shape as the rest of this round.
+    ///
+    /// So the current form is used only when `hiIsFormDisplayed` confirms it,
+    /// and otherwise every form symbol in `hiFormList()` is resolved with
+    /// `symeval` and filtered the same way. On the live session that walk
+    /// resolved all 277 symbols to `formStruct`s and reported 0 displayed,
+    /// which is the correct answer.
+    const DISPLAYED_FORMS: &'static str = "let((cur out) out = nil \
+         cur = hiGetCurrentForm() when(cur && hiIsFormDisplayed(cur) out = list(cur)) \
+         when(!out foreach(s hiFormList() let((f) f = nil errset(f = symeval(s)) \
+         when(f && type(f) == 'formStruct && hiIsFormDisplayed(f) out = cons(f out))))) out)";
+
+    /// SKILL expression for a form's human-readable name.
+    ///
+    /// A `formStruct` has no `formTitle`/`name` field once built — probed live,
+    /// both read `nil`. The populated ones are `_WMTitle` (the window-manager
+    /// title) and `_formName`.
+    fn form_name(form: &str) -> String {
+        format!(
+            r#"if({form}->_WMTitle {form}->_WMTitle if({form}->_formName {form}->_formName "unnamed-form"))"#
+        )
+    }
+
+    /// List all open Virtuoso windows.
+    ///
+    /// Returns a JSON array string: `[{"id":<fixnum>,"name":"..."}]` when the
+    /// Virtuoso version exposes `hiGetWindowId`, or `[{"name":"..."}]` when it
+    /// does not (e.g. IC25.1, where `hiGetWindowId` is unbound).
+    ///
+    /// `id` is the Virtuoso-internal window id from `hiGetWindowId` — a stable
+    /// handle callers can use to target a window. Because `hiGetWindowId` is
+    /// NOT available in every IC release (it is unbound on IC25.1), the SKILL
+    /// attempts to read it inside `errset` and **omits** the `id` field (rather
+    /// than erroring) on versions where it is absent. This keeps
+    /// `vcli window list` functional across versions instead of returning
+    /// `skill_ok()==false` on the unbound ones.
+    ///
+    /// NOTE on the implementation shape: this daemon's SKILL evaluator only
+    /// accepts `if`/`when` with self-evaluating (constant) branches — compound
+    /// branches silently mis-evaluate. So we do NOT use `if(fboundp ...)`
+    /// around a `sprintf`/`strcat` branch; instead we default `idstr` to `""`
+    /// and let `errset` overwrite it only when `hiGetWindowId` is callable.
+    /// `strcat` is used (never `sprintf`) so the integer id is coerced to a
+    /// string inline and the JSON is assembled from literals.
+    ///
+    /// `name` is the window title; `kind`/`mode` are NOT emitted here because
+    /// there is no single cross-version SKILL call that returns them reliably —
+    /// `window::list` derives `kind`/`mode` heuristically from `name` instead
+    /// (see `annotate_modes` in commands/window.rs). Geometry and PID likewise
+    /// require per-version SKILL introspection (`hiGetWindowScreenBox`,
+    /// `hiGetProcessId`) that must be verified against a live Virtuoso before
+    /// being added here.
+    pub fn list_windows(&self) -> String {
+        r#"let((out sep name idstr) out = "[" sep = "" foreach(w hiGetWindowList() name = hiGetWindowName(w) idstr = "" errset(idstr = strcat("\"id\":" hiGetWindowId(w) ",")) out = strcat(out sep "{" idstr "\"name\":\"" name "\"}") sep = ",") strcat(out "]"))"#
+            .into()
+    }
+
+    /// Dismiss the current blocking dialog.
+    /// action: "cancel" clicks Cancel; "ok" clicks OK.
+    ///
+    /// Was `hiGetCurrentDialog` + `hiCancelDialog` / `hiSendOK` — **none of the
+    /// three exists in IC23.1** (no entry in any of the 41 `.fnd` databases;
+    /// live the call dies with `undefined function hiGetCurrentDialog`). Both
+    /// dialog methods were dead. The documented equivalents are
+    /// `hiGetCurrentForm() => r_form`, `hiFormCancel(r_form) => t` and
+    /// `hiFormDone(r_form) => t` ("Equivalent to clicking the Cancel/OK button
+    /// on a form"), all from `skuiref`.
+    ///
+    /// Every displayed form is dismissed, and the reply names them, because a
+    /// caller reaching for this is trying to unblock a stalled bridge and needs
+    /// to know what was clicked away. Note this is the SKILL path: a modal that
+    /// has actually deadlocked the CIW cannot be cleared from inside SKILL at
+    /// all — that is what `window.dismiss_dialog_x11` is for.
+    pub fn dismiss_dialog(&self, action: &str) -> String {
+        let click = if action == "ok" {
+            "hiFormDone"
+        } else {
+            "hiFormCancel"
+        };
+        let locator = Self::DISPLAYED_FORMS;
+        let name = Self::form_name("f");
+        format!(
+            r#"let((forms n names) forms = {locator} if(forms then n = 0 names = "" foreach(f forms when({click}(f) n = n+1 names = strcat(names sprintf(nil "%s " {name})))) if(n > 0 sprintf(nil "{action}:%d %s" n names) "no-dialog") else "no-dialog"))"#
+        )
+    }
+
+    /// Get the name of the current dialog without dismissing it.
+    /// Returns "no-dialog" if no form is displayed.
+    ///
+    /// See [`Self::dismiss_dialog`] for why `hiGetCurrentDialog` is gone.
+    pub fn get_dialog_info(&self) -> String {
+        let locator = Self::DISPLAYED_FORMS;
+        let name = Self::form_name("car(forms)");
+        format!(
+            r#"let((forms extra) forms = {locator} if(forms then extra = length(forms)-1 sprintf(nil "%s%s" {name} if(extra > 0 sprintf(nil " (+%d more)" extra) "")) else "no-dialog"))"#
+        )
+    }
+
+    /// Capture a screenshot of the current Virtuoso window to a PNG file.
+    ///
+    /// IC23.1 does not have `hiGetWindowScreenDump`, so we use X11 `import`
+    /// (ImageMagick) via system().  The file path is verified with `isFile`
+    /// after the capture to distinguish success from failure.
+    pub fn screenshot(&self, path: &str) -> String {
+        let path = escape_skill_string(path);
+        Self::skill_capture(&path)
+    }
+
+    /// Capture a screenshot, verifying a matching window exists first.
+    /// Full-screen root capture; --window only validates existence.
+    /// Per-window capture requires xdotool/wmctrl on the X11 side.
+    pub fn screenshot_by_pattern(&self, path: &str, pattern: &str) -> String {
+        let path = escape_skill_string(path);
+        let pattern = escape_skill_string(pattern);
+        let capture = Self::skill_capture(&path);
+        format!(
+            r#"let((matched) matched = nil foreach(w hiGetWindowList() when(rexMatchp("{pattern}" hiGetWindowName(w)) matched = t)) if(matched {capture} "no-match"))"#
+        )
+    }
+
+    /// SKILL fragment: run X11 import and return path on success, nil on failure.
+    /// This uses `import` from ImageMagick, which is always available on Linux.
+    ///
+    /// `path_escaped` is the raw (quote-escaped) path from
+    /// `escape_skill_string`; it must be wrapped in SKILL string quotes here
+    /// (as `load("{path}")` does), otherwise `/path/x.png` parses as an
+    /// invalid identifier. The success check uses the 3-arg `if(cond t e)`
+    /// form — SKILL rejects `if(cond t else e)` with a `lineread/read: syntax
+    /// error` — and `isFile` must run AFTER `system` (it probes the file the
+    /// capture just created; checking first always returns nil).
+    ///
+    /// The grab targets the X11 root window. That is the only capture that
+    /// needs no window id, so it is the one that works for a caller that has
+    /// none. It does NOT work on X servers that refuse `XGetImage` on the root
+    /// window (observed on an IC26.1 host: `xwd -root` fails with BadMatch,
+    /// and ImageMagick reports that as the misleading "missing an image
+    /// filename"). Hosts like that need the per-window capture in
+    /// `transport::x11`, which is where the window id is known.
+    ///
+    /// No fallback is attempted *here* on purpose: a shell substitution that
+    /// yields an empty window id turns into `import -window -silent file`,
+    /// which HANGS inside the Virtuoso SKILL interpreter and blocks the
+    /// daemon for the whole SKILL timeout. The fallback therefore lives in
+    /// Rust, not in SKILL: when this capture fails (or times out, or the
+    /// evaluation channel is hung) the caller retries through X11
+    /// (`transport::x11`), which never enters the SKILL interpreter at all.
+    fn skill_capture(path_escaped: &str) -> String {
+        format!(
+            r#"let((cmd) cmd = strcat("import -window root -silent " "{path}") system(cmd) if(isFile("{path}") "{path}" nil))"#,
+            path = path_escaped
+        )
+    }
+
+    /// Build a safe SKILL bootstrap expression.
+    ///
+    /// The generated SKILL:
+    ///   1. Confirms `hiGetWindowList()` contains a window whose name
+    ///      matches `expected_name_pattern` (CIW verification).
+    ///   2. Issues the requested action with the path escaped through
+    ///      `escape_skill_string` and the path literal pre-validated
+    ///      to live under the caller-supplied scratch root by Rust.
+    ///
+    /// Returns `VirtuosoError::Config` if the action's path does not
+    /// live under `scratch_root` — the strict containment check must
+    /// happen on the Rust side before any SKILL is constructed, since
+    /// SKILL-side validation would be a defense in depth only.
+    pub fn build_bootstrap_skill(
+        &self,
+        target: &BootstrapTarget,
+        action: &BootstrapAction,
+        scratch_root: &Path,
+    ) -> Result<String> {
+        match action {
+            BootstrapAction::LoadFile(path) => {
+                let canonical_root = std::fs::canonicalize(scratch_root).map_err(|e| {
+                    VirtuosoError::Config(format!(
+                        "scratch_root '{}' cannot be resolved: {e}",
+                        scratch_root.display()
+                    ))
+                })?;
+                let canonical_path = std::fs::canonicalize(path).map_err(|e| {
+                    VirtuosoError::Config(format!(
+                        "bootstrap path '{}' cannot be resolved: {e}",
+                        path.display()
+                    ))
+                })?;
+                if !canonical_path.starts_with(&canonical_root) {
+                    return Err(VirtuosoError::Config(format!(
+                        "bootstrap path '{}' escapes scratch root '{}'",
+                        canonical_path.display(),
+                        canonical_root.display()
+                    )));
+                }
+
+                let pattern = target.expected_name_pattern.as_deref().unwrap_or(".*");
+                let pattern_escaped = escape_skill_string(pattern);
+                let path_escaped = escape_skill_string(&canonical_path.to_string_lossy());
+                let _ = target.window_id;
+
+                Ok(format!(
+                    r#"let((matched) matched = nil foreach(w hiGetWindowList() when(rexMatchp("{pattern_escaped}" hiGetWindowName(w)) matched = t)) if(matched load("{path_escaped}") "ciw-not-found"))"#
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn list_windows_contains_hi_get_window_list() {
+        let ops = WindowOps;
+        let skill = ops.list_windows();
+        assert!(
+            skill.contains("hiGetWindowList"),
+            "should use hiGetWindowList"
+        );
+        assert!(
+            skill.contains("hiGetWindowName"),
+            "should use hiGetWindowName"
+        );
+        assert!(
+            skill.contains("hiGetWindowId"),
+            "should surface the window id so callers can target it"
+        );
+        assert!(
+            skill.contains("errset"),
+            "must guard hiGetWindowId with errset so list_windows works on \
+             versions where hiGetWindowId is unbound (e.g. IC25.1) instead of erroring"
+        );
+        assert!(
+            skill.contains("idstr = \"\""),
+            "idstr must default to empty string so the JSON is always well-formed"
+        );
+        assert!(
+            skill.contains(r#"name\":"#),
+            "must still emit the name key so the fallback object is \
+             {{\"name\":\"<title>\"}} when hiGetWindowId is unavailable"
+        );
+        assert!(
+            !skill.contains("fboundp"),
+            "do not use if(fboundp ...) compound branches — this daemon's \
+             evaluator mis-evaluates them; errset + default-idstr is the safe shape"
+        );
+        assert!(
+            !skill.contains("sprintf"),
+            "do not build the JSON with sprintf — this daemon's evaluator \
+             mis-evaluates sprintf as an if/when branch or top-level expr; \
+             strcat (which coerces the fixnum id inline) is the safe shape"
+        );
+    }
+
+    #[test]
+    fn dismiss_dialog_cancel() {
+        let ops = WindowOps;
+        let skill = ops.dismiss_dialog("cancel");
+        assert!(skill.contains("hiGetCurrentForm"), "should check dialog");
+        assert!(skill.contains("hiFormCancel"), "should cancel dialog");
+        assert!(skill.contains("no-dialog"), "should handle no dialog");
+    }
+
+    #[test]
+    fn dismiss_dialog_ok() {
+        let ops = WindowOps;
+        let skill = ops.dismiss_dialog("ok");
+        assert!(skill.contains("hiFormDone"), "should click OK");
+        assert!(!skill.contains("hiFormCancel"), "ok must not cancel");
+    }
+
+    #[test]
+    fn get_dialog_info() {
+        let ops = WindowOps;
+        let skill = ops.get_dialog_info();
+        assert!(skill.contains("hiGetCurrentForm"), "should check dialog");
+        assert!(skill.contains("_WMTitle"), "should get the form title");
+        assert!(
+            !skill.contains("hiFormCancel") && !skill.contains("hiFormDone"),
+            "reading must not click anything: {skill}"
+        );
+    }
+
+    /// `hiGetCurrentDialog` / `hiCancelDialog` / `hiSendOK` do not exist in
+    /// IC23.1 — both dialog methods were dead. And the documented replacement
+    /// is not a drop-in: `hiGetCurrentForm` returns the last form the cursor
+    /// visited, displayed or not (live it returned a long-gone *Descend* form),
+    /// so it must be filtered through `hiIsFormDisplayed` or the caller is told
+    /// a stale form was dismissed.
+    #[test]
+    fn dialog_ops_use_documented_form_calls_and_check_the_form_is_on_screen() {
+        let ops = WindowOps;
+        for skill in [
+            ops.dismiss_dialog("cancel"),
+            ops.dismiss_dialog("ok"),
+            ops.get_dialog_info(),
+        ] {
+            assert!(
+                !skill.contains("hiGetCurrentDialog")
+                    && !skill.contains("hiCancelDialog")
+                    && !skill.contains("hiSendOK"),
+                "no undefined IC23.1 dialog calls: {skill}"
+            );
+            assert!(
+                skill.contains("hiIsFormDisplayed"),
+                "a form that is not displayed is not a dialog: {skill}"
+            );
+            assert!(
+                skill.contains("hiFormList") && skill.contains("symeval"),
+                "must fall back to the full form list, not trust the cursor: {skill}"
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_escapes_path() {
+        let ops = WindowOps;
+        let skill = ops.screenshot("/path/with spaces/screen.png");
+        assert!(
+            skill.contains("import -window root -silent"),
+            "should use import"
+        );
+        assert!(skill.contains("isFile"), "should verify file with isFile");
+    }
+
+    #[test]
+    fn screenshot_skill_uses_three_arg_if_and_quoted_path() {
+        let ops = WindowOps;
+        let skill = ops.screenshot("/tmp/screen.png");
+        assert!(
+            skill.contains("isFile(\"/tmp/screen.png\")"),
+            "path must be quoted as a SKILL string literal, got: {skill}"
+        );
+        assert!(
+            skill.contains("if(isFile(\"/tmp/screen.png\") \"/tmp/screen.png\" nil)"),
+            "must use 3-arg if form without else keyword, got: {skill}"
+        );
+        assert!(
+            !skill.contains("else nil"),
+            "must not emit `else` in 3-arg if, got: {skill}"
+        );
+        let sys_pos = skill.find("system(cmd)").expect("must call system(cmd)");
+        let isfile_pos = skill
+            .find("isFile(")
+            .expect("must check isFile after system");
+        assert!(
+            sys_pos < isfile_pos,
+            "isFile must run AFTER system(cmd), got: {skill}"
+        );
+    }
+
+    #[test]
+    fn screenshot_by_pattern_escapes_pattern() {
+        let ops = WindowOps;
+        let skill = ops.screenshot_by_pattern("/tmp/screen.png", "Library Manager");
+        assert!(skill.contains("rexMatchp"), "should use regex match");
+        assert!(skill.contains("no-match"), "should handle no match");
+    }
+
+    // === build_bootstrap_skill tests (RED then GREEN) ===
+
+    #[test]
+    fn bootstrap_loadfile_within_scratch_root_succeeds() {
+        let scratch = tempfile::tempdir().unwrap();
+        let program = scratch.path().join("init.il");
+        fs::write(&program, "(println \"hi\")").unwrap();
+
+        let ops = WindowOps;
+        let target = BootstrapTarget {
+            window_id: 0x2e01f16,
+            expected_name_pattern: Some("Library Manager".into()),
+        };
+        let skill = ops
+            .build_bootstrap_skill(&target, &BootstrapAction::LoadFile(program), scratch.path())
+            .unwrap();
+
+        assert!(skill.contains("rexMatchp"), "must verify CIW pattern");
+        assert!(skill.contains("load("), "must use load()");
+        assert!(skill.contains("ciw-not-found"), "must signal no-match");
+        assert!(skill.contains("init.il"), "path must be embedded");
+    }
+
+    #[test]
+    fn bootstrap_loadfile_preserves_apostrophes_as_skill_literal_chars() {
+        let scratch = tempfile::tempdir().unwrap();
+        let program = scratch.path().join("with'apostrophe.il");
+        fs::write(&program, "").unwrap();
+
+        let ops = WindowOps;
+        let target = BootstrapTarget {
+            window_id: 1,
+            expected_name_pattern: None,
+        };
+        let skill = ops
+            .build_bootstrap_skill(&target, &BootstrapAction::LoadFile(program), scratch.path())
+            .unwrap();
+        assert!(
+            skill.contains(r#"load("#) && skill.contains("with'apostrophe.il"),
+            "path must appear inside a quoted SKILL literal: {skill}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_loadfile_outside_scratch_root_returns_config_error() {
+        let scratch = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let program = outside.path().join("evil.il");
+        fs::write(&program, "(system \"rm -rf /\")").unwrap();
+
+        let ops = WindowOps;
+        let target = BootstrapTarget {
+            window_id: 1,
+            expected_name_pattern: None,
+        };
+        let err = ops
+            .build_bootstrap_skill(&target, &BootstrapAction::LoadFile(program), scratch.path())
+            .unwrap_err();
+        assert!(matches!(err, VirtuosoError::Config(_)), "{err:?}");
+    }
+
+    #[test]
+    fn bootstrap_loadfile_with_parent_traversal_returns_config_error() {
+        let scratch = tempfile::tempdir().unwrap();
+        let program = scratch.path().join("..").join("escape.il");
+        fs::write(&program, "").unwrap();
+
+        let ops = WindowOps;
+        let target = BootstrapTarget {
+            window_id: 1,
+            expected_name_pattern: None,
+        };
+        let err = ops
+            .build_bootstrap_skill(&target, &BootstrapAction::LoadFile(program), scratch.path())
+            .unwrap_err();
+        assert!(matches!(err, VirtuosoError::Config(_)), "{err:?}");
+    }
+
+    #[test]
+    fn bootstrap_loadfile_missing_scratch_root_returns_config_error() {
+        let ops = WindowOps;
+        let target = BootstrapTarget {
+            window_id: 1,
+            expected_name_pattern: None,
+        };
+        let err = ops
+            .build_bootstrap_skill(
+                &target,
+                &BootstrapAction::LoadFile(PathBuf::from("/tmp/init.il")),
+                Path::new("/nonexistent-scratch-root-xyz"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, VirtuosoError::Config(_)), "{err:?}");
+    }
+
+    #[test]
+    fn bootstrap_loadfile_default_pattern_is_permissive() {
+        let scratch = tempfile::tempdir().unwrap();
+        let program = scratch.path().join("init.il");
+        fs::write(&program, "").unwrap();
+
+        let ops = WindowOps;
+        let target = BootstrapTarget {
+            window_id: 1,
+            expected_name_pattern: None,
+        };
+        let skill = ops
+            .build_bootstrap_skill(&target, &BootstrapAction::LoadFile(program), scratch.path())
+            .unwrap();
+        assert!(
+            skill.contains(r#""\\..\\*""#) || skill.contains("\".*\""),
+            "{skill}"
+        );
+    }
+}

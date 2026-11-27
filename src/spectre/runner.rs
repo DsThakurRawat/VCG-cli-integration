@@ -1,0 +1,2066 @@
+#![allow(dead_code)]
+
+use crate::error::{Result, VirtuosoError};
+use crate::models::{ExecutionStatus, SimulationResult};
+use crate::spectre::jobs::{Job, JobStatus};
+use crate::streaming::{JobEvent, JobEventSink};
+use crate::transport::contract::{
+    CommandRequest, CommandResult, DownloadDirRequest, RemoteTransport, UploadTextRequest,
+};
+use crate::transport::openssh::OpenSshTransport;
+use crate::transport::ssh::shell_quote;
+use regex::Regex;
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::Duration;
+use uuid::Uuid;
+
+/// Result of a parallel Spectre run — label plus outcome.
+#[derive(Debug)]
+pub struct ParallelSimResult {
+    pub label: String,
+    pub result: Result<SimulationResult>,
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+fn catch_parallel_job<F>(label: String, operation: F) -> ParallelSimResult
+where
+    F: FnOnce() -> Result<SimulationResult>,
+{
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(
+        |payload| {
+            Err(VirtuosoError::Execution(format!(
+                "parallel simulation worker panicked: {}",
+                panic_message(payload.as_ref())
+            )))
+        },
+    );
+    ParallelSimResult { label, result }
+}
+
+fn parallel_chunk_panic_results(
+    labels: &[String],
+    payload: &(dyn std::any::Any + Send),
+) -> Vec<ParallelSimResult> {
+    let message = panic_message(payload);
+    labels
+        .iter()
+        .map(|label| ParallelSimResult {
+            label: label.clone(),
+            result: Err(VirtuosoError::Execution(format!(
+                "parallel simulation chunk panicked: {message}"
+            ))),
+        })
+        .collect()
+}
+
+type ParsedSimulationOutput = (
+    HashMap<String, Vec<f64>>,
+    HashMap<String, crate::models::ScalarValue>,
+);
+
+pub struct SpectreSimulator {
+    pub spectre_cmd: String,
+    pub spectre_args: Vec<String>,
+    pub timeout: u64,
+    pub work_dir: PathBuf,
+    pub output_format: String,
+    pub remote: bool,
+    /// Shared transport handle. `Arc` matters here: `run_parallel` clones this
+    /// simulator once and every worker borrows it, so all workers reach the
+    /// same transport (and therefore the same ControlMaster state) rather than
+    /// a per-thread snapshot of it.
+    pub transport: Option<Arc<dyn RemoteTransport>>,
+    /// `user@host` label recorded on job metadata.
+    ///
+    /// Derived from configuration at construction rather than read back from
+    /// the transport: connection identity belongs in the planned
+    /// `ConnectionKey`, not in the transport contract. Keeping it here keeps
+    /// the contract free of endpoint-formatting methods that every backend
+    /// would otherwise have to duplicate.
+    pub remote_target: Option<String>,
+    pub remote_work_dir: Option<String>,
+    pub keep_remote_files: bool,
+    pub max_workers: u32,
+    /// Path to Cadence environment setup file (VB_CADENCE_CSHRC).
+    /// Source this before running spectre on remote SSH.
+    pub cadence_cshrc: Option<String>,
+    /// Absolute path to Spectre binary (VB_SPECTRE_BIN).
+    /// When set, this path is used directly instead of relying on PATH.
+    pub spectre_bin: Option<String>,
+    /// Opt-in to strict PSF parsing (VB_STRICT_PSF=1).
+    /// When enabled, `parse_simulation_output` uses the strict directory
+    /// parser which propagates errors instead of silently dropping
+    /// malformed files. Default false preserves legacy behavior.
+    pub strict_psf: bool,
+    sink: Arc<dyn JobEventSink>,
+}
+
+impl Clone for SpectreSimulator {
+    fn clone(&self) -> Self {
+        Self {
+            spectre_cmd: self.spectre_cmd.clone(),
+            spectre_args: self.spectre_args.clone(),
+            timeout: self.timeout,
+            work_dir: self.work_dir.clone(),
+            output_format: self.output_format.clone(),
+            remote: self.remote,
+            transport: self.transport.clone(),
+            remote_target: self.remote_target.clone(),
+            remote_work_dir: self.remote_work_dir.clone(),
+            keep_remote_files: self.keep_remote_files,
+            max_workers: self.max_workers,
+            cadence_cshrc: self.cadence_cshrc.clone(),
+            spectre_bin: self.spectre_bin.clone(),
+            strict_psf: self.strict_psf,
+            sink: Arc::clone(&self.sink),
+        }
+    }
+}
+
+/// Check if simulation output indicates a netlist read-in error.
+/// "Circuit read-in complete" is NORMAL Spectre output.
+/// Only flag actual errors: "error reading" or "read-in failed".
+fn has_readin_error(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("error reading") || lower.contains("read-in failed")
+}
+
+/// Extract specific error messages from simulation log for better diagnostics.
+fn extract_error_messages(content: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.contains("Error") || line.contains("ERROR") || line.contains("error:") {
+            if line.contains("No licences")
+                || line.contains("Warning")
+                || line.contains("info:")
+                || line.contains("Reading")
+            {
+                continue;
+            }
+            errors.push(line.to_string());
+        }
+    }
+
+    errors
+}
+
+/// Extract warning diagnostics independently from errors.  Spectre frequently
+/// emits warnings without the word "error", so routing warnings through the
+/// error extractor loses useful outcome information.
+fn extract_warning_messages(content: &str) -> Vec<String> {
+    let zero_summary = Regex::new(
+        r"(?i)(?:\b(?:no|zero)\s+warnings?\b|\b0\s+warnings?\b|\bwarnings?\s*:\s*0\b|\bwarning count\s*:\s*0\b)",
+    )
+    .ok();
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            if line.is_empty() {
+                return false;
+            }
+            let lower = line.to_lowercase();
+            if !lower.contains("warning") {
+                return false;
+            }
+            !zero_summary
+                .as_ref()
+                .map(|regex| regex.is_match(&lower))
+                .unwrap_or(false)
+        })
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Output is usable only after it has been parsed into non-empty analyses or
+/// operating points.  Directory presence and a successful empty parse do not
+/// prove Spectre produced data.
+fn has_usable_output(
+    data: &HashMap<String, Vec<f64>>,
+    operating_points: &HashMap<String, crate::models::ScalarValue>,
+) -> bool {
+    !data.is_empty() || !operating_points.is_empty()
+}
+
+fn classify_simulation_output(
+    exit_ok: bool,
+    log_content: &str,
+    data: &HashMap<String, Vec<f64>>,
+    operating_points: &HashMap<String, crate::models::ScalarValue>,
+) -> SpectreOutcome {
+    SpectreOutcomeClassifier::new(
+        exit_ok,
+        log_content,
+        has_usable_output(data, operating_points),
+    )
+    .classify()
+}
+
+fn parse_simulation_output(
+    raw_dir: &std::path::Path,
+    strict_psf: bool,
+) -> Result<ParsedSimulationOutput> {
+    let sweep = crate::spectre::parsers::parse_sweep_psf_directory(raw_dir)?;
+    let data = if !sweep.is_empty() {
+        let mut flat = HashMap::new();
+        let mut indices: Vec<_> = sweep.keys().collect();
+        indices.sort();
+        for &idx in indices {
+            for (signal, values) in &sweep[&idx] {
+                flat.insert(format!("point_{}_{}", idx, signal), values.clone());
+            }
+        }
+        flat
+    } else if raw_dir.join("psf").exists() || raw_dir.join("results").exists() {
+        if strict_psf {
+            crate::spectre::parsers::parse_psf_ascii_strict_directory(raw_dir)?
+        } else {
+            crate::spectre::parsers::parse_psf_ascii(raw_dir)?
+        }
+    } else {
+        HashMap::new()
+    };
+    let operating_points = crate::spectre::parsers::parse_structured_op_blocks(raw_dir);
+    Ok((data, operating_points))
+}
+
+/// Combines the simulation SSH streams with the actual Spectre log.  A failed
+/// log read is an operational failure: without spectre.out we cannot make a
+/// trustworthy outcome decision.
+fn combined_remote_log(simulation: &CommandResult, log_read: &CommandResult) -> Result<String> {
+    if !log_read.success {
+        let detail = log_read.stderr.trim();
+        return Err(VirtuosoError::Ssh(format!(
+            "failed to read remote spectre.out (exit {}): {}",
+            log_read.exit_status,
+            if detail.is_empty() {
+                "no stderr"
+            } else {
+                detail
+            }
+        )));
+    }
+    Ok(format!(
+        "{}\n{}\n{}",
+        simulation.stdout, simulation.stderr, log_read.stdout
+    ))
+}
+
+fn remote_directory_exists(result: &CommandResult) -> Result<bool> {
+    match result.exit_status {
+        0 => Ok(true),
+        1 => Ok(false),
+        code => Err(VirtuosoError::Ssh(format!(
+            "failed to inspect remote result directory (exit {code}): {}",
+            result.stderr.trim()
+        ))),
+    }
+}
+
+/// Progress reporting has an explicit lifecycle independent of Spectre log
+/// wording.  The owner always requests cancellation before joining it.
+struct ProgressFollower {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ProgressFollower {
+    fn spawn(sink: Arc<dyn JobEventSink>, log_path: PathBuf, job_id: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_for_thread.load(Ordering::Acquire) {
+                if let Ok(content) = fs::read_to_string(&log_path) {
+                    if let Some((percent, message)) = parse_spectre_progress(&content) {
+                        sink.emit(JobEvent::Progress {
+                            job_id: job_id.clone(),
+                            percent,
+                            message,
+                            iteration: None,
+                            time_point: None,
+                        });
+                    }
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn terminate_timed_out_child(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
+    match child.kill() {
+        Ok(()) => child.wait().map_err(|wait_error| {
+            VirtuosoError::Execution(format!(
+                "spectre kill succeeded but reap failed: {wait_error}"
+            ))
+        }),
+        Err(kill_error) => Err(describe_failed_kill(kill_error, child.try_wait())),
+    }
+}
+
+fn describe_failed_kill(
+    kill_error: std::io::Error,
+    wait_state: std::io::Result<Option<std::process::ExitStatus>>,
+) -> VirtuosoError {
+    match wait_state {
+        Ok(Some(status)) => VirtuosoError::Execution(format!(
+            "spectre kill failed ({kill_error}); child was already reaped with {status}"
+        )),
+        Ok(None) => VirtuosoError::Execution(format!(
+            "spectre kill failed ({kill_error}); child is still running and was not waited indefinitely"
+        )),
+        Err(wait_error) => VirtuosoError::Execution(format!(
+            "spectre kill failed ({kill_error}); status check also failed ({wait_error})"
+        )),
+    }
+}
+
+fn should_cleanup_remote(outcome: &SpectreOutcome, keep_remote_files: bool) -> bool {
+    !keep_remote_files && matches!(outcome, SpectreOutcome::Success)
+}
+
+/// Check if simulation output indicates a license error.
+fn has_license_error(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    (lower.contains("license") || lower.contains("licence"))
+        && (lower.contains("error") || lower.contains("denied") || lower.contains("unavailable"))
+}
+
+fn build_local_license_command(spectre: &str) -> Command {
+    let mut command = Command::new(spectre);
+    command.arg("-W");
+    command
+}
+
+fn build_remote_license_command(cadence_cshrc: Option<&str>, spectre: &str) -> String {
+    let spectre = shell_quote(spectre);
+    let probe = format!(
+        "command -v {spectre} 2>/dev/null || echo 'not found'; \
+         {spectre} -W 2>/dev/null | head -1 || echo 'unknown'; \
+         lmstat -a 2>/dev/null | grep -i spectre | head -5 || echo 'lmstat not available'"
+    );
+
+    match cadence_cshrc {
+        Some(cshrc) if cshrc.ends_with(".csh") || cshrc.ends_with(".cshrc") => {
+            let csh_script = format!(
+                "source {} && exec sh -c {}",
+                shell_quote(cshrc),
+                shell_quote(&probe)
+            );
+            format!("csh -c {}", shell_quote(&csh_script))
+        }
+        Some(cshrc) => format!(". {} && ({probe})", shell_quote(cshrc)),
+        None => probe,
+    }
+}
+
+/// Completion detection patterns (configurable for i18n).
+/// Default: English "Simulation completed" and Chinese "成就".
+fn is_simulation_complete(content: &str) -> bool {
+    content.contains("Simulation completed")
+        || content.contains("成就")
+        || std::env::var("VB_SPECTRE_COMPLETION_PATTERN")
+            .map(|p| content.contains(&p))
+            .unwrap_or(false)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SpectreOutcomeClassifier — unified failure classification
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Classification outcome for a Spectre run.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpectreOutcome {
+    /// Spectre succeeded cleanly.
+    Success,
+    /// Spectre produced usable data but logged warnings or license deprecation.
+    PartialSuccess { warnings: Vec<String> },
+    /// Spectre failed — no usable data, explicit failure in log.
+    Failure { reason: String },
+    /// Spectre ran but left incomplete/partial data (convergence failure, etc.).
+    PartialFailure { reason: String },
+}
+
+impl SpectreOutcome {
+    pub fn is_ok(&self) -> bool {
+        matches!(
+            self,
+            SpectreOutcome::Success | SpectreOutcome::PartialSuccess { .. }
+        )
+    }
+
+    pub fn is_failure(&self) -> bool {
+        matches!(
+            self,
+            SpectreOutcome::Failure { .. } | SpectreOutcome::PartialFailure { .. }
+        )
+    }
+
+    fn is_partial(&self) -> bool {
+        matches!(
+            self,
+            SpectreOutcome::PartialSuccess { .. } | SpectreOutcome::PartialFailure { .. }
+        )
+    }
+
+    fn execution_status(&self) -> ExecutionStatus {
+        match self {
+            SpectreOutcome::Success => ExecutionStatus::Success,
+            SpectreOutcome::PartialSuccess { .. } => ExecutionStatus::Partial,
+            SpectreOutcome::Failure { .. } => ExecutionStatus::Error,
+            SpectreOutcome::PartialFailure { .. } => ExecutionStatus::Partial,
+        }
+    }
+
+    fn short_reason(&self) -> String {
+        match self {
+            SpectreOutcome::Success => String::new(),
+            SpectreOutcome::PartialSuccess { warnings } => {
+                if warnings.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} warning(s)", warnings.len())
+                }
+            }
+            SpectreOutcome::Failure { reason } | SpectreOutcome::PartialFailure { reason } => {
+                reason.clone()
+            }
+        }
+    }
+}
+
+/// Unified Spectre log classifier.
+/// Replaces the ad-hoc `!status.success() || has_readin_error()` checks
+/// in run_local, run_remote, and run_parallel.
+#[derive(Debug, Clone, Default)]
+pub struct SpectreOutcomeClassifier {
+    pub exit_ok: bool,
+    pub log_content: String,
+    pub has_raw_data: bool,
+}
+
+impl SpectreOutcomeClassifier {
+    pub fn new(exit_ok: bool, log_content: &str, has_raw_data: bool) -> Self {
+        Self {
+            exit_ok,
+            log_content: log_content.to_string(),
+            has_raw_data,
+        }
+    }
+
+    /// Classify the Spectre run outcome from the given log.
+    ///
+    /// Detection rules (checked in order):
+    /// 1. Explicit fatal / panic / SEV → Failure
+    /// 2. Missing include / netlist error → Failure
+    /// 3. Convergence failure (SPCRTRF-*, "failed to converge") → PartialFailure
+    ///    (even if exit code is 0)
+    /// 4. Read-in error → Failure
+    /// 5. License error → PartialFailure (data may still be usable)
+    /// 6. Exit code != 0 → Failure
+    /// 7. "No convergence difficulties" alone is NOT a failure signal
+    /// 8. If we have raw data and none of the above → Success
+    /// 9. If we have raw data but there are warnings → PartialSuccess
+    /// 10. If no raw data and no explicit errors → Failure (silent exit)
+    pub fn classify(&self) -> SpectreOutcome {
+        let lc = &self.log_content;
+
+        if self.has_fatal_error(lc) {
+            return SpectreOutcome::Failure {
+                reason: self.fatal_reason(lc),
+            };
+        }
+
+        if self.has_missing_include(lc) {
+            return SpectreOutcome::Failure {
+                reason: "missing netlist include or library".to_string(),
+            };
+        }
+
+        if self.has_convergence_failure(lc) {
+            if self.has_raw_data {
+                return SpectreOutcome::PartialFailure {
+                    reason: self.convergence_reason(lc),
+                };
+            } else {
+                return SpectreOutcome::Failure {
+                    reason: self.convergence_reason(lc),
+                };
+            }
+        }
+
+        if has_readin_error(lc) {
+            return SpectreOutcome::Failure {
+                reason: "netlist read-in failed".to_string(),
+            };
+        }
+
+        if has_license_error(lc) {
+            if self.has_raw_data {
+                return SpectreOutcome::PartialSuccess {
+                    warnings: vec!["license error — simulation may be incomplete".to_string()],
+                };
+            } else {
+                return SpectreOutcome::Failure {
+                    reason: "license error — simulation did not run".to_string(),
+                };
+            }
+        }
+
+        if !self.exit_ok {
+            if self.has_raw_data {
+                return SpectreOutcome::PartialFailure {
+                    reason: format!("non-zero exit code{}", self.short_exit_reason()),
+                };
+            } else {
+                return SpectreOutcome::Failure {
+                    reason: format!("spectre exited with error{}", self.short_exit_reason()),
+                };
+            }
+        }
+
+        let warnings = self.warnings();
+        if self.has_raw_data {
+            if warnings.is_empty() {
+                SpectreOutcome::Success
+            } else {
+                SpectreOutcome::PartialSuccess { warnings }
+            }
+        } else {
+            SpectreOutcome::Failure {
+                reason: "spectre exited cleanly but produced no output data".to_string(),
+            }
+        }
+    }
+
+    /// "failed to converge" or SPCRTRF-* / SPCRTRF:*
+    fn has_convergence_failure(&self, content: &str) -> bool {
+        let lower = content.to_lowercase();
+        lower.contains("failed to converge")
+            || lower.contains("convergence failure")
+            || lower.contains("failed during convergence")
+            || lower.contains("do not converge")
+            || lower.contains("could not converge")
+            || Regex::new(r"(?i)SPCRTRF[:-]\d+")
+                .map(|re| re.is_match(content))
+                .unwrap_or(false)
+            || Regex::new(r"(?i)SPCRTRF_\d+")
+                .map(|re| re.is_match(content))
+                .unwrap_or(false)
+    }
+
+    fn convergence_reason(&self, content: &str) -> String {
+        let lower = content.to_lowercase();
+        if lower.contains("failed to converge") || lower.contains("convergence failure") {
+            "convergence failure".to_string()
+        } else if let Some(caps) = Regex::new(r"(?i)(SPCRTRF[:-]?\d+)")
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            format!(
+                "Spectre error {}: convergence failed",
+                caps.get(0).unwrap().as_str()
+            )
+        } else {
+            "convergence failure".to_string()
+        }
+    }
+
+    /// Fatal: "fatal" near an error, SEV, panic, assertion failure.
+    fn has_fatal_error(&self, content: &str) -> bool {
+        let lower = content.to_lowercase();
+        if Regex::new(r"(?im)^\s*(?:error|fatal)\b[^\n]{0,40}\(\s*SFE-\d+\s*\)")
+            .map(|re| re.is_match(content))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if lower.contains("fatal") {
+            return true;
+        }
+        if lower.contains("sev") && lower.contains("error") {
+            return true;
+        }
+        if lower.contains("panic") || lower.contains("assertion") {
+            return true;
+        }
+        if lower.contains("coredump") || lower.contains("core dumped") {
+            return true;
+        }
+        false
+    }
+
+    fn fatal_reason(&self, content: &str) -> String {
+        let lower = content.to_lowercase();
+        if lower.contains("panic") {
+            return "spectre panic".to_string();
+        }
+        if lower.contains("assertion") {
+            return "spectre assertion failure".to_string();
+        }
+        if lower.contains("coredump") || lower.contains("core dumped") {
+            return "spectre coredump".to_string();
+        }
+        if lower.contains("sev") {
+            return "SEV fatal error".to_string();
+        }
+        "fatal error".to_string()
+    }
+
+    /// Missing include / missing model file.
+    fn has_missing_include(&self, content: &str) -> bool {
+        let lower = content.to_lowercase();
+        (lower.contains("missing include") || lower.contains("cannot open"))
+            && (lower.contains(".scs")
+                || lower.contains(".include")
+                || lower.contains("file not found"))
+    }
+
+    fn short_exit_reason(&self) -> String {
+        let re = Regex::new(r"exit code.*?(\d+)").ok();
+        re.and_then(|re| re.captures(&self.log_content))
+            .map(|c| format!(" (exit {})", c.get(1).unwrap().as_str()))
+            .unwrap_or_default()
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        extract_warning_messages(&self.log_content)
+    }
+}
+
+impl SpectreSimulator {
+    /// Construct a simulator from an already-resolved [`Config`].
+    ///
+    /// P0-A identity closure: migrated command families resolve the Config once
+    /// in `main()` and hand it down via `CommandContext`; this constructor lets
+    /// `sim run-async` / `sim run-parallel` use that pre-resolved config instead
+    /// of re-reading the environment (which could drift if env vars change
+    /// between the selection step and the command dispatch).
+    pub fn from_config(cfg: &crate::config::Config) -> Result<Self> {
+        let remote = cfg.is_remote();
+
+        let transport = if remote {
+            crate::transport::backend::require_openssh(cfg)?;
+            let mut runner =
+                crate::transport::ssh::SSHRunner::new(cfg.remote_host.as_deref().unwrap_or(""));
+            if let Some(ref user) = cfg.remote_user {
+                runner = runner.with_user(user);
+            }
+            if let Some(ref jump) = cfg.jump_host {
+                let mut r = runner.with_jump(jump);
+                if let Some(ref user) = cfg.jump_user {
+                    r.jump_user = Some(user.clone());
+                }
+                runner = r;
+            }
+            runner.timeout = cfg.timeout;
+            let target = runner.remote_target();
+            Some((
+                Arc::new(OpenSshTransport::new(runner)) as Arc<dyn RemoteTransport>,
+                Some(target),
+            ))
+        } else {
+            None
+        };
+        let (transport, remote_target) = match transport {
+            Some(pair) => (Some(pair.0), pair.1),
+            None => (None, None),
+        };
+
+        Ok(Self {
+            spectre_cmd: cfg.spectre_cmd.clone(),
+            spectre_args: cfg.spectre_args.clone(),
+            timeout: cfg.timeout,
+            work_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            output_format: "psfascii".into(),
+            remote,
+            transport,
+            remote_target,
+            remote_work_dir: None,
+            keep_remote_files: cfg.keep_remote_files,
+            max_workers: cfg.spectre_max_workers,
+            cadence_cshrc: cfg.cadence_cshrc.clone(),
+            spectre_bin: cfg.spectre_bin.clone(),
+            strict_psf: std::env::var("VB_STRICT_PSF")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false),
+            sink: Arc::new(crate::streaming::NullSink),
+        })
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let cfg = crate::config::Config::from_env()?;
+        Self::from_config(&cfg)
+    }
+
+    pub fn with_sink(mut self, sink: Arc<dyn JobEventSink>) -> Self {
+        self.sink = sink;
+        self
+    }
+
+    /// Get the effective Spectre command to execute.
+    /// Prefers spectre_bin (absolute path) over spectre_cmd (command name).
+    fn spectre_command(&self) -> &str {
+        self.spectre_bin.as_deref().unwrap_or(&self.spectre_cmd)
+    }
+
+    fn remote_spectre_argv(&self) -> Vec<String> {
+        let mut argv = vec![
+            self.spectre_command().to_string(),
+            "-64".to_string(),
+            "input.scs".to_string(),
+            "+escchars".to_string(),
+            "+log".to_string(),
+            "spectre.out".to_string(),
+            "-format".to_string(),
+            self.output_format.clone(),
+            "-raw".to_string(),
+            "raw".to_string(),
+            "+lqtimeout".to_string(),
+            "900".to_string(),
+            "-maxw".to_string(),
+            "5".to_string(),
+            "-maxn".to_string(),
+            self.max_workers.to_string(),
+            "+logstatus".to_string(),
+        ];
+        argv.extend(self.spectre_args.iter().cloned());
+        argv
+    }
+
+    fn remote_spectre_command(&self, remote_dir: &str, background: bool) -> String {
+        let tool_command = self
+            .remote_spectre_argv()
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let environment_command = match self.cadence_cshrc.as_deref() {
+            Some(cshrc) => {
+                let source = if cshrc.ends_with(".csh") || cshrc.ends_with(".cshrc") {
+                    format!("source {} && exec {tool_command}", shell_quote(cshrc))
+                } else {
+                    format!(". {} && exec {tool_command}", shell_quote(cshrc))
+                };
+                let shell = if cshrc.ends_with(".csh") || cshrc.ends_with(".cshrc") {
+                    "csh"
+                } else {
+                    "sh"
+                };
+                format!("{shell} -c {}", shell_quote(&source))
+            }
+            None => tool_command,
+        };
+
+        let cd = format!("cd {}", shell_quote(remote_dir));
+        if background {
+            format!(
+                ". /etc/profile 2>/dev/null; . ~/.bash_profile 2>/dev/null; \
+                 . ~/.bashrc 2>/dev/null; {cd} && nohup {environment_command} \
+                 > /dev/null 2>&1 & echo $!"
+            )
+        } else {
+            format!("{cd} && {environment_command}")
+        }
+    }
+
+    pub fn run_simulation(
+        &self,
+        netlist: &str,
+        params: Option<&HashMap<String, String>>,
+    ) -> Result<SimulationResult> {
+        if self.remote {
+            self.run_remote(netlist, params)
+        } else {
+            self.run_local(netlist, params)
+        }
+    }
+
+    /// Run multiple netlist simulations in parallel, returning results in input order.
+    ///
+    /// Each entry is `(label, netlist)` — results are returned with the same label.
+    /// Worker count is capped at `self.max_workers` and `num_cpus::get()`.
+    ///
+    /// All workers share **one** cloned simulator, and therefore one transport:
+    /// `sim` is cloned once below and each scoped thread borrows it by
+    /// reference, and the `Arc<dyn RemoteTransport>` inside it is cloned rather
+    /// than rebuilt. Each worker drains its own chunk sequentially, so peak
+    /// concurrent remote operations is bounded by the worker count, not by the
+    /// number of commands a single job issues.
+    ///
+    /// Consequence: backend state is shared across workers rather than isolated
+    /// per thread. The OpenSSH backend guards its ControlMaster flag with a
+    /// `Mutex<bool>`, so a ControlMaster failure observed by any worker flips
+    /// the flag for all of them. That is safe (no data race) but it is not
+    /// per-thread isolation — do not assume otherwise when reasoning about
+    /// fallback behaviour.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let inputs = vec![
+    ///     ("tt".to_string(), netlist_tt),
+    ///     ("ss".to_string(), netlist_ss),
+    ///     ("ff".to_string(), netlist_ff),
+    /// ];
+    /// let results = sim.run_parallel(&inputs);
+    /// for ParallelSimResult { label, result } in results {
+    ///     match result {
+    ///         Ok(sim_res) => println!("{}: OK", label),
+    ///         Err(e) => println!("{}: ERROR - {}", label, e),
+    ///     }
+    /// }
+    /// ```
+    pub fn run_parallel(&self, inputs: &[(String, String)]) -> Vec<ParallelSimResult> {
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+
+        let n_workers = self.max_workers.min(num_cpus::get() as u32).max(1) as usize;
+
+        let sim = self.clone();
+        let inputs_arc: Vec<_> = inputs.iter().map(|(l, n)| (l.clone(), n.clone())).collect();
+
+        std::thread::scope(|s| {
+            let chunks: Vec<_> = inputs_arc
+                .chunks(inputs_arc.len().div_ceil(n_workers))
+                .collect();
+
+            let handles: Vec<_> = chunks
+                .iter()
+                .map(|chunk| {
+                    let labels = chunk
+                        .iter()
+                        .map(|(label, _)| label.clone())
+                        .collect::<Vec<_>>();
+                    let handle = s.spawn(|| {
+                        chunk
+                            .iter()
+                            .map(|(label, netlist)| {
+                                catch_parallel_job(label.clone(), || {
+                                    sim.run_simulation(netlist, None)
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    (labels, handle)
+                })
+                .collect();
+
+            let mut all_results = Vec::with_capacity(inputs_arc.len());
+            for (labels, handle) in handles {
+                match handle.join() {
+                    Ok(results) => all_results.extend(results),
+                    Err(payload) => {
+                        all_results.extend(parallel_chunk_panic_results(&labels, payload.as_ref()))
+                    }
+                }
+            }
+            debug_assert_eq!(all_results.len(), inputs_arc.len());
+            all_results
+        })
+    }
+
+    /// Check if simulation output indicates a netlist read-in error.
+    fn has_readin_error(content: &str) -> bool {
+        let lower = content.to_lowercase();
+        lower.contains("error reading") || lower.contains("read-in failed")
+    }
+
+    /// Extract specific error messages from simulation log for better diagnostics.
+    fn extract_error_messages(content: &str) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.contains("Error") || line.contains("ERROR") || line.contains("error:") {
+                if line.contains("No licences")
+                    || line.contains("Warning")
+                    || line.contains("info:")
+                    || line.contains("Reading")
+                {
+                    continue;
+                }
+                errors.push(line.to_string());
+            }
+        }
+
+        errors
+    }
+
+    /// Check if simulation output indicates a license error.
+    fn has_license_error(content: &str) -> bool {
+        let lower = content.to_lowercase();
+        (lower.contains("license") || lower.contains("licence"))
+            && (lower.contains("error")
+                || lower.contains("denied")
+                || lower.contains("unavailable"))
+    }
+
+    /// Completion detection patterns (configurable for i18n).
+    /// Default: English "Simulation completed" and Chinese "成就".
+    fn is_simulation_complete(content: &str) -> bool {
+        content.contains("Simulation completed")
+            || content.contains("成就")
+            || std::env::var("VB_SPECTRE_COMPLETION_PATTERN")
+                .map(|p| content.contains(&p))
+                .unwrap_or(false)
+    }
+
+    pub fn check_license(&self) -> Result<String> {
+        let spectre = self.spectre_command();
+        if let Some(ref runner) = self.transport {
+            let command = build_remote_license_command(self.cadence_cshrc.as_deref(), spectre);
+            let result = runner.run_command(&CommandRequest::untimed(&command))?;
+            Ok(result.stdout.trim().to_string())
+        } else {
+            let output = build_local_license_command(spectre)
+                .output()
+                .map_err(|e| VirtuosoError::Execution(e.to_string()))?;
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+    }
+
+    /// Launch simulation in background, return job ID immediately.
+    /// Works for both local and remote (via SSH nohup).
+    pub fn run_async(&self, netlist: &str) -> Result<Job> {
+        if self.remote {
+            return self.run_async_remote(netlist);
+        }
+
+        let run_id = Uuid::new_v4().to_string()[..8].to_string();
+        let run_dir = self.work_dir.join(&run_id);
+        fs::create_dir_all(&run_dir).map_err(|e| VirtuosoError::Execution(e.to_string()))?;
+
+        let netlist_path = run_dir.join("input.scs");
+        fs::write(&netlist_path, netlist).map_err(|e| VirtuosoError::Execution(e.to_string()))?;
+
+        let raw_dir = run_dir.join("raw");
+        fs::create_dir_all(&raw_dir).map_err(|e| VirtuosoError::Execution(e.to_string()))?;
+
+        let log_path = run_dir.join("spectre.out");
+
+        let mut cmd = Command::new(self.spectre_command());
+        cmd.arg("-64")
+            .arg(&netlist_path)
+            .arg("+escchars")
+            .arg("+log")
+            .arg(&log_path)
+            .arg("-format")
+            .arg(&self.output_format)
+            .arg("-raw")
+            .arg(&raw_dir)
+            .arg("+lqtimeout")
+            .arg("900")
+            .arg("-maxw")
+            .arg("5")
+            .arg("-maxn")
+            .arg(self.max_workers.to_string())
+            .arg("+logstatus");
+
+        for arg in &self.spectre_args {
+            cmd.arg(arg);
+        }
+
+        let child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| VirtuosoError::Execution(format!("spectre failed to start: {e}")))?;
+
+        let job = Job {
+            id: run_id,
+            status: JobStatus::Running,
+            netlist_path: netlist_path.to_string_lossy().into(),
+            raw_dir: Some(raw_dir.to_string_lossy().into()),
+            pid: Some(child.id()),
+            created: chrono::Local::now().to_rfc3339(),
+            finished: None,
+            error: None,
+            remote_host: None,
+            remote_dir: None,
+        };
+        job.save()?;
+        Ok(job)
+    }
+
+    fn run_async_remote(&self, netlist: &str) -> Result<Job> {
+        let runner = self.transport.as_ref().ok_or_else(|| {
+            VirtuosoError::Execution("no remote transport for remote async simulation".into())
+        })?;
+
+        let run_id = Uuid::new_v4().to_string()[..8].to_string();
+        let remote_dir = format!("/tmp/virtuoso_bridge/spectre/{run_id}");
+
+        runner.run_command(&CommandRequest::untimed(format!(
+            "mkdir -p {}",
+            shell_quote(&remote_dir)
+        )))?;
+        runner.upload_text(&UploadTextRequest::untimed(
+            netlist,
+            format!("{remote_dir}/input.scs"),
+        ))?;
+
+        let spectre_cmd = self.remote_spectre_command(&remote_dir, true);
+
+        let result = runner.run_command(&CommandRequest::with_exec_timeout(
+            &spectre_cmd,
+            Duration::from_secs(10),
+        ))?;
+        let pid: u32 = result
+            .stdout
+            .trim()
+            .parse()
+            .map_err(|_| VirtuosoError::Execution(format!("bad PID: {}", result.stdout)))?;
+
+        let job = Job {
+            id: run_id,
+            status: JobStatus::Running,
+            netlist_path: format!("{remote_dir}/input.scs"),
+            raw_dir: Some(format!("{remote_dir}/raw")),
+            pid: Some(pid),
+            created: chrono::Local::now().to_rfc3339(),
+            finished: None,
+            error: None,
+            remote_host: self.remote_target.clone(),
+            remote_dir: Some(remote_dir),
+        };
+        job.save()?;
+        Ok(job)
+    }
+
+    fn run_local(
+        &self,
+        netlist: &str,
+        _params: Option<&HashMap<String, String>>,
+    ) -> Result<SimulationResult> {
+        let run_id = Uuid::new_v4().to_string();
+        let run_dir = self.work_dir.join(&run_id);
+        fs::create_dir_all(&run_dir).map_err(|e| VirtuosoError::Execution(e.to_string()))?;
+
+        let netlist_path = run_dir.join("input.scs");
+        fs::write(&netlist_path, netlist).map_err(|e| VirtuosoError::Execution(e.to_string()))?;
+
+        let raw_dir = run_dir.join("raw");
+        fs::create_dir_all(&raw_dir).map_err(|e| VirtuosoError::Execution(e.to_string()))?;
+
+        let log_path = run_dir.join("spectre.out");
+
+        let mut cmd = Command::new(self.spectre_command());
+        cmd.arg("-64")
+            .arg(&netlist_path)
+            .arg("+escchars")
+            .arg("+log")
+            .arg(&log_path)
+            .arg("-format")
+            .arg(&self.output_format)
+            .arg("-raw")
+            .arg(&raw_dir)
+            .arg("+lqtimeout")
+            .arg("900")
+            .arg("-maxw")
+            .arg("5")
+            .arg("-maxn")
+            .arg(self.max_workers.to_string())
+            .arg("+logstatus");
+
+        for arg in &self.spectre_args {
+            cmd.arg(arg);
+        }
+
+        self.sink.emit(JobEvent::Started {
+            job_id: run_id.clone(),
+            created: chrono::Local::now().to_rfc3339(),
+        });
+
+        let mut child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| VirtuosoError::Execution(format!("spectre failed to start: {e}")))?;
+
+        let mut progress_follower =
+            ProgressFollower::spawn(Arc::clone(&self.sink), log_path.clone(), run_id.clone());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(self.timeout);
+        let start_time = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break s,
+                Ok(None) => {
+                    if std::time::Instant::now() > deadline {
+                        progress_follower.stop_and_join();
+                        if let Err(termination_error) = terminate_timed_out_child(&mut child) {
+                            return Err(VirtuosoError::Execution(format!(
+                                "spectre timed out after {}s; {termination_error}",
+                                self.timeout
+                            )));
+                        }
+                        return Err(VirtuosoError::Timeout(self.timeout));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(e) => {
+                    progress_follower.stop_and_join();
+                    return Err(VirtuosoError::Execution(format!(
+                        "failed to wait on spectre: {e}"
+                    )));
+                }
+            }
+        };
+
+        progress_follower.stop_and_join();
+
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        let log_content = fs::read_to_string(&log_path).unwrap_or_default();
+
+        let (data, operating_points) = parse_simulation_output(&raw_dir, self.strict_psf)?;
+        let outcome =
+            classify_simulation_output(status.success(), &log_content, &data, &operating_points);
+
+        // ── Emit event based on classification ─────────────────────────────────────
+        match &outcome {
+            SpectreOutcome::Failure { reason } => {
+                self.sink.emit(JobEvent::Failed {
+                    job_id: run_id.clone(),
+                    error: reason.clone(),
+                });
+            }
+            SpectreOutcome::PartialFailure { reason } => {
+                self.sink.emit(JobEvent::Failed {
+                    job_id: run_id.clone(),
+                    error: reason.clone(),
+                });
+            }
+            SpectreOutcome::PartialSuccess { warnings } => {
+                self.sink.emit(JobEvent::Completed {
+                    job_id: run_id.clone(),
+                    duration_ms,
+                    errors: warnings.clone(),
+                });
+            }
+            SpectreOutcome::Success => {
+                self.sink.emit(JobEvent::Completed {
+                    job_id: run_id.clone(),
+                    duration_ms,
+                    errors: Vec::new(),
+                });
+            }
+        }
+
+        // ── Build result — status from classification, not raw exit code ─────────
+        let (errors, warnings) = match &outcome {
+            SpectreOutcome::Success => (Vec::new(), Vec::new()),
+            SpectreOutcome::PartialSuccess { warnings } => (Vec::new(), warnings.clone()),
+            SpectreOutcome::Failure { reason } => (vec![reason.clone()], Vec::new()),
+            SpectreOutcome::PartialFailure { reason } => (vec![reason.clone()], Vec::new()),
+        };
+
+        Ok(SimulationResult {
+            status: outcome.execution_status(),
+            tool_version: None,
+            data,
+            operating_points,
+            errors,
+            warnings,
+            metadata: [("log".into(), log_content), ("run_id".into(), run_id)]
+                .into_iter()
+                .collect(),
+        })
+    }
+
+    fn run_remote(
+        &self,
+        netlist: &str,
+        _params: Option<&HashMap<String, String>>,
+    ) -> Result<SimulationResult> {
+        let runner = self.transport.as_ref().ok_or_else(|| {
+            VirtuosoError::Execution("no remote transport available for remote simulation".into())
+        })?;
+
+        let run_id = Uuid::new_v4().to_string();
+        let remote_dir = format!("/tmp/virtuoso_bridge/spectre/{run_id}");
+
+        runner.run_command(&CommandRequest::untimed(format!(
+            "mkdir -p {}",
+            shell_quote(&remote_dir)
+        )))?;
+
+        let netlist_content = netlist.to_string();
+        runner.upload_text(&UploadTextRequest::untimed(
+            netlist_content,
+            format!("{remote_dir}/input.scs"),
+        ))?;
+
+        let sim_cmd = self.remote_spectre_command(&remote_dir, false);
+        let result = runner.run_command(&CommandRequest::with_exec_timeout(
+            &sim_cmd,
+            Duration::from_secs(self.timeout * 2),
+        ))?;
+
+        let remote_log = runner.run_command(&CommandRequest::with_exec_timeout(
+            format!("cat {}", shell_quote(&format!("{remote_dir}/spectre.out"))),
+            Duration::from_secs(self.timeout),
+        ))?;
+        let combined_output = combined_remote_log(&result, &remote_log)?;
+
+        let remote_raw = format!("{remote_dir}/raw");
+        let raw_check = runner.run_command(&CommandRequest::with_exec_timeout(
+            format!("test -d {}", shell_quote(&remote_raw)),
+            Duration::from_secs(self.timeout),
+        ))?;
+        let local_raw = self.work_dir.join(&run_id).join("raw");
+        let (data, operating_points) = if remote_directory_exists(&raw_check)? {
+            runner
+                .download_dir(&DownloadDirRequest::untimed(&remote_raw, &local_raw))
+                .map_err(|e| {
+                    VirtuosoError::Ssh(format!(
+                        "{}: failed to retrieve remote Spectre raw results from {remote_dir}: {e}",
+                        e.code()
+                    ))
+                })?;
+            parse_simulation_output(&local_raw, self.strict_psf)?
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+
+        let outcome =
+            classify_simulation_output(result.success, &combined_output, &data, &operating_points);
+
+        let (errors, warnings, status) = match &outcome {
+            SpectreOutcome::Success => (Vec::new(), Vec::new(), ExecutionStatus::Success),
+            SpectreOutcome::PartialSuccess { warnings } => {
+                (Vec::new(), warnings.clone(), ExecutionStatus::Partial)
+            }
+            SpectreOutcome::Failure { reason } => {
+                (vec![reason.clone()], Vec::new(), ExecutionStatus::Error)
+            }
+            SpectreOutcome::PartialFailure { reason } => {
+                (vec![reason.clone()], Vec::new(), ExecutionStatus::Partial)
+            }
+        };
+
+        if should_cleanup_remote(&outcome, self.keep_remote_files) {
+            runner.run_command(&CommandRequest::untimed(format!(
+                "rm -rf {}",
+                shell_quote(&remote_dir)
+            )))?;
+        }
+
+        Ok(SimulationResult {
+            status,
+            tool_version: None,
+            data,
+            operating_points,
+            errors,
+            warnings,
+            metadata: [
+                ("run_id".into(), run_id.clone()),
+                ("remote_dir".into(), remote_dir.clone()),
+                ("log".into(), combined_output),
+            ]
+            .into_iter()
+            .collect(),
+        })
+    }
+}
+
+/// Parse spectre log output for progress information.
+/// Returns (percent, message) if progress was found.
+fn parse_spectre_progress(log_content: &str) -> Option<(f32, String)> {
+    let lines: Vec<&str> = log_content.lines().collect();
+
+    let mut last_time: Option<String> = None;
+    let mut last_iteration: Option<u64> = None;
+
+    for line in lines.iter().rev() {
+        let line = line.trim();
+
+        if let Some(time_val) = line.strip_prefix("Time:") {
+            let time_val = time_val.trim().trim_end_matches('s').trim();
+            last_time = Some(time_val.to_string());
+        }
+
+        if let Some(iter_str) = line.strip_prefix("Iteration:") {
+            if let Ok(iter) = iter_str.trim().parse::<u64>() {
+                last_iteration = Some(iter);
+            }
+        }
+
+        if last_time.is_some() && last_iteration.is_some() {
+            break;
+        }
+    }
+
+    if let (Some(time), Some(iter)) = (last_time, last_iteration) {
+        let message = format!("t={}, iter={}", time, iter);
+
+        let percent = if let Some((current, total)) = parse_time_ratio(&message) {
+            (current / total * 100.0).min(100.0) as f32
+        } else {
+            50.0
+        };
+
+        return Some((percent, message));
+    }
+
+    for line in lines.iter().rev() {
+        let line = line.trim();
+        if line.contains("Progress:") || line.contains("progress:") {
+            if let Some(pct) = extract_percent(line) {
+                return Some((pct, line.to_string()));
+            }
+        }
+    }
+
+    if is_simulation_complete(log_content) {
+        return Some((100.0, "completed".to_string()));
+    }
+
+    None
+}
+
+/// Parse time ratio from messages like "t=1200u/3n".
+fn parse_time_ratio(msg: &str) -> Option<(f64, f64)> {
+    if let Some(start) = msg.find("t=") {
+        let after_t = &msg[start + 2..];
+        if let Some(slash) = after_t.find('/') {
+            let current = &after_t[..slash];
+            let total = &after_t[slash + 1..];
+            if let (Some(c), Some(t)) = (parse_time_value(current), parse_time_value(total)) {
+                if t > 0.0 {
+                    return Some((c, t));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse a time value like "1200u", "3n", "1.2e-6" into f64 (in seconds).
+fn parse_time_value(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(0.0);
+    }
+
+    let (num_str, unit) = if let Some(idx) =
+        s.find(|c: char| !c.is_numeric() && c != '.' && c != '-' && c != 'e' && c != 'E')
+    {
+        (&s[..idx], &s[idx..])
+    } else {
+        (s, "")
+    };
+
+    let value: f64 = num_str.parse().ok()?;
+
+    Some(match unit {
+        "f" => value * 1e-15,
+        "p" => value * 1e-12,
+        "n" => value * 1e-9,
+        "u" => value * 1e-6,
+        "m" => value * 1e-3,
+        "" => value,
+        _ => value,
+    })
+}
+
+/// Extract percentage from a string like "Progress: 45%"
+fn extract_percent(s: &str) -> Option<f32> {
+    if let Some(idx) = s.find(|c: char| c.is_numeric()) {
+        let rest = &s[idx..];
+        if let Some(end) = rest.find('%') {
+            if let Ok(pct) = rest[..end].trim().parse::<f32>() {
+                return Some(pct.clamp(0.0, 100.0));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    fn test_simulator() -> SpectreSimulator {
+        SpectreSimulator {
+            spectre_cmd: "spectre".to_string(),
+            spectre_args: Vec::new(),
+            timeout: 30,
+            work_dir: PathBuf::from("/tmp"),
+            output_format: "psfascii".to_string(),
+            remote: false,
+            transport: None,
+            remote_target: None,
+            remote_work_dir: None,
+            keep_remote_files: false,
+            max_workers: 1,
+            cadence_cshrc: None,
+            spectre_bin: None,
+            strict_psf: false,
+            sink: Arc::new(crate::streaming::NullSink),
+        }
+    }
+
+    // === Error detection tests ===
+
+    #[test]
+    fn test_has_readin_error_actual_error() {
+        let content = "Error reading netlist: undefined module 'resistor'\nCircuit read-in failed";
+        assert!(has_readin_error(content));
+    }
+
+    #[test]
+    fn test_has_readin_error_case_insensitive() {
+        let content = "ERROR READING netlist\nread-in failed";
+        assert!(has_readin_error(content));
+    }
+
+    #[test]
+    fn test_has_readin_error_benign_complete() {
+        let content = "Circuit read-in complete\nSimulation running...";
+        assert!(!has_readin_error(content));
+    }
+
+    #[test]
+    fn test_has_readin_error_empty() {
+        let content = "";
+        assert!(!has_readin_error(content));
+    }
+
+    #[test]
+    fn test_has_license_error() {
+        let content = "License error: spectre is not available\nERROR: No licences";
+        assert!(has_license_error(content));
+    }
+
+    #[test]
+    fn test_has_license_error_british_spelling() {
+        let content = "Licence error: spectre denied";
+        assert!(has_license_error(content));
+    }
+
+    #[test]
+    fn test_has_license_error_only_word() {
+        let content = "Using license file: /path/to/license.dat";
+        assert!(!has_license_error(content));
+    }
+
+    #[test]
+    fn local_license_check_uses_direct_spectre_argv() {
+        let command = build_local_license_command("spectre; touch /tmp/pwned");
+        assert_eq!(command.get_program(), "spectre; touch /tmp/pwned");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("-W")]
+        );
+    }
+
+    #[test]
+    fn remote_license_check_quotes_environment_and_spectre_command() {
+        let command = build_remote_license_command(
+            Some("/cadence/env setup.csh"),
+            "spectre; touch /tmp/pwned",
+        );
+        assert!(command.contains("source '/cadence/env setup.csh'"));
+        assert!(command.contains("'spectre; touch /tmp/pwned' -W"));
+        assert!(!command.contains("spectre; touch /tmp/pwned -W"));
+    }
+
+    #[test]
+    fn remote_license_check_sources_sh_environment_in_login_shell() {
+        let command = build_remote_license_command(Some("/cadence/env setup.sh"), "spectre");
+        assert!(command.starts_with(". '/cadence/env setup.sh' &&"));
+        assert!(command.contains("spectre -W"));
+    }
+
+    #[test]
+    fn remote_license_check_runs_csh_environment_under_csh_with_quoted_values() {
+        let command = build_remote_license_command(
+            Some("/cadence/env; setup.csh"),
+            "spectre; touch /tmp/pwned",
+        );
+        assert!(command.starts_with("csh -c "));
+        assert!(command.contains("/cadence/env; setup.csh"));
+        assert!(command.contains("spectre; touch /tmp/pwned"));
+        assert!(!command.contains("source /cadence/env; setup.csh"));
+        assert!(!command.contains("spectre; touch /tmp/pwned -W"));
+        assert!(!command.starts_with("source "));
+    }
+
+    #[test]
+    fn test_extract_error_messages() {
+        let content = "Warning: something unusual\nError: netlist parse failed\ninfo: reading file\nERROR: undefined module";
+        let errors = extract_error_messages(content);
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].contains("Error: netlist parse failed"));
+        assert!(errors[1].contains("ERROR: undefined module"));
+    }
+
+    #[test]
+    fn test_extract_error_messages_skips_benign() {
+        let content = "Info: Reading design\nNo licences found for abc\nWarning: deprecated syntax";
+        let errors = extract_error_messages(content);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_extract_error_messages_empty() {
+        let content = "";
+        let errors = extract_error_messages(content);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn classifier_treats_sfe_errors_as_fatal_even_with_success_exit() {
+        let outcome =
+            SpectreOutcomeClassifier::new(true, "ERROR (SFE-23): instance M0 is undefined", true)
+                .classify();
+
+        assert!(matches!(outcome, SpectreOutcome::Failure { .. }));
+    }
+
+    #[test]
+    fn classifier_does_not_treat_benign_sfe_reference_as_fatal() {
+        let outcome = SpectreOutcomeClassifier::new(
+            true,
+            "For more information, see SFE-23 in the reference manual.",
+            true,
+        )
+        .classify();
+
+        assert_eq!(outcome, SpectreOutcome::Success);
+    }
+
+    #[test]
+    fn classifier_handles_spcrtrf_case_insensitively_and_preserves_partial_data() {
+        let outcome =
+            SpectreOutcomeClassifier::new(true, "error (spcrtrf-15044): failed at time 2ns", true)
+                .classify();
+
+        assert!(matches!(outcome, SpectreOutcome::PartialFailure { .. }));
+    }
+
+    #[test]
+    fn classifier_does_not_treat_benign_convergence_chatter_as_fatal() {
+        let outcome = SpectreOutcomeClassifier::new(
+            true,
+            "Notice: no convergence difficulties detected.",
+            true,
+        )
+        .classify();
+
+        assert_eq!(outcome, SpectreOutcome::Success);
+    }
+
+    #[test]
+    fn classifier_reports_warning_lines_independently_from_errors() {
+        let outcome =
+            SpectreOutcomeClassifier::new(true, "Warning (SPECTRE-123): deprecated option", true)
+                .classify();
+
+        assert!(matches!(
+            outcome,
+            SpectreOutcome::PartialSuccess { ref warnings }
+                if warnings == &vec!["Warning (SPECTRE-123): deprecated option".to_string()]
+        ));
+    }
+
+    #[test]
+    fn warning_extractor_ignores_zero_and_negated_summaries() {
+        let log = "0 warnings\nNo warnings were issued\nwarnings: 0\nWarning count: 0\nNumber of warnings: 0";
+        assert!(extract_warning_messages(log).is_empty());
+    }
+
+    #[test]
+    fn warning_extractor_keeps_real_warning_lines_and_positive_counts() {
+        let log = "Warning (SPECTRE-123): deprecated option\nwarnings: 2";
+        assert_eq!(
+            extract_warning_messages(log),
+            vec![
+                "Warning (SPECTRE-123): deprecated option".to_string(),
+                "warnings: 2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn classifier_treats_zero_warning_summary_as_clean_success() {
+        let outcome = SpectreOutcomeClassifier::new(true, "Simulation complete. Warnings: 0", true)
+            .classify();
+        assert_eq!(outcome, SpectreOutcome::Success);
+    }
+
+    #[test]
+    fn remote_op_only_output_is_usable_for_classification() {
+        let data = HashMap::new();
+        let operating_points = [("M0:gm".to_string(), crate::models::ScalarValue::Float(1e-3))]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        let outcome = classify_simulation_output(true, "", &data, &operating_points);
+        assert!(has_usable_output(&data, &operating_points));
+        assert_eq!(outcome, SpectreOutcome::Success);
+    }
+
+    #[test]
+    fn remote_sh_environment_quotes_shell_metacharacters() {
+        let simulator = SpectreSimulator {
+            cadence_cshrc: Some("/cadence/env setup;touch 'owned'.sh".to_string()),
+            ..test_simulator()
+        };
+        let command = simulator.remote_spectre_command("/tmp/run", false);
+        let tool_command = simulator
+            .remote_spectre_argv()
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let inner = format!(
+            ". {} && exec {tool_command}",
+            shell_quote(simulator.cadence_cshrc.as_deref().unwrap())
+        );
+        assert_eq!(
+            command,
+            format!(
+                "cd {} && sh -c {}",
+                shell_quote("/tmp/run"),
+                shell_quote(&inner)
+            )
+        );
+    }
+
+    #[test]
+    fn remote_spectre_command_quotes_directory_binary_format_and_each_argument() {
+        let remote_dir = "/tmp/run dir;touch 'dir-owned'";
+        let simulator = SpectreSimulator {
+            spectre_bin: Some("/cadence/bin/spectre;touch 'bin-owned'".to_string()),
+            output_format: "psf ascii;touch format-owned".to_string(),
+            spectre_args: vec![
+                "--label=space value".to_string(),
+                "; touch arg-owned".to_string(),
+                "quote'argument".to_string(),
+            ],
+            ..test_simulator()
+        };
+
+        let command = simulator.remote_spectre_command(remote_dir, false);
+        let expected_argv = simulator
+            .remote_spectre_argv()
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            command,
+            format!("cd {} && {expected_argv}", shell_quote(remote_dir))
+        );
+    }
+
+    #[test]
+    fn remote_spectre_command_quotes_csh_environment_before_wrapping() {
+        let simulator = SpectreSimulator {
+            cadence_cshrc: Some("/cadence/env setup;touch 'env-owned'.csh".to_string()),
+            ..test_simulator()
+        };
+
+        let command = simulator.remote_spectre_command("/tmp/run", false);
+        let tool_command = simulator
+            .remote_spectre_argv()
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let inner = format!(
+            "source {} && exec {tool_command}",
+            shell_quote(simulator.cadence_cshrc.as_deref().unwrap())
+        );
+        assert_eq!(
+            command,
+            format!(
+                "cd {} && csh -c {}",
+                shell_quote("/tmp/run"),
+                shell_quote(&inner)
+            )
+        );
+    }
+
+    #[test]
+    fn remote_cleanup_requires_full_success() {
+        assert!(should_cleanup_remote(&SpectreOutcome::Success, false));
+        assert!(!should_cleanup_remote(
+            &SpectreOutcome::PartialSuccess {
+                warnings: vec!["warning".to_string()]
+            },
+            false
+        ));
+        assert!(!should_cleanup_remote(
+            &SpectreOutcome::PartialFailure {
+                reason: "partial".to_string()
+            },
+            false
+        ));
+        assert!(!should_cleanup_remote(&SpectreOutcome::Success, true));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn timeout_termination_reaps_after_successful_kill() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .spawn()
+            .unwrap();
+        let status = terminate_timed_out_child(&mut child).unwrap();
+        assert!(!status.success());
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn timeout_termination_reports_kill_and_wait_state_when_kill_fails() {
+        let status = Command::new("true").status().unwrap();
+        let error =
+            describe_failed_kill(std::io::Error::other("permission denied"), Ok(Some(status)))
+                .to_string();
+        assert!(error.contains("kill failed"), "{error}");
+        assert!(error.contains("reaped"), "{error}");
+    }
+
+    #[test]
+    fn classifier_rejects_clean_exit_without_usable_data() {
+        assert!(matches!(
+            SpectreOutcomeClassifier::new(true, "Spectre completed", false).classify(),
+            SpectreOutcome::Failure { .. }
+        ));
+    }
+
+    #[test]
+    fn usable_output_includes_operating_point_only_results() {
+        let mut operating_points = HashMap::new();
+        assert!(!has_usable_output(&HashMap::new(), &operating_points));
+
+        operating_points.insert("M0:gm".to_string(), crate::models::ScalarValue::Float(1e-3));
+        assert!(has_usable_output(&HashMap::new(), &operating_points));
+    }
+
+    #[test]
+    fn parse_output_uses_non_sweep_psf_data_when_sweep_parse_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let psf_dir = temp.path().join("psf");
+        fs::create_dir(&psf_dir).unwrap();
+        fs::write(psf_dir.join("tran.tran"), "0\n1e-9\n").unwrap();
+
+        let (data, operating_points) = parse_simulation_output(temp.path(), false).unwrap();
+        assert_eq!(data.get("tran").unwrap(), &vec![0.0, 1e-9]);
+        assert!(operating_points.is_empty());
+    }
+
+    #[test]
+    fn parse_output_strict_true_propagates_malformed_psf_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let psf_dir = temp.path().join("psf");
+        fs::create_dir(&psf_dir).unwrap();
+        fs::write(psf_dir.join("bad.tran"), "1.0\nnot-a-number\n").unwrap();
+
+        let legacy = parse_simulation_output(temp.path(), false).unwrap();
+        let legacy_bad = legacy.0.get("bad").expect("legacy keeps the file stem");
+        assert_eq!(
+            legacy_bad.as_slice(),
+            &[1.0],
+            "legacy silently drops the bad line"
+        );
+
+        let err = parse_simulation_output(temp.path(), true).unwrap_err();
+        assert!(matches!(err, VirtuosoError::Execution(_)), "{err:?}");
+    }
+
+    #[test]
+    fn progress_follower_requires_explicit_stop_even_when_log_has_error_text() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        fs::write(log.path(), "ERROR (SFE-23): malformed instance").unwrap();
+        let mut follower = ProgressFollower::spawn(
+            Arc::new(crate::streaming::NullSink),
+            log.path().to_path_buf(),
+            "job".to_string(),
+        );
+
+        thread::sleep(Duration::from_millis(150));
+        assert!(!follower.handle.as_ref().unwrap().is_finished());
+        follower.stop_and_join();
+        assert!(follower.handle.is_none());
+    }
+
+    #[test]
+    fn combined_remote_log_includes_spectre_out_and_propagates_read_failure() {
+        let simulation = CommandResult {
+            success: true,
+            exit_status: 0,
+            stdout: "ssh stdout".to_string(),
+            stderr: "ssh stderr".to_string(),
+            duration: Duration::ZERO,
+        };
+        let log = CommandResult {
+            success: true,
+            exit_status: 0,
+            stdout: "ERROR (SFE-23): only in spectre.out".to_string(),
+            stderr: String::new(),
+            duration: Duration::ZERO,
+        };
+        assert!(combined_remote_log(&simulation, &log)
+            .unwrap()
+            .contains("ERROR (SFE-23)"));
+
+        let failed_log = CommandResult {
+            success: false,
+            exit_status: 1,
+            stdout: String::new(),
+            stderr: "cat: spectre.out: No such file".to_string(),
+            duration: Duration::ZERO,
+        };
+        assert!(matches!(
+            combined_remote_log(&simulation, &failed_log),
+            Err(VirtuosoError::Ssh(_))
+        ));
+    }
+
+    #[test]
+    fn missing_remote_raw_directory_is_not_a_transfer_error() {
+        let missing = CommandResult {
+            success: false,
+            exit_status: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration: Duration::ZERO,
+        };
+        assert!(!remote_directory_exists(&missing).unwrap());
+
+        let outcome = classify_simulation_output(
+            true,
+            "Simulation complete",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(matches!(outcome, SpectreOutcome::Failure { .. }));
+    }
+
+    #[test]
+    fn remote_raw_inspection_failure_is_propagated() {
+        let failed = CommandResult {
+            success: false,
+            exit_status: 255,
+            stdout: String::new(),
+            stderr: "connection lost".to_string(),
+            duration: Duration::ZERO,
+        };
+        assert!(matches!(
+            remote_directory_exists(&failed),
+            Err(VirtuosoError::Ssh(_))
+        ));
+    }
+
+    #[test]
+    fn parallel_job_panic_becomes_labeled_error_result() {
+        let result = catch_parallel_job("tt".to_string(), || -> Result<SimulationResult> {
+            panic!("worker exploded")
+        });
+        assert_eq!(result.label, "tt");
+        assert!(result
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("worker exploded"));
+    }
+
+    #[test]
+    fn parallel_chunk_panic_preserves_one_error_per_input() {
+        let labels = vec!["tt".to_string(), "ss".to_string(), "ff".to_string()];
+        let payload: Box<dyn std::any::Any + Send> = Box::new("chunk exploded");
+        let results = parallel_chunk_panic_results(&labels, payload.as_ref());
+        assert_eq!(results.len(), labels.len());
+        assert!(results.iter().zip(labels).all(|(result, label)| {
+            result.label == label
+                && result
+                    .result
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("chunk exploded")
+        }));
+    }
+
+    // === Completion detection tests ===
+
+    #[test]
+    fn test_is_simulation_complete_english() {
+        let content = "Simulation completed successfully";
+        assert!(is_simulation_complete(content));
+    }
+
+    #[test]
+    fn test_is_simulation_complete_chinese() {
+        let content = "仿真成就完成";
+        assert!(is_simulation_complete(content));
+    }
+
+    #[test]
+    fn test_is_simulation_complete_not_complete() {
+        let content = "Simulation running...\nTime: 1e-6 s";
+        assert!(!is_simulation_complete(content));
+    }
+
+    // === Progress parsing tests ===
+
+    #[test]
+    fn test_parse_time_value_simple() {
+        assert_eq!(parse_time_value("1.5"), Some(1.5));
+        assert_eq!(parse_time_value("0"), Some(0.0));
+    }
+
+    #[test]
+    fn test_parse_time_value_with_units() {
+        fn approx_eq(a: Option<f64>, b: f64) -> bool {
+            a.map(|v| (v - b).abs() < 1e-12).unwrap_or(false)
+        }
+        assert!(approx_eq(parse_time_value("1.5n"), 1.5e-9));
+        assert!(approx_eq(parse_time_value("100u"), 100e-6));
+        assert!(approx_eq(parse_time_value("2m"), 2e-3));
+        assert!(approx_eq(parse_time_value("3p"), 3e-12));
+        assert!(approx_eq(parse_time_value("1.5f"), 1.5e-15));
+    }
+
+    #[test]
+    fn test_parse_time_value_scientific() {
+        assert_eq!(parse_time_value("1e-9"), Some(1e-9));
+        assert_eq!(parse_time_value("1.5e-6"), Some(1.5e-6));
+    }
+
+    #[test]
+    fn test_parse_time_value_empty() {
+        assert_eq!(parse_time_value(""), Some(0.0));
+        assert_eq!(parse_time_value("   "), Some(0.0));
+    }
+
+    #[test]
+    fn test_parse_time_ratio() {
+        let msg = "t=1200u/3n";
+        let (current, total) = parse_time_ratio(msg).unwrap();
+        assert!((current - 1200e-6).abs() < 1e-12);
+        assert!((total - 3e-9).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_time_ratio_scientific() {
+        let msg = "t=1.2e-6/3e-6";
+        let (current, total) = parse_time_ratio(msg).unwrap();
+        assert!((current - 1.2e-6).abs() < 1e-12);
+        assert!((total - 3e-6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_time_ratio_no_slash() {
+        let msg = "t=1e-6";
+        assert!(parse_time_ratio(msg).is_none());
+    }
+
+    #[test]
+    fn test_parse_time_ratio_zero_total() {
+        let msg = "t=1u/0";
+        assert!(parse_time_ratio(msg).is_none());
+    }
+
+    #[test]
+    fn test_extract_percent() {
+        assert_eq!(extract_percent("Progress: 45%"), Some(45.0));
+        assert_eq!(extract_percent("Load: 100% complete"), Some(100.0));
+    }
+
+    #[test]
+    fn test_extract_percent_clamped() {
+        assert_eq!(extract_percent("Over: 150% done"), Some(100.0));
+        assert_eq!(extract_percent("Under: -10% done"), Some(10.0));
+    }
+
+    #[test]
+    fn test_extract_percent_no_percent() {
+        assert!(extract_percent("no percentage here").is_none());
+    }
+
+    #[test]
+    fn test_parse_spectre_progress_time_and_iteration() {
+        let log = r#"Simulation running...
+Time: 1.2e-6 s
+Iteration: 1234
+Loading..."#;
+        let result = parse_spectre_progress(log);
+        assert!(result.is_some());
+        let (percent, msg) = result.unwrap();
+        assert!(msg.contains("1.2e-6"));
+        assert!(msg.contains("1234"));
+        assert!((0.0..=100.0).contains(&percent));
+    }
+
+    #[test]
+    fn test_parse_spectre_progress_with_ratio() {
+        let log = r#"Time: t=500u/1m
+Iteration: 500"#;
+        let result = parse_spectre_progress(log);
+        assert!(result.is_some());
+        let (percent, _) = result.unwrap();
+        assert!((percent - 50.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_parse_spectre_progress_completed() {
+        let log = "Simulation completed successfully";
+        let result = parse_spectre_progress(log);
+        assert!(result.is_some());
+        let (percent, msg) = result.unwrap();
+        assert_eq!(percent, 100.0);
+        assert_eq!(msg, "completed");
+    }
+
+    #[test]
+    fn test_parse_spectre_progress_progress_keyword() {
+        let log = "Progress: 75%";
+        let result = parse_spectre_progress(log);
+        assert!(result.is_some());
+        let (percent, _) = result.unwrap();
+        assert_eq!(percent, 75.0);
+    }
+
+    #[test]
+    fn test_parse_spectre_progress_no_progress() {
+        let log = "Starting simulation...";
+        let result = parse_spectre_progress(log);
+        assert!(result.is_none());
+    }
+}

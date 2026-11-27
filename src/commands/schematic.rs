@@ -1,0 +1,590 @@
+use std::collections::HashMap;
+use std::fs;
+
+use crate::client::bridge::VirtuosoClient;
+use crate::client::editor::SchematicEditor;
+use crate::error::{Result, VirtuosoError};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tempfile;
+
+/// Cadence symbol orientation. Exactly the 8 values SKILL accepts.
+#[derive(Debug, Clone, Copy, Deserialize, clap::ValueEnum)]
+#[clap(rename_all = "verbatim")]
+pub enum Orient {
+    R0,
+    R90,
+    R180,
+    R270,
+    MX,
+    MY,
+    MXR90,
+    MYR90,
+}
+
+impl Orient {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::R0 => "R0",
+            Self::R90 => "R90",
+            Self::R180 => "R180",
+            Self::R270 => "R270",
+            Self::MX => "MX",
+            Self::MY => "MY",
+            Self::MXR90 => "MXR90",
+            Self::MYR90 => "MYR90",
+        }
+    }
+}
+
+// ── Atomic commands ─────────────────────────────────────────────────
+
+pub fn open(lib: &str, cell: &str, view: &str) -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client.schematic.open_cellview(lib, cell, view);
+    let r = client.execute_skill(&skill, None)?;
+    Ok(json!({
+        "status": if r.skill_ok() { "success" } else { "error" },
+        "lib": lib, "cell": cell, "view": view,
+        "output": r.output,
+    }))
+}
+
+pub fn place(
+    master: &str,
+    name: &str,
+    x: f64,
+    y: f64,
+    orient: Orient,
+    params: &[(String, String)],
+) -> Result<Value> {
+    let (lib, cell) = master
+        .split_once('/')
+        .ok_or_else(|| VirtuosoError::Config("--master must be lib/cell format".into()))?;
+    let client = VirtuosoClient::from_env()?;
+    let mut ed = SchematicEditor::new(&client);
+    ed.add_instance(lib, cell, "symbol", name, (x, y), orient.as_str());
+    for (k, v) in params {
+        ed.set_param(name, k, v);
+    }
+    let r = ed.execute()?;
+    Ok(json!({
+        "status": if r.skill_ok() { "success" } else { "error" },
+        "instance": name, "master": master,
+        "output": r.output,
+    }))
+}
+
+pub fn wire_from_strings(net: &str, points: &[String]) -> Result<Value> {
+    let pts: Vec<(f64, f64)> = points
+        .iter()
+        .map(|s| {
+            let (x, y) = s
+                .split_once(',')
+                .ok_or_else(|| VirtuosoError::Config(format!("Point '{s}' must be x,y")))?;
+            Ok((
+                x.parse()
+                    .map_err(|_| VirtuosoError::Config(format!("Bad x: {x}")))?,
+                y.parse()
+                    .map_err(|_| VirtuosoError::Config(format!("Bad y: {y}")))?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    wire(net, &pts)
+}
+
+pub fn wire(net: &str, points: &[(f64, f64)]) -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client.schematic.create_wire(points, net);
+    let r = client.execute_skill(&skill, None)?;
+    Ok(json!({
+        "status": if r.skill_ok() { "success" } else { "error" },
+        "net": net, "output": r.output,
+    }))
+}
+
+pub fn conn(net: &str, from: &str, to: &str) -> Result<Value> {
+    let (inst1, term1) = from
+        .split_once(':')
+        .ok_or_else(|| VirtuosoError::Config("--from must be inst:term format".into()))?;
+    let (inst2, term2) = to
+        .split_once(':')
+        .ok_or_else(|| VirtuosoError::Config("--to must be inst:term format".into()))?;
+    let client = VirtuosoClient::from_env()?;
+    let mut ed = SchematicEditor::new(&client);
+    ed.assign_net(inst1, term1, net);
+    ed.assign_net(inst2, term2, net);
+    let r = ed.execute()?;
+    Ok(json!({
+        "status": if r.skill_ok() { "success" } else { "error" },
+        "net": net, "from": from, "to": to,
+        "output": r.output,
+    }))
+}
+
+pub fn label(net: &str, x: f64, y: f64) -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client.schematic.create_wire_label(net, (x, y));
+    let r = client.execute_skill(&skill, None)?;
+    Ok(json!({
+        "status": if r.skill_ok() { "success" } else { "error" },
+        "net": net, "output": r.output,
+    }))
+}
+
+pub fn pin(
+    net: &str,
+    pin_type: &str,
+    x: f64,
+    y: f64,
+    orient: Option<&str>,
+    sigtype: Option<&str>,
+) -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client
+        .schematic
+        .create_pin(net, pin_type, (x, y), orient, sigtype)?;
+    let r = client.execute_skill(&skill, None)?;
+    Ok(json!({
+        "status": if r.skill_ok() { "success" } else { "error" },
+        "net": net, "type": pin_type,
+        "orient": orient.unwrap_or("R0"), "sigtype": sigtype,
+        "output": r.output,
+    }))
+}
+
+pub fn check() -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client.schematic.check();
+    let r = client.execute_skill(&skill, None)?;
+    Ok(json!({
+        "status": if r.skill_ok() { "success" } else { "error" },
+        "output": r.output,
+    }))
+}
+
+pub fn save() -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client.schematic.save();
+    let r = client.execute_skill(&skill, None)?;
+    Ok(json!({
+        "status": if r.skill_ok() { "success" } else { "error" },
+        "output": r.output,
+    }))
+}
+
+/// Create a short labeled net stub in a given direction.
+///
+/// direction: "right" | "left" | "up" | "down"
+/// length: stub length in grid units (default 0.5)
+/// cosmetic: "default" (0.0625, centerCenter) or "clean" (0.125, lowerCenter)
+pub fn net_stub(
+    net: &str,
+    x: f64,
+    y: f64,
+    direction: &str,
+    length: f64,
+    cosmetic: &str,
+) -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client
+        .schematic
+        .create_net_stub(net, x, y, direction, length, cosmetic);
+    let r = client.execute_skill_unchecked(&skill, None)?;
+    Ok(json!({
+        "status": if r.skill_ok() { "success" } else { "error" },
+        "net": net,
+        "direction": direction,
+        "origin": [x, y],
+        "output": r.output,
+        "errors": r.errors,
+    }))
+}
+
+/// Label an instance terminal (D/G/S/B) with a net name at the terminal's
+/// precise pin center.
+///
+/// `already` distinguishes "the stub was drawn just now" from "the stub was
+/// already there, labelled with this same net". Both are `success` — running a
+/// build recipe twice must not look like a failure — but the caller counting
+/// how much it changed needs to tell them apart. The SKILL marks the second
+/// case with a leading `already:`; a stub carrying a *different* net name is an
+/// error, not an `already`.
+///
+/// inst: "instance_name" (e.g. "M1")
+/// term: terminal name (e.g. "D", "G", "S", "B")
+/// net: net name to assign
+/// cosmetic: "default" or "clean"
+/// auto_rotate: infer label rotation from stub direction
+pub fn label_term(
+    inst: &str,
+    term: &str,
+    net: &str,
+    cosmetic: &str,
+    auto_rotate: bool,
+) -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client
+        .schematic
+        .label_instance_term(inst, term, net, cosmetic, auto_rotate);
+    let r = client.execute_skill_unchecked(&skill, None)?;
+    let ok = r.skill_ok();
+    Ok(json!({
+        "status": if ok { "success" } else { "error" },
+        "instance": inst,
+        "terminal": term,
+        "net": net,
+        "already": ok && r.output_unquoted().starts_with("already:"),
+        "output": r.output,
+        "errors": r.errors,
+    }))
+}
+
+// ── Build (batch from JSON spec) ────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SchematicSpec {
+    pub target: SpecTarget,
+    #[serde(default)]
+    pub instances: Vec<SpecInstance>,
+    #[serde(default)]
+    pub connections: Vec<SpecConnection>,
+    #[serde(default)]
+    pub globals: Vec<SpecGlobal>,
+    #[serde(default)]
+    pub pins: Vec<SpecPin>,
+}
+
+#[derive(Deserialize)]
+pub struct SpecTarget {
+    pub lib: String,
+    pub cell: String,
+    #[serde(default = "default_view")]
+    pub view: String,
+}
+
+fn default_view() -> String {
+    "schematic".into()
+}
+
+#[derive(Deserialize)]
+pub struct SpecInstance {
+    pub name: String,
+    pub master: String, // "lib/cell"
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    #[serde(default = "default_orient")]
+    pub orient: Orient,
+    #[serde(default)]
+    pub params: HashMap<String, String>,
+}
+
+fn default_orient() -> Orient {
+    Orient::R0
+}
+
+#[derive(Deserialize)]
+pub struct SpecConnection {
+    pub net: String,
+    pub from: String, // "inst:term"
+    pub to: String,
+}
+
+#[derive(Deserialize)]
+pub struct SpecGlobal {
+    pub net: String,
+    pub insts: Vec<String>, // ["M5:S", "M5:B"]
+}
+
+#[derive(Deserialize)]
+pub struct SpecPin {
+    pub net: String,
+    #[serde(rename = "type")]
+    pub pin_type: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub connect: Option<String>, // "M2:G"
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    /// Absent means R0, the same default the RPC and the CLI use.
+    #[serde(default)]
+    pub orient: Option<String>,
+    /// Absent means the argument is not passed at all, so the terminal
+    /// inherits a same-named wire's sigType — see `SchematicOps::create_pin`.
+    #[serde(default)]
+    pub sigtype: Option<String>,
+}
+
+pub fn build(spec_path: &str) -> Result<Value> {
+    let spec_str = fs::read_to_string(spec_path)
+        .map_err(|e| VirtuosoError::Config(format!("Cannot read spec file {spec_path}: {e}")))?;
+    let spec: SchematicSpec = serde_json::from_str(&spec_str)
+        .map_err(|e| VirtuosoError::Config(format!("Invalid spec JSON: {e}")))?;
+
+    let client = VirtuosoClient::from_env()?;
+
+    let open_skill =
+        client
+            .schematic
+            .open_cellview(&spec.target.lib, &spec.target.cell, &spec.target.view);
+    let r = client.execute_skill(&open_skill, None)?;
+    if !r.skill_ok() {
+        return Err(VirtuosoError::Execution(format!(
+            "Failed to open cellview: {}",
+            r.output
+        )));
+    }
+
+    let mut ed = SchematicEditor::new(&client);
+    for inst in &spec.instances {
+        let (lib, cell) = inst.master.split_once('/').ok_or_else(|| {
+            VirtuosoError::Config(format!(
+                "Instance {} master '{}' must be lib/cell",
+                inst.name, inst.master
+            ))
+        })?;
+        ed.add_instance(
+            lib,
+            cell,
+            "symbol",
+            &inst.name,
+            (inst.x, inst.y),
+            inst.orient.as_str(),
+        );
+        for (k, v) in &inst.params {
+            ed.set_param(&inst.name, k, v);
+        }
+    }
+    let r = ed.execute()?;
+    if !r.skill_ok() {
+        return Err(VirtuosoError::Execution(format!(
+            "Failed to place instances: {}",
+            r.output
+        )));
+    }
+
+    {
+        let mut assignments: Vec<(String, String, String)> = Vec::new();
+        for c in &spec.connections {
+            let (i1, t1) = c.from.split_once(':').ok_or_else(|| {
+                VirtuosoError::Config(format!("Bad from '{}' in connection", c.from))
+            })?;
+            let (i2, t2) = c
+                .to
+                .split_once(':')
+                .ok_or_else(|| VirtuosoError::Config(format!("Bad to '{}' in connection", c.to)))?;
+            assignments.push((i1.into(), t1.into(), c.net.clone()));
+            assignments.push((i2.into(), t2.into(), c.net.clone()));
+        }
+        for g in &spec.globals {
+            for inst_term in &g.insts {
+                let (inst, term) = inst_term.split_once(':').ok_or_else(|| {
+                    VirtuosoError::Config(format!("Bad global '{}' in {}", inst_term, g.net))
+                })?;
+                assignments.push((inst.into(), term.into(), g.net.clone()));
+            }
+        }
+
+        let helper_file = tempfile::Builder::new()
+            .prefix("rb_schematic_helper_")
+            .suffix(".il")
+            .tempfile()
+            .map_err(|e| VirtuosoError::Config(format!("Cannot create temp helper: {e}")))?;
+        let helper_path = helper_file.path();
+        fs::write(
+            helper_path,
+            include_str!("../../resources/rb_connect_terminal.il"),
+        )
+        .map_err(|e| VirtuosoError::Config(format!("Cannot write helper: {e}")))?;
+        let r = client.execute_skill(
+            &format!(r#"load("{path}")"#, path = helper_path.display()),
+            None,
+        )?;
+        if !r.skill_ok() {
+            return Err(VirtuosoError::Execution(format!(
+                "Failed to load connection helper: {}",
+                r.output
+            )));
+        }
+
+        let mut lines = vec!["let((cv)".to_string(), "cv = VC_SCH_CV".to_string()];
+        for (inst, term, net) in &assignments {
+            lines.push(format!(
+                r#"VC_connectTerminal(cv "{inst}" "{term}" "{net}")"#
+            ));
+        }
+        lines.push("t)".to_string());
+
+        let script_file = tempfile::Builder::new()
+            .prefix("rb_schematic_conn_")
+            .suffix(".il")
+            .tempfile()
+            .map_err(|e| VirtuosoError::Config(format!("Cannot create temp script: {e}")))?;
+        let script_path = script_file.path();
+        fs::write(script_path, lines.join("\n"))
+            .map_err(|e| VirtuosoError::Config(format!("Cannot write script: {e}")))?;
+        let r = client.execute_skill(
+            &format!(r#"load("{path}")"#, path = script_path.display()),
+            None,
+        )?;
+        if !r.skill_ok() {
+            return Err(VirtuosoError::Execution(format!(
+                "Failed to create connections: {}",
+                r.output
+            )));
+        }
+    }
+
+    if !spec.pins.is_empty() {
+        let mut ed = SchematicEditor::new(&client);
+        for p in &spec.pins {
+            ed.add_pin(
+                &p.net,
+                &p.pin_type,
+                (p.x, p.y),
+                p.orient.as_deref(),
+                p.sigtype.as_deref(),
+            )?;
+        }
+        let r = ed.execute()?;
+        if !r.skill_ok() {
+            return Err(VirtuosoError::Execution(format!(
+                "Failed to create pins: {}",
+                r.output
+            )));
+        }
+    }
+
+    let save_skill = client.schematic.save();
+    client.execute_skill(&save_skill, None)?;
+    let check_skill = client.schematic.check();
+    let r = client.execute_skill(&check_skill, None)?;
+
+    Ok(json!({
+        "status": "success",
+        "target": format!("{}/{}/{}", spec.target.lib, spec.target.cell, spec.target.view),
+        "instances": spec.instances.len(),
+        "connections": spec.connections.len() + spec.globals.len(),
+        "pins": spec.pins.len(),
+        "check": r.output,
+    }))
+}
+
+// ── Read commands ───────────────────────────────────────────────────
+
+/// Parse SKILL JSON output: bridge returns `"\"[...]\""`  — strip outer quotes, unescape inner.
+/// Returns `Err` if the output cannot be parsed as JSON after unescaping.
+pub fn parse_skill_json(output: &str) -> Result<Value> {
+    let s = output.trim_matches('"');
+    if let Ok(v) = serde_json::from_str(s) {
+        return Ok(v);
+    }
+    let unescaped = s.replace("\\\"", "\"").replace("\\\\", "\\");
+    serde_json::from_str(&unescaped).map_err(|e| {
+        VirtuosoError::Execution(format!(
+            "Failed to parse SKILL JSON output: {e}. Raw: {output}"
+        ))
+    })
+}
+
+pub fn list_instances() -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client.schematic.list_instances();
+    let r = client.execute_skill(&skill, Some(client.read_timeout()))?;
+    if !r.skill_ok() {
+        return Err(VirtuosoError::Execution(format!(
+            "Failed to list instances: {}",
+            r.output
+        )));
+    }
+    parse_skill_json(&r.output)
+}
+
+pub fn list_nets() -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client.schematic.list_nets();
+    let r = client.execute_skill(&skill, Some(client.read_timeout()))?;
+    if !r.skill_ok() {
+        return Err(VirtuosoError::Execution(format!(
+            "Failed to list nets: {}",
+            r.output
+        )));
+    }
+    parse_skill_json(&r.output)
+}
+
+pub fn list_pins() -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client.schematic.list_pins();
+    let r = client.execute_skill(&skill, Some(client.read_timeout()))?;
+    if !r.skill_ok() {
+        return Err(VirtuosoError::Execution(format!(
+            "Failed to list pins: {}",
+            r.output
+        )));
+    }
+    parse_skill_json(&r.output)
+}
+
+pub fn get_params(inst: &str) -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client.schematic.get_instance_params(inst);
+    let r = client.execute_skill(&skill, Some(client.read_timeout()))?;
+    if !r.skill_ok() {
+        return Err(VirtuosoError::Execution(format!(
+            "Failed to get params for '{}': {}",
+            inst, r.output
+        )));
+    }
+    Ok(json!({"instance": inst, "params": parse_skill_json(&r.output)?}))
+}
+
+/// Set one CDF parameter of a schematic instance.
+///
+/// Routes through the typed RPC dispatcher (`schematic.set_param`) rather than
+/// the raw-SKILL `execute_skill` path its read twin `get_params` uses. This
+/// keeps the CLI and the RPC method on **one route**: both go through the
+/// per-domain `permits_method` capability gate (Schematic, not Admin) and the
+/// audit log, so `vcli schematic set-param` works under the default,
+/// non-Admin capability set — the whole point of the typed surface.
+pub fn set_param(inst: &str, param: &str, value: &str) -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let request = crate::rpc::dispatcher::RpcRequest {
+        method: "schematic.set_param".into(),
+        params: json!({ "inst": inst, "param": param, "value": value }),
+        api_key: std::env::var("VCLI_API_KEY").ok().filter(|k| !k.is_empty()),
+    };
+    let ctx = crate::context::CommandContext::new(crate::config::Config::from_env()?, None)?;
+    crate::rpc::dispatcher::RpcDispatcher::new(ctx).dispatch(&client, request)
+}
+
+/// Polish net labels with cosmetic presets, auto-rotation, or offset repositioning.
+///
+/// preset: "readable" (fontSize 0.125, centerCenter) or "compact" (fontSize 0.0625, centerLeft)
+/// auto_rotate: infer rotation from wire direction
+/// offset: "small" (+5 DBU), "medium" (+10), "large" (+20)
+pub fn polish_label(
+    net: &str,
+    preset: &str,
+    auto_rotate: bool,
+    offset: Option<&str>,
+) -> Result<Value> {
+    let client = VirtuosoClient::from_env()?;
+    let skill = client
+        .schematic
+        .polish_labels(net, preset, auto_rotate, offset);
+    let r = client.execute_skill_unchecked(&skill, None)?;
+    let labels_updated = r.output_unquoted().parse::<usize>().unwrap_or(0);
+    Ok(json!({
+        "status": if r.skill_ok() { "success" } else { "error" },
+        "net": net,
+        "labels_updated": labels_updated,
+        "preset": preset,
+        "auto_rotate": auto_rotate,
+        "offset": offset,
+    }))
+}

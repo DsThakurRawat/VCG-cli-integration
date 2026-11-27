@@ -1,0 +1,598 @@
+use crate::client::bridge::VirtuosoClient;
+use crate::config::Config;
+use crate::error::{Result, VirtuosoError};
+use crate::models::SessionInfo;
+use crate::skill_finder::{SKILLFinder, SearchMode};
+use serde_json::{json, Value};
+use std::io::Read;
+use std::path::Path;
+
+/// Resolve the SKILL text for `skill exec`.
+///
+/// Exactly one source: a positional expression, `-` (read `stdin`), or `file`.
+/// `-` and `--file` keep inner double quotes that PowerShell 5.x strips from
+/// native-exe arguments.
+pub(crate) fn resolve_skill_exec_code(
+    code: Option<&str>,
+    file: Option<&Path>,
+    stdin: &mut dyn Read,
+) -> Result<String> {
+    match (code, file) {
+        (Some(_), Some(_)) => Err(VirtuosoError::Config(
+            "pass SKILL via an argument, `-`, or --file, not more than one".into(),
+        )),
+        (None, None) => Err(VirtuosoError::Config(
+            "no SKILL expression provided; pass code, `-` for stdin, or --file <path>".into(),
+        )),
+        (Some("-"), None) => read_skill_text(stdin),
+        (Some(code), None) => nonempty_skill(code),
+        (None, Some(path)) => {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                VirtuosoError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to read SKILL file {}: {e}", path.display()),
+                ))
+            })?;
+            nonempty_skill(&text)
+        }
+    }
+}
+
+fn read_skill_text(stdin: &mut dyn Read) -> Result<String> {
+    let mut text = String::new();
+    stdin.read_to_string(&mut text)?;
+    nonempty_skill(&text)
+}
+
+fn nonempty_skill(text: &str) -> Result<String> {
+    if text.trim().is_empty() {
+        Err(VirtuosoError::Config("empty SKILL expression".into()))
+    } else {
+        Ok(text.to_string())
+    }
+}
+
+pub fn exec(
+    ctx: &crate::context::CommandContext,
+    code: Option<&str>,
+    file: Option<&Path>,
+    timeout: u64,
+    readonly: bool,
+) -> Result<Value> {
+    let code = resolve_skill_exec_code(code, file, &mut std::io::stdin())?;
+    let mut client = VirtuosoClient::from_context(ctx)?;
+    if readonly {
+        client = client.with_sandbox_mode();
+    }
+    let result = client.execute_skill(&code, Some(timeout))?;
+
+    Ok(json!({
+        "status": if result.ok() { "success" } else { "error" },
+        "output": result.output,
+        "errors": result.errors,
+        "warnings": result.warnings,
+        "execution_time": result.execution_time,
+    }))
+}
+
+/// Run `code` concurrently against every live local session.
+/// Each session gets its own TCP connection in a scoped thread.
+/// Returns per-session results; exit is non-zero only when every session fails.
+pub fn broadcast(code: &str, timeout: u64) -> Result<Value> {
+    let sessions = SessionInfo::list_alive();
+    if sessions.is_empty() {
+        return Err(VirtuosoError::NotFound("no live sessions found".into()));
+    }
+
+    let results: Vec<(usize, Value)> = std::thread::scope(|s| {
+        let handles: Vec<_> = sessions
+            .iter()
+            .enumerate()
+            .map(|(idx, session)| {
+                let id = session.id.clone();
+                let port = session.port;
+                s.spawn(move || {
+                    let client = VirtuosoClient::new("127.0.0.1", port, timeout);
+                    match client.execute_skill(code, Some(timeout)) {
+                        Ok(r) => (
+                            idx,
+                            json!({
+                                "session": id,
+                                "ok": r.skill_ok(),
+                                "output": r.output,
+                            }),
+                        ),
+                        Err(e) => (
+                            idx,
+                            json!({
+                                "session": id,
+                                "ok": false,
+                                "error": e.to_string(),
+                            }),
+                        ),
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| (0, json!({"ok": false, "error": "thread panicked"})))
+            })
+            .collect()
+    });
+
+    let mut results: Vec<Value> = results.into_iter().map(|(_, v)| v).collect();
+    results.sort_by(|a, b| {
+        let idx_a = sessions
+            .iter()
+            .position(|s| s.id == a["session"].as_str().unwrap_or(""))
+            .unwrap_or(0);
+        let idx_b = sessions
+            .iter()
+            .position(|s| s.id == b["session"].as_str().unwrap_or(""))
+            .unwrap_or(0);
+        idx_a.cmp(&idx_b)
+    });
+
+    let n_ok = results
+        .iter()
+        .filter(|r| r["ok"].as_bool().unwrap_or(false))
+        .count();
+    let status = if n_ok == results.len() {
+        "success"
+    } else if n_ok == 0 {
+        "error"
+    } else {
+        "partial"
+    };
+
+    if n_ok == 0 {
+        return Err(VirtuosoError::Execution(format!(
+            "broadcast failed on all {} sessions",
+            results.len()
+        )));
+    }
+
+    Ok(json!({
+        "status": status,
+        "sessions": results.len(),
+        "ok": n_ok,
+        "results": results,
+    }))
+}
+
+pub fn load(ctx: &crate::context::CommandContext, file: &str, skillpp: bool) -> Result<Value> {
+    let client = VirtuosoClient::from_context(ctx)?;
+
+    let result = client.load_il(file, skillpp)?;
+    let skillpp_mode = result.metadata.contains_key("skillpp_mode");
+
+    Ok(json!({
+        "status": "success",
+        "file": file,
+        "loaded_path": result.metadata.get("loaded_path"),
+        "skillpp_mode": skillpp_mode,
+        "output": result.output,
+        "errors": result.errors,
+    }))
+}
+
+/// Execute inline SKILL expressions — companion to `load` for one-liners.
+///
+/// Wraps input in `progn(\n<user>\n)` to:
+/// - Enable multi-statement execution without wrapping in progn yourself
+/// - Prevent trailing `; comment` from swallowing the closing paren
+///
+/// Supports two input modes:
+/// - `code` provided directly: single expression or multi-line block
+/// - `stdin == true`: read from stdin (avoids shell quoting pain)
+pub fn eval(
+    ctx: &crate::context::CommandContext,
+    code: Option<String>,
+    stdin: bool,
+) -> Result<Value> {
+    use std::io::Read;
+
+    if stdin && code.is_some() {
+        return Err(VirtuosoError::Config(
+            "pass SKILL via argument OR --stdin, not both".into(),
+        ));
+    }
+
+    let skill = if stdin {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|e| VirtuosoError::Io(std::io::Error::other(e)))?;
+        if input.trim().is_empty() {
+            return Err(VirtuosoError::Config(
+                "empty SKILL expression from stdin".into(),
+            ));
+        }
+        input
+    } else {
+        let c = code.ok_or_else(|| VirtuosoError::Config("no SKILL expression provided".into()))?;
+        if c.trim().is_empty() {
+            return Err(VirtuosoError::Config("empty SKILL expression".into()));
+        }
+        c
+    };
+
+    let wrapped = format!("progn(\n{}\n)", skill);
+
+    let client = VirtuosoClient::from_context(ctx)?;
+    let result = client.execute_skill(&wrapped, None)?;
+
+    Ok(json!({
+        "status": if result.ok() { "success" } else { "error" },
+        "output": result.output,
+        "errors": result.errors,
+        "warnings": result.warnings,
+        "execution_time": result.execution_time,
+    }))
+}
+
+/// Load the SKILL Finder databases for the configured host.
+///
+/// Shared by [`find`] and [`info`] so both answer from exactly the same
+/// source — when they disagreed, `info` was the one that lied.
+fn load_finder(cfg: &Config, refresh: bool) -> Result<SKILLFinder> {
+    let mut finder = SKILLFinder::new();
+
+    if cfg.is_remote() {
+        crate::transport::backend::require_openssh(cfg)?;
+        let host = cfg.remote_host.clone().unwrap_or_default();
+        let target = cfg.ssh_target();
+        let ssh_key = cfg.ssh_key.as_deref();
+        let cshrc = cfg.cadence_cshrc.as_deref();
+
+        if refresh {
+            let _ = crate::skill_finder::clear_cache(&host);
+        }
+
+        let _ = crate::skill_finder::load_or_sync(&mut finder, &host, &target, ssh_key, cshrc)?;
+    } else {
+        if let Some(dir) = find_skill_finder_dir(cfg)? {
+            finder.load(&dir).map_err(|e| {
+                VirtuosoError::Config(format!("failed to load SKILL Finder: {}", e))
+            })?;
+        }
+    }
+
+    Ok(finder)
+}
+
+/// Search SKILL function names using the Cadence SKILL Finder database.
+///
+/// Requires VB_SPECTRE_DIR or VB_CADENCE_CSHRC to locate the Cadence installation,
+/// or VB_SKILL_FINDER_DIR to specify the path directly.
+///
+/// # Arguments
+///
+/// * `query` - Search string
+/// * `mode` - Search mode: fuzzy (default), prefix, suffix, exact, regex
+/// * `limit` - Maximum results (default: 50)
+/// * `refresh` - Force a fresh cache sync (remote mode only)
+/// * `include_desc` - When `true`, also match against the description field,
+///   not just the function name. Useful for "what function does X" queries.
+pub fn find(
+    ctx: &crate::context::CommandContext,
+    query: &str,
+    mode: &str,
+    limit: usize,
+    refresh: bool,
+    include_desc: bool,
+) -> Result<Value> {
+    let search_mode: SearchMode = mode.parse().unwrap_or(SearchMode::Fuzzy);
+    let finder = load_finder(ctx.config(), refresh)?;
+
+    let results: Vec<_> = finder
+        .search(query, search_mode, limit, include_desc)
+        .into_iter()
+        .map(|e| {
+            json!({
+                "name": e.name,
+                "syntax": e.syntax,
+                "description": e.description,
+                "source": e.source_file
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "query": query,
+        "mode": search_mode.to_string(),
+        "include_desc": include_desc,
+        "count": results.len(),
+        "entries": results,
+    }))
+}
+
+/// Get the documented signature and description for a specific SKILL function.
+///
+/// Answers from the local SKILL Finder `.fnd` databases — no Virtuoso, no
+/// Admin capability, works offline.
+///
+/// It used to call `mfGetMoreInfo` on the live bridge instead, which was wrong
+/// in three compounding ways:
+///
+/// 1. `mfGetMoreInfo` **does not exist on IC23.1** (`getd` → nil), and the call
+///    sat inside `when(boundp('mfGetMoreInfo) …)` — so it quietly evaluated to
+///    nil for *every* input.
+/// 2. That nil was reported as `{"found": false}` — i.e. *"no such function"*.
+///    The tool was reporting its own breakage as a fact about the caller's
+///    query. That is the one lie that sends you back to guessing, which is
+///    precisely what looking things up exists to prevent.
+/// 3. Reaching the bridge at all required raw-SKILL (Admin) access, so the
+///    manual was unreadable to a plain design token.
+///
+/// If a future IC release ships `mfGetMoreInfo`, enrich from it — but keep the
+/// `.fnd` answer as the floor, and never again report a missing documentation
+/// *system* as a missing *function*.
+pub fn info(ctx: &crate::context::CommandContext, func_name: &str) -> Result<Value> {
+    if func_name.is_empty() {
+        return Err(VirtuosoError::Config("function name is required".into()));
+    }
+
+    let finder = load_finder(ctx.config(), false)?;
+
+    if let Some(e) = finder
+        .search(func_name, SearchMode::Exact, 1, false)
+        .into_iter()
+        .next()
+    {
+        return Ok(json!({
+            "func_name": func_name,
+            "found": true,
+            "name": e.name,
+            "syntax": e.syntax,
+            "description": e.description,
+            "source": e.source_file,
+        }));
+    }
+
+    let suggestions: Vec<_> = finder
+        .search(func_name, SearchMode::Fuzzy, 10, false)
+        .into_iter()
+        .map(|e| e.name.clone())
+        .collect();
+
+    Ok(json!({
+        "func_name": func_name,
+        "found": false,
+        "reason": "no entry in the SKILL Finder databases",
+        "entries_loaded": finder.len(),
+        "suggestions": suggestions,
+        "hint": "On IC23.1 an undocumented function is almost always an undefined \
+                 one. Confirm with getd('<fn>) before calling it.",
+    }))
+}
+
+/// Find the SKILL Finder directory from config.
+///
+/// Priority:
+/// 1. `VB_SKILL_FINDER_DIR` env var
+/// 2. Discover from the local Cadence installation (`virtuoso`, then `spectre`)
+/// 3. Discover on the remote host over SSH (via `VB_CADENCE_CSHRC`)
+fn find_skill_finder_dir(cfg: &Config) -> Result<Option<std::path::PathBuf>> {
+    if let Ok(dir) = std::env::var("VB_SKILL_FINDER_DIR") {
+        if !dir.is_empty() && std::path::Path::new(&dir).exists() {
+            tracing::debug!("Using VB_SKILL_FINDER_DIR: {}", dir);
+            return Ok(Some(std::path::PathBuf::from(dir)));
+        }
+    }
+
+    if !cfg.is_remote() {
+        for bin in ["virtuoso", "spectre"] {
+            let Ok(out) = std::process::Command::new("command")
+                .args(["-v", bin])
+                .output()
+                .or_else(|_| std::process::Command::new("which").arg(bin).output())
+            else {
+                continue;
+            };
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if path.is_empty() || path == bin {
+                continue;
+            }
+            let mut cur = std::path::Path::new(&path).parent();
+            while let Some(dir) = cur {
+                let finder_dir = dir.join("doc/finder/SKILL");
+                if finder_dir.exists() {
+                    tracing::debug!("Found SKILL Finder at: {}", finder_dir.display());
+                    return Ok(Some(finder_dir));
+                }
+                cur = dir.parent();
+            }
+        }
+    }
+
+    if cfg.is_remote() {
+        if let Some(ref cshrc) = cfg.cadence_cshrc {
+            if let Ok(Some(path)) =
+                discover_skill_finder_remote(&cfg.ssh_target(), cfg.ssh_key.as_deref(), cshrc)
+            {
+                tracing::debug!("Discovered SKILL Finder on remote: {}", path.display());
+                return Ok(Some(path));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Discover SKILL Finder directory on a remote server via SSH.
+///
+/// Probes `virtuoso` **and** `spectre` and returns the most relevant hit (the
+/// DFII tree wins). Probing only `spectre` lands on a Spectre-only install
+/// that ships 2 `.fnd` files instead of the 39 in the Virtuoso tree.
+fn discover_skill_finder_remote(
+    target: &str,
+    ssh_key: Option<&str>,
+    cadence_cshrc: &str,
+) -> std::result::Result<Option<std::path::PathBuf>, String> {
+    let script = crate::skill_finder::remote_finder_probe_script(Some(cadence_cshrc));
+
+    let output = crate::transport::ssh::doc_transfer_command("ssh", ssh_key)
+        .arg(target)
+        .arg(&script)
+        .output()
+        .map_err(|e| format!("SSH failed: {}", e))?;
+
+    let dirs = crate::skill_finder::parse_finder_dirs(&String::from_utf8_lossy(&output.stdout));
+
+    Ok(dirs.into_iter().next().map(std::path::PathBuf::from))
+}
+
+/// Sync SKILL Finder cache from remote server.
+pub fn sync_cache(
+    ctx: &crate::context::CommandContext,
+    host: Option<&str>,
+    cshrc: Option<&str>,
+    verbose: bool,
+) -> Result<Value> {
+    let cfg = ctx.config();
+    crate::transport::backend::require_openssh(cfg)?;
+    let target_host = host
+        .map(String::from)
+        .or(cfg.remote_host.clone())
+        .ok_or_else(|| VirtuosoError::Config("Remote host required for sync".into()))?;
+
+    let target = cfg.ssh_target();
+    let ssh_key = cfg.ssh_key.clone();
+    let ssh_key_ref = ssh_key.as_deref();
+    let target_cshrc = cshrc.map(String::from).or(cfg.cadence_cshrc.clone());
+    let target_cshrc_ref = target_cshrc.as_deref();
+
+    let old_count = crate::skill_finder::cache_file_count(&target_host);
+
+    let new_count = if verbose {
+        fn print_progress(msg: &str) {
+            eprintln!("{}", msg);
+        }
+        crate::skill_finder::sync_from_remote(
+            &target_host,
+            &target,
+            ssh_key_ref,
+            target_cshrc_ref,
+            Some(print_progress),
+        )
+        .map_err(|e| VirtuosoError::Config(e.to_string()))?
+    } else {
+        fn noop(_: &str) {}
+        crate::skill_finder::sync_from_remote(
+            &target_host,
+            &target,
+            ssh_key_ref,
+            target_cshrc_ref,
+            Some(noop),
+        )
+        .map_err(|e| VirtuosoError::Config(e.to_string()))?
+    };
+
+    let cache_path = crate::skill_finder::cache_dir(&target_host)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    Ok(json!({
+        "host": target_host,
+        "cache_path": cache_path,
+        "old_file_count": old_count,
+        "new_file_count": new_count,
+        "synced": new_count > 0,
+    }))
+}
+
+/// Show or clear SKILL Finder cache.
+pub fn show_cache(
+    ctx: &crate::context::CommandContext,
+    host: Option<&str>,
+    clear: bool,
+) -> Result<Value> {
+    let cfg = ctx.config();
+    let target_host = host
+        .map(String::from)
+        .or(cfg.remote_host.clone())
+        .unwrap_or_else(|| "default".to_string());
+
+    if clear {
+        crate::skill_finder::clear_cache(&target_host)
+            .map_err(|e| VirtuosoError::Config(e.to_string()))?;
+        return Ok(json!({
+            "host": target_host,
+            "cleared": true,
+            "message": format!("Cache cleared for {}", target_host),
+        }));
+    }
+
+    if let Some(info) = crate::skill_finder::cache_info(&target_host) {
+        Ok(json!({
+            "host": target_host,
+            "exists": true,
+            "path": info.path.to_string_lossy(),
+            "file_count": info.file_count,
+            "modified": info.modified.map(|t| {
+                chrono::DateTime::<chrono::Utc>::from(t)
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string()
+            }),
+        }))
+    } else {
+        Ok(json!({
+            "host": target_host,
+            "exists": false,
+            "message": format!("No cache found for {}. Use 'vcli skill sync' to download.", target_host),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn positional_code_is_returned_unchanged() {
+        let mut input = Cursor::new(b"");
+        let got = resolve_skill_exec_code(Some("1+1"), None, &mut input).unwrap();
+        assert_eq!(got, "1+1");
+    }
+
+    #[test]
+    fn dash_reads_stdin_and_keeps_inner_quotes() {
+        let raw = r#"getShellEnvVar("USER")"#;
+        let mut input = Cursor::new(raw.as_bytes());
+        let got = resolve_skill_exec_code(Some("-"), None, &mut input).unwrap();
+        assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn file_reads_skill_and_keeps_inner_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expr.il");
+        let raw = r#"getShellEnvVar("USER")"#;
+        std::fs::write(&path, raw).unwrap();
+        let mut input = Cursor::new(b"");
+        let got = resolve_skill_exec_code(None, Some(&path), &mut input).unwrap();
+        assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn rejects_code_and_file_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expr.il");
+        std::fs::write(&path, "1+1").unwrap();
+        let mut input = Cursor::new(b"");
+        let result = resolve_skill_exec_code(Some("1+1"), Some(&path), &mut input);
+        assert!(matches!(result, Err(VirtuosoError::Config(_))));
+    }
+
+    #[test]
+    fn rejects_empty_stdin() {
+        let mut input = Cursor::new(b"   \n");
+        let result = resolve_skill_exec_code(Some("-"), None, &mut input);
+        assert!(matches!(result, Err(VirtuosoError::Config(_))));
+    }
+}

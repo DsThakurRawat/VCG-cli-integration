@@ -1,0 +1,1732 @@
+use crate::client::bridge::escape_skill_string;
+use crate::version::VirtuosoVersion;
+
+/// Parameters for `MaestroOps::export_waveform`.
+///
+/// Bundles the seven caller-supplied strings/integers so the
+/// constructor signature stays inside clippy's argument-count
+/// budget (see `LayoutOps::xstream_out` for the same pattern).
+pub struct ExportWaveformRequest<'a> {
+    pub session: &'a str,
+    pub expression: &'a str,
+    pub analysis: &'a str,
+    /// One of "scientific", "engineering", "automatic".
+    pub number_notation: &'a str,
+    /// `1..=16`.
+    pub precision: u8,
+    /// `>= 4`.
+    pub width: u8,
+    pub output_path: &'a str,
+}
+
+pub struct MaestroOps;
+
+/// SKILL that binds `tn` to the test an Assembler call must act on.
+///
+/// Expects `tests` and `tn` to be declared in the enclosing `let`.
+///
+/// `maeGetSetup(?session s)` returns the session's **test names** — that is its
+/// documented default (`?typeName "tests"`, IC23.1 ADE SKILL Reference), and
+/// `maeSetAnalysis`/`maeGetEnabledAnalysis` take a test name as their first
+/// positional argument. Taking `car()` of that list is a guess that happens to
+/// be right while a session holds one test. So:
+///
+/// - `test` given → use it, but check membership first, because
+///   `maeSetAnalysis` on an unknown test just returns `nil` with no hint of
+///   which name it did not recognise.
+/// - `test` omitted and the session holds exactly one → use that one.
+/// - `test` omitted and the session holds several → **error naming them**,
+///   rather than silently configuring whichever test happens to be first.
+fn test_binding(session: &str, test: Option<&str>, caller: &str) -> String {
+    let session = escape_skill_string(session);
+    let caller = escape_skill_string(caller);
+    let resolve = match test {
+        Some(t) => {
+            let t = escape_skill_string(t);
+            format!(
+                r#"tn = "{t}" unless(member(tn tests) error("{caller}: session \"{session}\" has no test named \"{t}\" — it has %L" tests))"#
+            )
+        }
+        None => format!(
+            r#"tn = cond((null(tests) error("{caller}: session \"{session}\" has no tests")) (cdr(tests) error("{caller}: session \"{session}\" has %d tests %L — pass \"test\" to say which one" length(tests) tests)) (t car(tests)))"#
+        ),
+    };
+    format!(r#"tests = maeGetSetup(?session "{session}") {resolve}"#)
+}
+
+impl MaestroOps {
+    /// Opens a maestro setup, returning a session handle like `"fnxSession4"`.
+    ///
+    /// `mode` is the difference between a session a human can work around and
+    /// one that locks them out, so it is passed explicitly rather than left to
+    /// `maeOpenSetup`'s own default:
+    ///
+    /// - `"r"` — read mode. **Takes no edit lock**: no `maestro.sdb.cdslck`
+    ///   appears next to the setup, so the cellview stays openable for edit in
+    ///   the GUI. The setup is still fully readable — `maeGetSetup` and the
+    ///   rest of the query API work normally.
+    /// - `"a"` — append mode, and `maeOpenSetup`'s default. Editable, and
+    ///   **takes the edit lock**. A SKILL-opened session has no window (Cadence
+    ///   documents this as the "non-GUI mode" and ships no API to attach one),
+    ///   so a human then finds the cell unopenable with nothing anywhere to
+    ///   click — EXPLORER-1642. `maeCloseSession` is the only way out.
+    ///
+    /// So callers open `"r"` and use [`Self::set_session_mode`] to hold `"a"`
+    /// across the writes alone. Measured on IC23.1 2026-09-09 by watching the
+    /// lock file appear and disappear.
+    ///
+    /// One asymmetry to pass on to the user: `maeOpenSetup` *creates* the
+    /// cellview when it does not exist, and per Cadence "you cannot create a
+    /// new view in read mode". Opening a setup that does not exist yet
+    /// therefore needs `"a"`, and returns nil in `"r"`.
+    pub fn open_session(&self, lib: &str, cell: &str, view: &str, mode: &str) -> String {
+        let lib = escape_skill_string(lib);
+        let cell = escape_skill_string(cell);
+        let view = escape_skill_string(view);
+        let mode = escape_skill_string(mode);
+        format!(r#"maeOpenSetup("{lib}" "{cell}" "{view}" ?mode "{mode}")"#)
+    }
+
+    /// Switches an already-open session between editable and read-only.
+    ///
+    /// This is what makes a read-only default cost nothing: `maeMakeEditable`
+    /// takes the edit lock and `maeMakeReadonly` hands it back, both in place
+    /// with no reopen, so the window during which a human is locked out shrinks
+    /// to the writes themselves. Verified in both directions against the lock
+    /// file on IC23.1 2026-09-09.
+    pub fn set_session_mode(&self, session: &str, editable: bool) -> String {
+        let session = escape_skill_string(session);
+        if editable {
+            format!(r#"maeMakeEditable(?session "{session}")"#)
+        } else {
+            format!(r#"maeMakeReadonly(?session "{session}")"#)
+        }
+    }
+
+    /// Force-closes the session, cancels any in-flight simulation.
+    ///
+    /// `maeCloseSession` takes the session as the `?session` keyword, not
+    /// positionally — IC23.1 rejects the positional form with
+    /// "extra arguments or keyword missing".
+    pub fn close_session(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        format!(r#"maeCloseSession(?session "{session}" ?forceClose t)"#)
+    }
+
+    pub fn list_sessions(&self) -> String {
+        skill_strings_to_json("maeGetSessions()")
+    }
+
+    /// List the test names in a Maestro session.
+    ///
+    /// `maeGetSetup(?session s)` called *without* `?typeName` returns the
+    /// test-name list, e.g. `("tb_cmp_SA")`. Every output-related API
+    /// (`get_outputs`, `add_output`, `get_spec_status`, `export`,
+    /// `create_corner_netlist`) is keyed by that name, so without this the
+    /// caller has to guess it.
+    pub fn list_tests(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        skill_strings_to_json(&format!(r#"maeGetSetup(?session "{session}")"#))
+    }
+
+    /// Set a design variable value.
+    /// maeSetVar(name value) — no session arg (IC23/IC25 compatible).
+    pub fn set_var(&self, name: &str, value: &str) -> String {
+        let name = escape_skill_string(name);
+        let value = escape_skill_string(value);
+        format!(r#"maeSetVar("{name}" "{value}")"#)
+    }
+
+    pub fn get_var(&self, name: &str) -> String {
+        let name = escape_skill_string(name);
+        format!(r#"maeGetVar("{name}")"#)
+    }
+
+    /// List all Assembler-global design variables. Returns JSON via sprintf.
+    ///
+    /// Scope note: `set_var`/`get_var` write and read the *Assembler-global*
+    /// (Maestro-internal) varList — `maeSetVar`/`maeGetVar`. A readback in
+    /// that scope does NOT prove what the netlist contains: the variable the
+    /// simulator consumes lives in the asi design-var list
+    /// (`asiSetDesignVarList`), which is flushed into the netlist at run
+    /// setup. So a `set_var` that is followed by a matching `get_var` is not
+    /// evidence that a run used the new value — the generated netlist is the
+    /// ground truth (the `parameters` line of `input.scs`).
+    ///
+    /// This method used to read `asiGetDesignVarList`, the *per-test /
+    /// Explorer* scope — a different table that does not mirror the global one,
+    /// so variables written over RPC always read back as absent. That is why
+    /// the READ side stays on `maeGetVar`.
+    ///
+    /// IC23.1 has no `mae*` enumerator (`maeGetVarList` / `maeGetVars` /
+    /// `maeGetAllVars` / `maeGetVarNames` / `maeListVars` /
+    /// `maeGetDesignVarList` / `maeGetVarValue` are all unbound). The names come
+    /// from `maeGetSetup(?session s ?typeName "variables")` — note the spelling:
+    /// `"vars"` and `"var"` both return nil. Values then come from
+    /// `maeGetVar(name)` one at a time.
+    pub fn list_vars(&self) -> String {
+        r#"let((s names out sep raw val) s = car(maeGetSessions()) names = maeGetSetup(?session s ?typeName "variables") out = "[" sep = "" foreach(n names raw = maeGetVar(n) val = if(stringp(raw) then raw else if(raw then sprintf(nil "%L" raw) else "")) val = buildString(parseString(val "\"") "\\\"") out = strcat(out sep sprintf(nil "{\"name\":\"%s\",\"value\":\"%s\"}" n val)) sep = ",") strcat(out "]"))"#.into()
+    }
+
+    /// Delete an Assembler-global design variable.
+    /// Mirrors `maeSetVar(name value)` — positional, no session argument.
+    pub fn delete_var(&self, name: &str) -> String {
+        let name = escape_skill_string(name);
+        format!(r#"maeDeleteVar("{name}")"#)
+    }
+
+    /// Delete an output from a test's setup.
+    /// Mirrors `maeAddOutput(name test ?expr ...)` — positional name + test.
+    pub fn delete_output(&self, output_name: &str, test_name: &str) -> String {
+        let output_name = escape_skill_string(output_name);
+        let test_name = escape_skill_string(test_name);
+        format!(r#"maeDeleteOutput("{output_name}" "{test_name}")"#)
+    }
+
+    /// Disable/remove an analysis from the current test.
+    ///
+    /// There is no `maeDeleteAnalysis` on IC23.1 (probed unbound, as is
+    /// `maeRemoveAnalysis`); only the ADE-level `asiDeleteAnalysis` exists, so
+    /// this one call is session-scoped rather than Assembler-scoped.
+    ///
+    /// Two IC23.1 quirks force the shape of this call:
+    /// 1. The analysis name must be a **symbol**, not a string — passing `"ac"`
+    ///    fails in `asiiDeleteObject` with "argument #1 should be a symbol".
+    /// 2. Even on success, `asiDeleteAnalysis` throws a trailing
+    ///    `*Error* eraseObject: no applicable method for the class list()`.
+    ///    The analysis really is gone, so a plain error check would report a
+    ///    successful delete as a failure. Hence: swallow the throw with
+    ///    `errset`, then decide the outcome by *re-reading the enabled list*.
+    ///
+    /// Returns the string `"t"` when the analysis is absent afterwards.
+    pub fn delete_analysis(&self, analysis: &str) -> String {
+        let analysis = escape_skill_string(analysis);
+        format!(
+            r#"let((r lst) errset(asiDeleteAnalysis(asiGetCurrentSession() stringToSymbol("{analysis}"))) r = errset(maeGetEnabledAnalysis(car(maeGetSetup()))) lst = if(r car(r) nil) if(exists(a lst equal(a "{analysis}")) "nil" "t"))"#
+        )
+    }
+
+    /// Get enabled analyses — IC23/IC25 均用 positional (testName)。
+    ///
+    /// 实测（IC25.1 ISR7）：`maeGetEnabledAnalysis(?session ...)` 报错，
+    /// 必须 positional 传入测试名。
+    pub fn get_analyses(
+        &self,
+        session: &str,
+        test: Option<&str>,
+        _version: VirtuosoVersion,
+    ) -> String {
+        let bind = test_binding(session, test, "maestro.get_analyses");
+        format!(r#"let((tests tn) {bind} maeGetEnabledAnalysis(tn))"#)
+    }
+
+    /// Enable an analysis type — version-aware.
+    ///
+    /// `maeSetAnalysis`'s first positional argument is **`t_testName`**
+    /// (IC23.1 ADE SKILL Reference), and `maeGetSetup(?session s)` returns the
+    /// session's **test names**. The previous version passed
+    /// `car(maeGetSetup(...))` and called it a "setup name": correct only while
+    /// a session holds exactly one test, and silently configuring the *first*
+    /// test the moment it holds two. Measured 2026-09-09 — `fnxSession14` grew
+    /// a second test (`amp_buf_tb`) and every subsequent `set_analysis`
+    /// would still have landed on `amp_tb`, returning `ok` each time. So the
+    /// test is now either named explicitly or resolved from a session that has
+    /// exactly one; ambiguity is an error, not a guess. See [`test_binding`].
+    ///
+    /// IC23: `maeSetAnalysis(testName analysisType ?enable t ?options ...)`.
+    /// IC25: same, plus `?session`.
+    ///
+    /// 实测 IC25（2026-08-06, IC25.1 ISR7）：
+    /// - `?options (list (list "stop" "1e10"))` 成功写入 netlist
+    /// - `?options` 中 `dec` 被静默丢弃，需通过 netlist sed 补全
+    pub fn set_analysis(
+        &self,
+        session: &str,
+        analysis_type: &str,
+        options_skill_alist: Option<&str>,
+        test: Option<&str>,
+        version: VirtuosoVersion,
+    ) -> String {
+        let bind = test_binding(session, test, "maestro.set_analysis");
+        let session = escape_skill_string(session);
+        let analysis_type = escape_skill_string(analysis_type);
+        let (opts_binding, opts_arg) = match options_skill_alist {
+            Some(alist) => {
+                let quoted: String = parse_skill_pairs(alist)
+                    .iter()
+                    .map(|p| skill_pair_to_quoted(p))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (
+                    format!("opts = (list {quoted})"),
+                    " ?options opts".to_string(),
+                )
+            }
+            None => (String::new(), String::new()),
+        };
+        let session_arg = if version.is_ic25() {
+            format!(r#" ?session "{session}""#)
+        } else {
+            String::new()
+        };
+        format!(
+            r#"let((tests tn opts) {bind} {opts_binding} maeSetAnalysis(tn "{analysis_type}"{session_arg} ?enable t{opts_arg}))"#
+        )
+    }
+
+    /// Run simulation asynchronously. Returns immediately.
+    pub fn run_simulation(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        format!(r#"maeRunSimulation(?session "{session}")"#)
+    }
+
+    /// Run simulation with dec injection, all in one SKILL expression.
+    ///
+    /// For IC25 ISR4: maeSetAnalysis ?options doesn't write dec to the netlist.
+    ///
+    /// The entire SKILL expression (procedure definition + call) goes through
+    /// `execute_skill_admin` which passes `skip_whitelist=true`, bypassing both
+    /// `check_blocking_skill` and the whitelist so `system("sed")` is permitted.
+    /// The procedure runs in Virtuoso's SKILL context where `system()` is available.
+    ///
+    /// Key findings (IC25 ISR7):
+    /// - maeSetAnalysis: first positional arg must be the SETUP NAME (from maeGetSetup),
+    ///   NOT the session name. Using session name → returns nil, doesn't enable analysis.
+    /// - maeGetAnalogRunDir is NOT available in bridge daemon SKILL context → use
+    ///   derived path via getWorkingDir() + maeGetSetup().
+    /// - Netlist lives at:
+    ///   getWorkingDir()/simulation/<cellview>/maestro/results/maestro/.tmpADEDir_user1/
+    ///   <setupName>/<cellview>_schematic_spectre/netlist/input.scs
+    pub fn run_with_dec(
+        &self,
+        session: &str,
+        analysis_type: &str,
+        options_skill_alist: Option<&str>,
+        dec: u32,
+    ) -> String {
+        let session_esc = escape_skill_string(session);
+        let at_esc = escape_skill_string(analysis_type);
+        let dec_u32 = dec;
+        let opts_inner = match options_skill_alist {
+            Some(alist) => {
+                let pairs: Vec<String> = parse_skill_pairs(alist);
+                let quoted: String = pairs
+                    .iter()
+                    .map(|p| skill_pair_to_quoted(p))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("quote((\"dec\" \"0\")) {}", quoted)
+            }
+            None => r#"quote(("dec" "0"))"#.to_string(),
+        };
+        format!(
+            r#"progn(
+procedure(vcliShellQuote(value)
+; Return a POSIX single-quoted shell word, escaping embedded apostrophes.
+; Apostrophe in input becomes '"'"' (close sq, add dq-sq-dq, reopen sq).
+let((out i c len)
+out = "'"
+len = strlen(value)
+i = 0
+while(i < len
+c = substring(value i 1)
+if(c == "'"
+out = strcat(out "'\"'\"'")
+out = strcat(out c))
+i = add1(i))
+strcat(out "'")))
+procedure(vcliDecInject(s a o d)
+let((setupName cellView netDir netPath netPathQuoted cmd ok ds)
+; Derive netlist path from getWorkingDir + maeGetSetup
+; IC25 Maestro writes netlist to:
+;   <wd>/simulation/<cellview>/maestro/results/maestro/.tmpADEDir_user1/<setupName>/<cellview>_schematic_spectre/netlist/input.scs
+setupName=car(maeGetSetup(?session s))
+cellView=substring(setupName 1 sub1(strlen(setupName)))
+netDir=sprintf(nil "%s/simulation/%s/maestro/results/maestro/.tmpADEDir_user1/%s/%s_schematic_spectre/netlist" getWorkingDir() cellView setupName cellView)
+netPath=strcat(netDir "/input.scs")
+netPathQuoted=vcliShellQuote(netPath)
+; Build dec="N" string for sed
+ds=sprintf(nil "dec=%d" d)
+; Set analysis with dec=0 (placeholder, sed will replace it)
+maeSetAnalysis(setupName a ?session s ?enable t ?options o)
+; Save → generates netlist
+maeSaveSetup(?session s)
+; Primary sed: replace " stop=" → " dec=N stop=" on the ac line
+; Uses /0/.../0/ address to match only the first occurrence
+cmd=sprintf(nil "sed -i '0,/ stop=/s/ stop=/ %s stop=/' %s %s" ds netPathQuoted netPathQuoted)
+ok=not(system(cmd))
+when(ok system(sprintf(nil "grep '^ac ' %s" netPathQuoted)))
+maeRunSimulation(?session s)))
+vcliDecInject("{}" "{}" (list {}) {}))"#,
+            session_esc, at_esc, opts_inner, dec_u32
+        )
+    }
+
+    /// Get test outputs — version-aware.
+    ///
+    /// IC23/IC25: maeGetTestOutputs(testName) — both use positional.
+    /// IC25 additionally supports ?session keyword.
+    #[allow(dead_code)]
+    /// List a test's outputs as JSON.
+    ///
+    /// Three things the naive `sprintf(... o~>name o~>outputType ...)` got
+    /// wrong on IC23.1:
+    /// - outputs created by `maeAddOutput(... ?expr)` have a nil `outputType`,
+    ///   and one nil aborts the whole `sprintf`
+    ///   ("format spec. incompatible with data, argument #2 is nil");
+    /// - the expression lives on `~>expression`, not `~>expr`, and it is a
+    ///   SKILL form rather than a string, so `%s` cannot print it;
+    /// - expressions contain `"` (`VDC("/vout")`), which has to be escaped or
+    ///   the emitted JSON does not parse.
+    pub fn get_outputs(&self, test_name: &str) -> String {
+        let test_name = escape_skill_string(test_name);
+        let esc = |var: &str| format!(r#"buildString(parseString({var} "\"") "\\\"")"#);
+        let str_field = |field: &str| format!(r#"if(stringp(o~>{field}) then o~>{field} else "")"#);
+        let (name, otype, signal) = (
+            str_field("name"),
+            str_field("outputType"),
+            str_field("signalName"),
+        );
+        let expr = r#"if(stringp(o~>expr) then o~>expr else if(o~>expression then sprintf(nil "%L" o~>expression) else ""))"#;
+        let (e_name, e_type, e_signal, e_expr) = (esc("nm"), esc("ty"), esc("sg"), esc("ex"));
+        format!(
+            r#"let((outs out sep nm ty sg ex) outs = maeGetTestOutputs("{test_name}") out = "[" sep = "" foreach(o outs nm = {name} ty = {otype} sg = {signal} ex = {expr} out = strcat(out sep sprintf(nil "{{\"name\":\"%s\",\"type\":\"%s\",\"signalName\":\"%s\",\"expr\":\"%s\"}}" {e_name} {e_type} {e_signal} {e_expr})) sep = ",") strcat(out "]"))"#
+        )
+    }
+
+    pub fn add_output(&self, output_name: &str, test_name: &str, expr: &str) -> String {
+        let output_name = escape_skill_string(output_name);
+        let test_name = escape_skill_string(test_name);
+        let expr = escape_skill_string(expr);
+        format!(r#"maeAddOutput("{output_name}" "{test_name}" ?expr "{expr}")"#)
+    }
+
+    /// Points a test (or every test in the session) at a design cellview.
+    ///
+    /// Uses `maeSetDesignForTest`, whose IC23.1 signature is
+    /// `(t_lib t_cell t_view [?test t] [?session s])` — the library/cell/view
+    /// are **positional**, and omitting `?test` sets the design for all tests.
+    ///
+    /// The previous form called `maeSetDesign` with `?libName`/`?cellName`/
+    /// `?viewName` keywords and no test name at all. IC23.1 has no such
+    /// keywords, and the real `maeSetDesign` takes the test name as its first
+    /// positional argument, so that call could only ever return nil — which is
+    /// why it sat behind `#[allow(dead_code)]` instead of being wired up.
+    /// Signature read from
+    /// `doc/maeSKILLref/maestroSKILL_re_maeSetDesignForTest.html` 2026-09-09.
+    pub fn set_design(
+        &self,
+        session: &str,
+        lib: &str,
+        cell: &str,
+        view: &str,
+        test: Option<&str>,
+    ) -> String {
+        let session = escape_skill_string(session);
+        let lib = escape_skill_string(lib);
+        let cell = escape_skill_string(cell);
+        let view = escape_skill_string(view);
+        let test_arg = match test {
+            Some(t) => format!(" ?test \"{}\"", escape_skill_string(t)),
+            None => String::new(),
+        };
+        format!(r#"maeSetDesignForTest("{lib}" "{cell}" "{view}"{test_arg} ?session "{session}")"#)
+    }
+
+    /// Creates a test in an open Maestro session.
+    ///
+    /// `maeCreateTest(t_testName [?sourceTest t] [?lib t] [?cell t] [?view t]
+    /// [?simulator t] [?session t]) => t / nil`. Giving lib/cell/view sets the
+    /// test's design in the same call, so no separate `set_design` is needed
+    /// for a fresh test.
+    ///
+    /// The session must be editable — a session opened in the default
+    /// `?mode "r"` accepts the in-memory change but `maeSaveSetup` will refuse
+    /// to persist it (see `save_setup`).
+    pub fn create_test(
+        &self,
+        session: &str,
+        test: &str,
+        lib: &str,
+        cell: &str,
+        view: &str,
+        simulator: &str,
+    ) -> String {
+        let session = escape_skill_string(session);
+        let test = escape_skill_string(test);
+        let lib = escape_skill_string(lib);
+        let cell = escape_skill_string(cell);
+        let view = escape_skill_string(view);
+        let simulator = escape_skill_string(simulator);
+        format!(
+            r#"maeCreateTest("{test}" ?lib "{lib}" ?cell "{cell}" ?view "{view}" ?simulator "{simulator}" ?session "{session}")"#
+        )
+    }
+
+    /// Saves the setup to disk — refusing up front if the session cannot write.
+    ///
+    /// `maeSaveSetup` on a read-only session returns non-nil and writes
+    /// **nothing**. Measured on IC23.1 2026-09-09: with `fnxSession12` open in
+    /// `?mode "r"`, `maeSetVar` accepted `RO_PROBE=1` (in-memory writes are not
+    /// blocked either), `maeSaveSetup` returned success, and `maestro.sdb` kept
+    /// its three-hour-old mtime with `<vars></vars>` still empty. So the return
+    /// value proves nothing and the caller walks away believing the edit
+    /// persisted — the same failure shape as `dbClose` reporting success while
+    /// keeping its lock.
+    ///
+    /// `axlIsSessionReadOnly` is the oracle the return value isn't, so it is
+    /// checked first and the save is refused with an error that names the fix.
+    /// It is probed rather than assumed: on a Virtuoso that lacks it the save
+    /// proceeds unguarded, which is no worse than before.
+    pub fn save_setup(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        format!(
+            "let((s) s = \"{session}\" \
+             when(getd('axlIsSessionReadOnly) && axlIsSessionReadOnly(s) \
+               error(\"maestro.save: session %s is read-only. maeSaveSetup would report \
+             success and write nothing. Switch it with maestro.set_session_mode mode=a, \
+             save, then switch back to mode=r.\" s)) \
+             maeSaveSetup(?session s))"
+        )
+    }
+
+    /// Create a netlist for a specific corner.
+    /// maeCreateNetlistForCorner(testName cornerName outputDir ?session s)
+    pub fn create_netlist_for_corner(
+        &self,
+        test_name: &str,
+        corner: &str,
+        output_dir: &str,
+        session: &str,
+    ) -> String {
+        let test_name = escape_skill_string(test_name);
+        let corner = escape_skill_string(corner);
+        let output_dir = escape_skill_string(output_dir);
+        let session = escape_skill_string(session);
+        format!(
+            r#"maeCreateNetlistForCorner("{test_name}" "{corner}" "{output_dir}" ?session "{session}")"#
+        )
+    }
+
+    pub fn get_sim_messages(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        format!(r#"maeGetSimulationMessages(?session "{session}")"#)
+    }
+
+    /// Get focused ADE window name, davSession, all window names, sessions, and run_dir in one RTT.
+    ///
+    /// Returns a 5-element SKILL list:
+    ///   (title davSession (all_titles...) (sessions...) run_dir_or_nil)
+    ///
+    /// `davSession` is `cw->davSession` — the Maestro session name bound to the ADE window.
+    /// `run_dir_or_nil` is bundled so callers need only 1 RTT when the focused window has a session.
+    pub fn focused_window_skill(&self) -> String {
+        r#"let((cw sess) cw=hiGetCurrentWindow() sess=if(cw cw->davSession nil) list(if(cw hiGetWindowName(cw) nil) sess mapcar(lambda((w) hiGetWindowName(w)) hiGetWindowList()) maeGetSessions() if(sess let((s) s=asiGetSession(sess) if(s asiGetAnalogRunDir(s) nil)) nil)))"#.into()
+    }
+
+    /// Get simulation run directory for a maestro session via asiGetAnalogRunDir.
+    /// Used when the caller provides a different session than the focused window's davSession.
+    pub fn run_dir_skill(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        format!(
+            r#"let((sess) sess=asiGetSession("{session}") if(sess asiGetAnalogRunDir(sess) nil))"#
+        )
+    }
+
+    /// Export results to CSV via maeExportOutputView.
+    pub fn export_results(
+        &self,
+        session: &str,
+        file_path: &str,
+        test_name: Option<&str>,
+        history: Option<&str>,
+    ) -> String {
+        let session = escape_skill_string(session);
+        let file_path = escape_skill_string(file_path);
+        let test_name_part = match test_name {
+            Some(t) => format!(r#" ?testName "{}""#, escape_skill_string(t)),
+            None => String::new(),
+        };
+        let history_part = match history {
+            Some(h) => format!(r#" ?historyName "{}""#, escape_skill_string(h)),
+            None => String::new(),
+        };
+        format!(
+            r#"maeExportOutputView(?session "{session}"{test_name_part}{history_part} ?view "Detail" ?fileName "{file_path}")"#
+        )
+    }
+
+    /// Export a waveform (or expression) to a text file via `ocnPrint`.
+    ///
+    /// # ⚠️ DEAD BUILDER — the SKILL it emits cannot run on IC23.1
+    ///
+    /// `axlGetWaveform` and `axlWaveformToList` **do not exist** on IC23.1:
+    /// absent from all 41 SKILL Finder databases, and `getd` returns nil for
+    /// both. Only the innermost `ocnPrint` is real. Executing this string dies
+    /// on its first form.
+    ///
+    /// It is harmless today only because **no RPC method reaches it** —
+    /// `maestro.export` routes to [`MaestroOps::export_results`]
+    /// (`maeExportOutputView`, documented and bound). The sole callers are this
+    /// module's own tests.
+    ///
+    /// Note what those tests assert: `contains("ocnPrint")`,
+    /// `contains("scientific")`, `contains("/tmp/wave.txt")` — every one of
+    /// them checks the one function in the string that actually exists, and
+    /// none checks the two that don't. Six green tests over an unrunnable
+    /// expression. A string builder's unit tests can only prove what the string
+    /// looks like, never that it runs.
+    ///
+    /// **Do not wire this to an RPC method as-is.** The documented route
+    /// (`IC231__maeSKILLref`) is `drIsWaveform` / `drGetWaveformXVec` /
+    /// `drGetWaveformYVec`, or `maeOpenResults` + `ocnPrint`. Confirm with
+    /// `skill.info` and `getd` before rewriting — see
+    /// `docs/skill-fn-audit-2026-09-10.md` §2.7.
+    ///
+    /// `expression` is a Cadence expression like `vout` or
+    /// `VT("/net015")` — passed verbatim to `ocnPrint` (no escape
+    /// because it's not a SKILL string literal; it's a syntax tree).
+    /// `analysis` selects the analysis context (`"tran"`, `"ac"`,
+    /// `"dc"`, ...). `number_notation` must be one of `"scientific"`,
+    /// `"engineering"`, `"automatic"`. `precision` is `1..=16`.
+    /// `width` is `>= 4`.
+    ///
+    /// Panics on invalid arguments — these are programming errors,
+    /// not user errors, since the constructor is meant to be called
+    /// from a clap layer that already validated the inputs.
+    pub fn export_waveform(&self, req: &ExportWaveformRequest<'_>) -> String {
+        if !(1..=16).contains(&req.precision) {
+            panic!(
+                "export_waveform: precision must be in 1..=16, got {}",
+                req.precision
+            );
+        }
+        if req.width < 4 {
+            panic!(
+                "export_waveform: width must be >= 4 (enough room for sign + 1 digit + decimal point), got {}",
+                req.width
+            );
+        }
+        match req.number_notation {
+            "scientific" | "engineering" | "automatic" => {}
+            other => panic!(
+                "export_waveform: numberNotation must be one of [scientific, engineering, automatic], got {other:?}"
+            ),
+        }
+
+        let session = escape_skill_string(req.session);
+        let analysis = escape_skill_string(req.analysis);
+        let expression_escaped = escape_skill_string(req.expression);
+        let output_path_escaped = escape_skill_string(req.output_path);
+        let number_notation_escaped = escape_skill_string(req.number_notation);
+        let precision = req.precision;
+        let width = req.width;
+
+        format!(
+            r#"let((v) v = axlWaveformToList(axlGetWaveform(?session "{session}" ?expression "{expression_escaped}" ?analysis "{analysis}")) ocnPrint(?expr v ?numberNotation "{number_notation_escaped}" ?precision {precision} ?width {width} ?outputFile "{output_path_escaped}"))"#
+        )
+    }
+
+    // =========================================================================
+    // Result Reading Functions (IC23/IC25 compatible)
+    // =========================================================================
+
+    /// Open a history run for programmatic result access.
+    pub fn open_results(&self, history: &str) -> String {
+        let history = escape_skill_string(history);
+        format!(r#"maeOpenResults(?history "{history}")"#)
+    }
+
+    /// Close the currently open results.
+    pub fn close_results(&self) -> String {
+        r#"maeCloseResults()"#.into()
+    }
+
+    /// List all test names that have results in the current history.
+    pub fn get_result_tests(&self) -> String {
+        r#"let((tests out sep) tests = maeGetResultTests() out = "[" sep = "" foreach(tst tests out = strcat(out sep sprintf(nil "\"%s\"" tst)) sep = ",") strcat(out "]"))"#.into()
+    }
+
+    /// List all output names available for a given test in the current history.
+    pub fn get_result_outputs(&self, test_name: &str) -> String {
+        let test_name = escape_skill_string(test_name);
+        format!(
+            r#"let((outs out sep) outs = maeGetResultOutputs(?testName "{test_name}") out = "[" sep = "" foreach(o outs out = strcat(out sep sprintf(nil "\"%s\"" o)) sep = ",") strcat(out "]"))"#
+        )
+    }
+
+    /// Get the value of a specific output for a specific test and corner.
+    ///
+    /// Note: This method does NOT call maeOpenResults first. You must call
+    /// open_results(history) before using this method to ensure the results
+    /// are accessible. Alternatively, use get_output_value_with_open() which
+    /// combines both operations.
+    ///
+    /// Similar to virtuoso-bridge-lite's fix for issue #81: maeGetOutputValue
+    /// should work directly without gating on maeExportOutputView return value.
+    pub fn get_output_value(&self, name: &str, test_name: &str, corner: Option<&str>) -> String {
+        let name = escape_skill_string(name);
+        let test_name = escape_skill_string(test_name);
+        match corner {
+            Some(c) => {
+                let c = escape_skill_string(c);
+                format!(r#"maeGetOutputValue("{name}" "{test_name}" ?cornerName "{c}")"#)
+            }
+            None => format!(r#"maeGetOutputValue("{name}" "{test_name}")"#),
+        }
+    }
+
+    /// Get output value with results opened first.
+    ///
+    /// This is a convenience method that combines open_results and get_output_value.
+    /// Use this when you need to read output values from a specific history run.
+    ///
+    /// Returns a SKILL expression that:
+    /// 1. Opens the history results (ignores return value - virtuoso-bridge-lite #81 fix)
+    /// 2. Gets the output value
+    pub fn get_output_value_with_open(
+        &self,
+        history: &str,
+        name: &str,
+        test_name: &str,
+        corner: Option<&str>,
+    ) -> String {
+        let history = escape_skill_string(history);
+        let name = escape_skill_string(name);
+        let test_name = escape_skill_string(test_name);
+
+        let get_value = match corner {
+            Some(c) => {
+                let c = escape_skill_string(c);
+                format!(r#"maeGetOutputValue("{name}" "{test_name}" ?cornerName "{c}")"#)
+            }
+            None => format!(r#"maeGetOutputValue("{name}" "{test_name}")"#),
+        };
+
+        format!(r#"(progn (maeOpenResults ?history "{history}") {get_value})"#)
+    }
+
+    /// Get the spec pass/fail status for an output.
+    pub fn get_spec_status(&self, name: &str, test_name: &str) -> String {
+        let name = escape_skill_string(name);
+        let test_name = escape_skill_string(test_name);
+        format!(r#"maeGetSpecStatus("{name}" "{test_name}")"#)
+    }
+
+    /// List available history runs for the current Maestro session.
+    /// Returns JSON array of history names.
+    pub fn get_history_list(&self) -> String {
+        r#"let((rd root found hs out sep) rd = car(errset(asiGetResultsDir(asiGetCurrentSession()))) root = nil found = nil when(stringp(rd) root = "" foreach(p parseString(rd "/") unless(found root = strcat(root "/" p) when(rexMatchp("/results/maestro$" root) found = t)))) hs = nil when(found && isDir(root) hs = setof(h getDirFiles(root) h != "." && h != ".." && !rexMatchp("^[.]" h) && isDir(strcat(root "/" h)))) out = "[" sep = "" foreach(h hs out = strcat(out sep sprintf(nil "\"%s\"" h)) sep = ",") strcat(out "]"))"#.into()
+    }
+
+    /// Get the Maestro session ID for the current session.
+    #[allow(dead_code)]
+    pub fn get_current_session(&self) -> String {
+        r#"let((sess out) sess = asiGetCurrentSession() out = if(sess then sess~>name else "nil"))"#
+            .into()
+    }
+
+    // =========================================================================
+    // Auto-Detection Helpers (similar to virtuoso-bridge-lite)
+    // =========================================================================
+
+    /// Get the current Maestro session info as a structured SKILL call.
+    /// Returns: (session_name, lib, cell, view) or nil.
+    ///
+    /// Usage:
+    ///   let skill = ops.maestro_session_info();
+    ///   let result = client.execute_skill(&skill)?;
+    pub fn maestro_session_info(&self) -> String {
+        r#"let((sess info) sess = asiGetCurrentSession() info = if(sess list(sess~>name if(sess~>adeSession then sess~>adeSession~>libName else nil) if(sess~>adeSession then sess~>adeSession~>cellName else nil) if(sess~>adeSession then sess~>adeSession~>viewName else nil)) else nil))"#.into()
+    }
+
+    /// Check if a cell exists in a library.
+    /// Returns "exists" if found, nil otherwise.
+    pub fn cell_exists(&self, lib: &str, cell: &str) -> String {
+        let lib = escape_skill_string(lib);
+        let cell = escape_skill_string(cell);
+        format!(r#"when(ddGetObj("{lib}" "{cell}") "exists")"#)
+    }
+
+    /// List all libraries containing cells of a specific view type.
+    /// Useful for auto-detecting which PDK libraries are available.
+    pub fn libs_with_view(&self, view: &str) -> String {
+        let view = escape_skill_string(view);
+        format!(
+            r#"let((libs out sep) libs = ddGetLibList() out = "[" sep = "" foreach(l libs when(member("{view}" l~>cells~>viewName) out = strcat(out sep sprintf(nil "\"%s\"" l~>name)) sep = ",")) strcat(out "]"))"#
+        )
+    }
+
+    /// Get the simulation results directory for the current session.
+    /// Returns nil if no session is active.
+    pub fn results_dir(&self) -> String {
+        r#"let((sess dir) sess = asiGetCurrentSession() dir = if(sess then asiGetResultsDir(sess) else nil) if(dir dir "nil"))"#.into()
+    }
+
+    /// The corner and corner-group names in a Maestro session's setup database.
+    ///
+    /// The previous body called `maeGetCorners()`, which does not exist in
+    /// IC23.1 — `getd` reports it UNDEFINED and it appears nowhere in
+    /// `finder/SKILL/Virtuoso_ADE/maeSKILLref.fnd`. It had no callers either,
+    /// so the whole wheel was dead.
+    ///
+    /// The documented route (`maeSKILLref/cornersRelated_re_axlGetCorners.html`,
+    /// whose own example is reproduced below) goes through the setup database:
+    ///
+    /// ```text
+    /// session = axlGetWindowSession()   => "session0"
+    /// x_mainSDB = axlGetMainSetupDB(session) => 1001
+    /// axlGetCorners(x_mainSDB) => (1003 ("C0" "C1" "C2_0_0" …))
+    /// ```
+    ///
+    /// Note the return shape: a *two*-element list of `(handle names)`, so the
+    /// names are `cadr`, not the list itself.
+    ///
+    /// `axlGetCorners` answers nil both for "no such session" and for "session
+    /// has no corners", so the session is validated up front with
+    /// `axlIsValidAXLSession` — otherwise a typo in the session name comes back
+    /// as an empty corner list, which is the failure mode this method exists to
+    /// prevent.
+    pub fn list_corners(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        let names = skill_strings_to_json("cadr(axlGetCorners(sdb))");
+        format!(
+            r#"let((sdb) unless(axlIsValidAXLSession("{session}") error("maestro.list_corners: no such Maestro session '%s' — check 'maestro.list_sessions'" "{session}")) sdb = axlGetMainSetupDB("{session}") unless(sdb error("maestro.list_corners: session '%s' has no setup database" "{session}")) {names})"#
+        )
+    }
+
+    /// Detect PVT corner from simulation results directory or cell name.
+    /// Returns the corner string (e.g., "tt", "ss", "ff") if detectable.
+    pub fn detect_corner_from_path(&self, path: &str) -> String {
+        let path = escape_skill_string(path);
+        format!(
+            r#"let((name corner) name = "{path}" corner = cond(
+                (rexMatchp("tt" name) "tt")
+                (rexMatchp("ss" name) "ss")
+                (rexMatchp("ff" name) "ff")
+                (rexMatchp("snfp" name) "snfp")
+                (rexMatchp("fnfp" name) "fnfp")
+                (rexMatchp("fs" name) "fs")
+                (rexMatchp("sf" name) "sf")
+                (t nil)
+            ) if(corner corner "nil"))"#
+        )
+    }
+
+    /// Get simulation status for a session (running, completed, failed).
+    pub fn get_sim_status(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        format!(
+            r#"let((sess status) sess = asiGetSession("{session}") status = if(sess sess~>status else "nil"))"#
+        )
+    }
+}
+
+/// Parse a SKILL alist string into individual pair strings like `["(list \"k1\" \"v1\")", "(list \"k2\" \"v2\")"]`.
+///
+/// Handles both formats:
+///   - With `list` keyword:  `(list (list "k1" "v1") (list "k2" "v2"))`
+///   - Without `list` keyword (from `json_to_skill_alist`): `(("k1" "v1") ("k2" "v2"))`
+fn parse_skill_pairs(alist: &str) -> Vec<String> {
+    let alist = alist.trim();
+    if alist.len() < 2 {
+        return vec![alist.to_string()];
+    }
+    if alist.starts_with("(list (") {
+        let inner = &alist[1..alist.len() - 1];
+        return parse_inner_pairs(inner);
+    }
+    if alist.starts_with("((") {
+        let inner = &alist[1..alist.len() - 1];
+        return parse_inner_pairs(inner);
+    }
+    vec![alist.to_string()]
+}
+
+/// Parse the inner content between the outer parentheses of an alist,
+/// extracting each top-level parenthetical group as a separate pair.
+fn parse_inner_pairs(inner: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '(' => {
+                depth += 1;
+                if depth == 1 {
+                    start = i;
+                }
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    results.push(inner[start..=i].trim().to_string());
+                }
+            }
+            _ => {}
+        }
+        if depth < 0 {
+            break;
+        }
+    }
+    if results.is_empty() {
+        vec![inner.trim().to_string()]
+    } else {
+        results
+    }
+}
+
+/// Convert a parsed pair to a SKILL quoted list: `quote(("key" "val"))`.
+///
+/// maeSetAnalysis ?options expects a list of such quoted pairs.
+fn skill_pair_to_quoted(pair: &str) -> String {
+    let trimmed = pair.trim();
+    if let Some(without_prefix) = trimmed.strip_prefix("(list ") {
+        let stripped = without_prefix
+            .strip_suffix(')')
+            .unwrap_or(without_prefix)
+            .trim();
+        format!("quote(({stripped}))")
+    } else {
+        format!("quote({trimmed})")
+    }
+}
+
+/// Wrap a SKILL expression that returns a list-of-strings into a JSON array string.
+///
+/// If `list_expr` returns nil (empty), the output is `"[]"`.
+/// This ensures list-returning ops never produce SKILL nil — callers use r.ok() not r.skill_ok().
+fn skill_strings_to_json(list_expr: &str) -> String {
+    format!(
+        r#"let((xs out sep) xs = {list_expr} out = "[" sep = "" foreach(x xs out = strcat(out sep sprintf(nil "\"%s\"" x)) sep = ",") strcat(out "]"))"#
+    )
+}
+
+/// Convert a JSON object string to a SKILL association list.
+///
+/// Input: `{"start":"1","stop":"10G","dec":"20"}`
+/// Output: `(("start" "1") ("stop" "10G") ("dec" "20"))`
+///
+/// Returns `Err` if the input is not valid JSON or not a JSON object.
+pub(crate) fn json_to_skill_alist(json_str: &str) -> Result<String, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| format!("invalid JSON: {e}"))?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| "expected a JSON object".to_string())?;
+    let pairs: Vec<String> = obj
+        .iter()
+        .map(|(k, v)| {
+            let binding = v.to_string();
+            let val = v.as_str().unwrap_or(&binding);
+            format!("(\"{k}\" \"{val}\")")
+        })
+        .collect();
+    Ok(format!("({})", pairs.join(" ")))
+}
+
+// ============================================================================
+// Persistent Job Helpers  (analogous to PR #173 in virtuoso-bridge-lite)
+// ============================================================================
+
+impl MaestroOps {
+    /// Probe whether a Maestro session is writable, read-only, or unknown.
+    ///
+    /// Returns exactly one of three strings:
+    ///
+    /// - `"readonly"` — the session exists and `axlIsSessionReadOnly` says `t`.
+    /// - `"writable"` — the session exists and is in edit mode.
+    /// - `"unknown"`  — the session could not be shown to exist, the
+    ///   predicates are missing on this IC version, or a call raised.
+    ///
+    /// `axlIsSessionReadOnly` returns `nil` for a writable session **and** for
+    /// a session that does not exist, so "not read-only" is not by itself
+    /// evidence that the session is writable: the existence check comes
+    /// first. `axlIsValidAXLSession` is the validity predicate (`t` / `nil`);
+    /// `maeGetSessions()` is a second oracle for the sessions that are open.
+    ///
+    /// `getd('fn)` is the repo's function-existence probe (the same one
+    /// [`Self::save_setup`] uses): on an IC version that lacks a predicate the
+    /// probe answers `"unknown"` instead of pretending the session is
+    /// writable.
+    pub fn session_writability_skill(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        format!(
+            r#"let((s valid names exists ro) s = "{session}" valid = if(getd('axlIsValidAXLSession) then errset(axlIsValidAXLSession(s)) else nil) valid = if(valid && listp(valid) then car(valid) else nil) names = if(getd('maeGetSessions) then errset(maeGetSessions()) else nil) names = if(names && listp(names) then car(names) else nil) exists = if(valid == t then t else if(names && listp(names) && member(s names) then t else nil)) if(null(exists) then "unknown" else ro = if(getd('axlIsSessionReadOnly) then errset(axlIsSessionReadOnly(s)) else nil) if(null(ro) then "unknown" else if(car(ro) == t then "readonly" else "writable"))))"#
+        )
+    }
+
+    /// Read the client id recorded on a Maestro session, if it carries one.
+    ///
+    /// Returns the id as a string, or the string `"nil"` when the session
+    /// carries no client id — the normal case for a session that was opened
+    /// outside this CLI. The id is one oracle for "which client owns this
+    /// session", never the only one: a session with no id is not a session
+    /// that may be submitted to by anybody.
+    pub fn session_client_id_skill(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        format!(
+            r#"let((sess prof) sess = errset(asiGetSession("{session}")) sess = if(sess && listp(sess) then car(sess) else sess) prof = errset(sess~>clientId) prof = if(prof && listp(prof) then car(prof) else prof) if(stringp(prof) then prof else "nil"))"#
+        )
+    }
+
+    /// Submit a Maestro simulation and return `(run_id pid)`.
+    ///
+    /// Side-effecting: this is the only call that starts a simulation, and
+    /// the caller must never retry it. `maeRunSimulation(?returnRunId t)`
+    /// returns the run id Maestro assigned to *this* run, so the id is read
+    /// from the submit itself. There is no pre-submit probe for it:
+    /// `maeGetSetup` has no `?runId` keyword (its keywords are `?typeName
+    /// ?enabled ?run ?session`), and it returns the setup details, not the
+    /// id of the run that has not happened yet.
+    ///
+    /// The run id is normalised to a string so the caller can parse it out of
+    /// the returned list without caring whether Maestro hands back a number
+    /// or a string. The Virtuoso pid comes from `ipcGetPid()`.
+    ///
+    /// The job is NOT persisted here: Maestro has already forked the Spectre
+    /// child by the time this returns, so the caller must write a record for
+    /// every submit or the simulation runs with no record at all.
+    pub fn submit_skill(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        format!(
+            r#"let((runId pid) runId = errset(maeRunSimulation(?session "{session}" ?returnRunId t)) runId = if(runId && listp(runId) then car(runId) else nil) runId = if(numberp(runId) then sprintf(nil "%g" runId) else runId) pid = errset(ipcGetPid()) pid = if(pid && listp(pid) then car(pid) else nil) list(if(runId then runId else "nil") if(pid then pid else "nil")))"#
+        )
+    }
+
+    /// The Virtuoso process id of the bridge that is running the SKILL.
+    ///
+    /// `ipcGetPid()` is the real API: `ipcGetProcessID` is not in the OA
+    /// function database and evaluates to nil in the SKILL interpreter. There
+    /// is no shell fallback — `ipcGetStdin` does not exist either, so the
+    /// `echo $PPID` probe could never have produced a pid.
+    pub fn pid_skill(&self) -> String {
+        r#"let((pid) pid = errset(ipcGetPid()) pid = if(pid && listp(pid) then car(pid) else nil) pid)"#.to_string()
+    }
+
+    /// Get the Maestro run directory for a session (run_dir).
+    /// Same as `asiGetAnalogRunDir` wrapped in errset for degradation.
+    pub fn job_run_dir_skill(&self, session: &str) -> String {
+        let session = escape_skill_string(session);
+        format!(
+            r#"let((sess dir) sess = errset(asiGetSession("{session}")) sess = if(sess && listp(sess) then car(sess) else sess) dir = errset(asiGetAnalogRunDir(sess)) dir = if(dir && listp(dir) then car(dir) else dir) if(dir then dir else nil))"#
+        )
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+
+    #[allow(dead_code)]
+    fn ops() -> MaestroOps {
+        MaestroOps
+    }
+
+    #[test]
+    fn writability_probe_reports_three_outcomes() {
+        let s = ops().session_writability_skill("fnxSession5");
+        assert!(s.contains("axlIsSessionReadOnly"), "{s}");
+        assert!(s.contains("axlIsValidAXLSession"), "{s}");
+        assert!(s.contains("fnxSession5"), "{s}");
+        for outcome in ["\"readonly\"", "\"writable\"", "\"unknown\""] {
+            assert!(s.contains(outcome), "missing outcome {outcome}: {s}");
+        }
+    }
+
+    #[test]
+    fn writability_probe_does_not_submit() {
+        let s = ops().session_writability_skill("sess");
+        assert!(!s.contains("maeRunSimulation"), "must be read-only: {s}");
+    }
+
+    #[test]
+    fn writability_probe_escapes_the_session_name() {
+        let s = ops().session_writability_skill(r#"se"ss"#);
+        assert!(s.contains(r#"se\"ss"#), "{s}");
+    }
+
+    #[test]
+    fn submit_skill_reads_the_run_id_from_the_submit() {
+        let s = ops().submit_skill("sess");
+        assert!(s.contains("maeRunSimulation"), "{s}");
+        assert!(s.contains("?returnRunId"), "{s}");
+        assert!(!s.contains("maeGetSetup"), "{s}");
+    }
+
+    #[test]
+    fn submit_skill_uses_the_real_pid_api() {
+        let s = ops().submit_skill("sess");
+        assert!(s.contains("ipcGetPid"), "{s}");
+        assert!(!s.contains("ipcGetProcessID"), "{s}");
+        assert!(!s.contains("ipcGetStdin"), "{s}");
+    }
+
+    #[test]
+    fn pid_skill_uses_the_real_pid_api() {
+        let s = ops().pid_skill();
+        assert!(s.contains("ipcGetPid"), "{s}");
+        assert!(!s.contains("ipcGetProcessID"), "{s}");
+        assert!(!s.contains("ipcGetStdin"), "{s}");
+        assert!(!s.contains("PPID"), "{s}");
+    }
+
+    #[test]
+    fn job_run_dir_skill() {
+        let s = ops().job_run_dir_skill("sess");
+        assert!(s.contains("asiGetAnalogRunDir"), "{s}");
+    }
+
+    #[test]
+    fn session_client_id_reads_client_id() {
+        let s = ops().session_client_id_skill("sess");
+        assert!(s.contains("clientId"), "{s}");
+    }
+}
+mod tests {
+    use super::*;
+
+    #[allow(dead_code)]
+    fn ops() -> MaestroOps {
+        MaestroOps
+    }
+
+    #[test]
+    fn open_session_quoting() {
+        let s = ops().open_session("myLib", "myCell", "adexl", "r");
+        assert_eq!(s, r#"maeOpenSetup("myLib" "myCell" "adexl" ?mode "r")"#);
+    }
+
+    #[test]
+    fn open_session_escapes_quotes() {
+        let s = ops().open_session(r#"lib"x"#, "cell", "adexl", "r");
+        assert!(s.contains(r#"lib\"x"#), "{s}");
+    }
+
+    #[test]
+    fn open_session_passes_append_mode_through() {
+        let s = ops().open_session("myLib", "myCell", "maestro", "a");
+        assert_eq!(s, r#"maeOpenSetup("myLib" "myCell" "maestro" ?mode "a")"#);
+    }
+
+    #[test]
+    fn set_session_mode_picks_the_matching_function() {
+        assert_eq!(
+            ops().set_session_mode("fnxSession7", true),
+            r#"maeMakeEditable(?session "fnxSession7")"#
+        );
+        assert_eq!(
+            ops().set_session_mode("fnxSession7", false),
+            r#"maeMakeReadonly(?session "fnxSession7")"#
+        );
+    }
+
+    #[test]
+    fn set_var_format() {
+        let s = ops().set_var("Vdd", "1.8");
+        assert_eq!(s, r#"maeSetVar("Vdd" "1.8")"#);
+    }
+
+    #[test]
+    fn list_vars_reads_assembler_global_scope() {
+        let s = ops().list_vars();
+        assert!(s.contains("maeGetVar("), "{s}");
+        assert!(!s.contains("asiGetDesignVarList"), "{s}");
+        assert!(s.contains(r#"?typeName "variables""#), "{s}");
+    }
+
+    #[test]
+    fn delete_var_format() {
+        let s = ops().delete_var("Vdd");
+        assert_eq!(s, r#"maeDeleteVar("Vdd")"#);
+    }
+
+    #[test]
+    fn delete_output_format() {
+        let s = ops().delete_output("Gain", "test1");
+        assert_eq!(s, r#"maeDeleteOutput("Gain" "test1")"#);
+    }
+
+    #[test]
+    fn delete_analysis_uses_symbol_and_verifies() {
+        let s = ops().delete_analysis("ac");
+        assert!(s.contains(r#"stringToSymbol("ac")"#), "{s}");
+        assert!(s.contains("errset(asiDeleteAnalysis"), "{s}");
+        assert!(s.contains("maeGetEnabledAnalysis"), "{s}");
+    }
+
+    #[test]
+    fn run_simulation_includes_session() {
+        let s = ops().run_simulation("sess1");
+        assert!(s.contains("maeRunSimulation"), "{s}");
+        assert!(s.contains("\"sess1\""), "{s}");
+    }
+
+    #[test]
+    fn get_analyses_ic23_resolves_test() {
+        let s = ops().get_analyses("sess1", None, VirtuosoVersion::IC23);
+        assert!(s.contains("maeGetSetup"), "IC23 must resolve the test: {s}");
+        assert!(s.contains("maeGetEnabledAnalysis(tn)"), "{s}");
+    }
+
+    #[test]
+    fn get_analyses_ic25_uses_test_name() {
+        let s = ops().get_analyses("sess1", None, VirtuosoVersion::IC25);
+        assert!(
+            s.contains("maeGetSetup"),
+            "Both IC23 and IC25 need maeGetSetup: {s}"
+        );
+        assert!(s.contains("maeGetEnabledAnalysis(tn)"), "{s}");
+    }
+
+    #[test]
+    fn get_analyses_uses_the_named_test_verbatim() {
+        let s = ops().get_analyses("sess1", Some("TRAN"), VirtuosoVersion::IC23);
+        assert!(s.contains(r#"tn = "TRAN""#), "{s}");
+        assert!(
+            s.contains("member(tn tests)"),
+            "must validate the name: {s}"
+        );
+    }
+
+    #[test]
+    fn list_sessions_uses_helper() {
+        let s = ops().list_sessions();
+        assert!(s.contains("maeGetSessions()"), "{s}");
+        assert!(s.contains("foreach"), "{s}");
+        assert!(s.contains(r#"strcat(out "]")"#), "{s}");
+    }
+
+    #[test]
+    fn get_result_tests_uses_helper() {
+        let s = ops().get_result_tests();
+        assert!(s.contains("maeGetResultTests()"), "{s}");
+        assert!(s.contains("foreach"), "{s}");
+        assert!(!s.contains("foreach(t "), "{s}");
+    }
+
+    #[test]
+    fn get_history_list_uses_helper() {
+        let s = ops().get_history_list();
+        assert!(s.contains("asiGetResultsDir"), "{s}");
+        assert!(s.contains("foreach"), "{s}");
+        assert!(!s.contains(r#"!index(h ".")"#), "{s}");
+    }
+
+    // === export_waveform tests (RED phase) ===
+    //
+    // Cadence SKILL ocnPrint with numberNotation/precision/width:
+    //   (ocnPrint ?expr <expr> ?numberNotation <notation> ?precision <n>
+    //             ?width <n> ?outputFile <path>)
+    // notation ∈ { "scientific" | "engineering" | "automatic" }
+
+    #[test]
+    fn export_waveform_emits_ocn_print_with_formatting() {
+        let s = ops().export_waveform(&ExportWaveformRequest {
+            session: "sess1",
+            expression: "vout",
+            analysis: "ac",
+            number_notation: "scientific",
+            precision: 12,
+            width: 18,
+            output_path: "/tmp/wave.txt",
+        });
+        assert!(s.contains("ocnPrint"), "must call ocnPrint: {s}");
+        assert!(s.contains("vout"), "expression must appear: {s}");
+        assert!(s.contains("scientific"), "notation must appear: {s}");
+        assert!(s.contains("12"), "precision must appear: {s}");
+        assert!(s.contains("18"), "width must appear: {s}");
+        assert!(s.contains("/tmp/wave.txt"), "output path must appear: {s}");
+    }
+
+    #[test]
+    fn export_waveform_escapes_double_quotes_in_session_and_path() {
+        let s = ops().export_waveform(&ExportWaveformRequest {
+            session: "sess\"x",
+            expression: "/tmp/with spaces/wave.txt",
+            analysis: "tran",
+            number_notation: "automatic",
+            precision: 8,
+            width: 10,
+            output_path: "/tmp/dest.txt",
+        });
+        assert!(
+            s.contains(r#"sess\"x"#),
+            "session double-quote must be escaped: {s}"
+        );
+        assert!(s.contains("/tmp/with spaces/wave.txt"));
+        assert!(s.contains("/tmp/dest.txt"));
+    }
+
+    #[test]
+    #[should_panic(expected = "precision must be in 1..=16")]
+    fn export_waveform_rejects_precision_zero() {
+        ops().export_waveform(&ExportWaveformRequest {
+            session: "sess",
+            expression: "vout",
+            analysis: "ac",
+            number_notation: "scientific",
+            precision: 0,
+            width: 18,
+            output_path: "/tmp/x",
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "precision must be in 1..=16")]
+    fn export_waveform_rejects_precision_above_16() {
+        ops().export_waveform(&ExportWaveformRequest {
+            session: "sess",
+            expression: "vout",
+            analysis: "ac",
+            number_notation: "scientific",
+            precision: 17,
+            width: 18,
+            output_path: "/tmp/x",
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "width must be >= 4")]
+    fn export_waveform_rejects_width_below_four() {
+        ops().export_waveform(&ExportWaveformRequest {
+            session: "sess",
+            expression: "vout",
+            analysis: "ac",
+            number_notation: "scientific",
+            precision: 12,
+            width: 3,
+            output_path: "/tmp/x",
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "numberNotation must be one of")]
+    fn export_waveform_rejects_unknown_notation() {
+        ops().export_waveform(&ExportWaveformRequest {
+            session: "sess",
+            expression: "vout",
+            analysis: "ac",
+            number_notation: "hex",
+            precision: 12,
+            width: 18,
+            output_path: "/tmp/x",
+        });
+    }
+
+    #[test]
+    fn export_results_minimal() {
+        let s = ops().export_results("sess1", "/tmp/out.csv", None, None);
+        assert!(s.contains("maeExportOutputView"), "{s}");
+        assert!(s.contains(r#"?session "sess1""#), "{s}");
+        assert!(s.contains(r#"?fileName "/tmp/out.csv""#), "{s}");
+        assert!(s.contains(r#"?view "Detail""#), "{s}");
+        assert!(!s.contains("?testName"), "should be absent when None: {s}");
+        assert!(
+            !s.contains("?historyName"),
+            "should be absent when None: {s}"
+        );
+    }
+
+    #[test]
+    fn export_results_with_all_params() {
+        let s = ops().export_results("sess1", "/tmp/out.csv", Some("AC"), Some("ExplorerRun.0"));
+        assert!(s.contains(r#"?testName "AC""#), "{s}");
+        assert!(s.contains(r#"?historyName "ExplorerRun.0""#), "{s}");
+    }
+
+    #[test]
+    fn set_analysis_ic23_positional() {
+        let s = ops().set_analysis("sess1", "ac", None, None, VirtuosoVersion::IC23);
+        assert!(s.contains("maeGetSetup"), "IC23 must resolve the test: {s}");
+        assert!(s.contains(r#"maeSetAnalysis(tn "ac""#), "{s}");
+    }
+
+    #[test]
+    fn set_analysis_ic23_no_options() {
+        let s = ops().set_analysis("sess1", "ac", None, None, VirtuosoVersion::IC23);
+        assert!(
+            !s.contains("?options"),
+            "IC23 path must not inject options: {s}"
+        );
+    }
+
+    /// The whole point of the test argument: with two tests in a session,
+    /// `maeSetAnalysis` must be told which one rather than taking the first.
+    #[test]
+    fn set_analysis_targets_the_named_test() {
+        let s = ops().set_analysis("sess1", "tran", None, Some("buf_tb"), VirtuosoVersion::IC23);
+        assert!(s.contains(r#"tn = "buf_tb""#), "{s}");
+        assert!(
+            !s.contains("car(tests)"),
+            "an explicit test must not fall back to the first one: {s}"
+        );
+    }
+
+    /// Omitting the test on a multi-test session is an error, not a guess.
+    #[test]
+    fn set_analysis_without_a_test_refuses_an_ambiguous_session() {
+        let s = ops().set_analysis("sess1", "tran", None, None, VirtuosoVersion::IC23);
+        assert!(s.contains("cdr(tests)"), "must detect a second test: {s}");
+        assert!(
+            s.contains("pass \\\"test\\\" to say which one"),
+            "the error must name the way out: {s}"
+        );
+        assert!(s.contains("car(tests)"), "one test is still resolved: {s}");
+    }
+
+    #[test]
+    fn set_analysis_ic25_includes_keywords() {
+        let s = ops().set_analysis("sess1", "ac", None, None, VirtuosoVersion::IC25);
+        assert!(
+            s.contains("?session"),
+            "IC25 must include ?session keyword: {s}"
+        );
+        assert!(s.contains("?enable t"), "IC25 must include ?enable t: {s}");
+        assert!(s.contains("maeGetSetup"), "IC25 needs the test name: {s}");
+        assert!(
+            !s.contains("?options"),
+            "IC25 without options must not inject ?options: {s}"
+        );
+    }
+
+    #[test]
+    fn set_analysis_ic25_with_options() {
+        let s = ops().set_analysis(
+            "sess1",
+            "ac",
+            Some(r#"(("stop" "1e10") ("start" "1"))"#),
+            None,
+            VirtuosoVersion::IC25,
+        );
+        assert!(
+            s.contains(r#"quote(("stop" "1e10"))"#),
+            "IC25 options must use quote: {s}"
+        );
+        assert!(
+            s.contains("?options opts"),
+            "Must pass options via ?options keyword: {s}"
+        );
+        assert!(
+            s.contains("let((tests tn opts)"),
+            "Must use a flat let holding the resolved test and the options: {s}"
+        );
+        assert!(
+            s.contains("opts = (list"),
+            "opts must be bound via = form: {s}"
+        );
+        assert!(
+            s.contains("maeSetAnalysis(tn"),
+            "maeSetAnalysis takes the test name first: {s}"
+        );
+        assert!(
+            !s.contains("apply("),
+            "No apply() needed for direct maeSetAnalysis: {s}"
+        );
+    }
+
+    #[test]
+    fn add_output_includes_expr() {
+        let s = ops().add_output("gain", "AC", "getData(\"vout\")");
+        assert!(s.contains("maeAddOutput"), "{s}");
+        assert!(s.contains("\"gain\""), "{s}");
+        assert!(s.contains("\"AC\""), "{s}");
+    }
+
+    /// `maeGetCorners` — what this method used to call — does not exist in
+    /// IC23.1. Guard the documented replacement so the dead call cannot come
+    /// back.
+    #[test]
+    fn list_corners_uses_the_documented_setup_database_route() {
+        let s = ops().list_corners("fnxSession4");
+        assert!(
+            !s.contains("maeGetCorners"),
+            "maeGetCorners is undefined in IC23.1: {s}"
+        );
+        assert!(
+            s.contains(r#"axlGetMainSetupDB("fnxSession4")"#),
+            "corners live in the setup database, reached by session name: {s}"
+        );
+        assert!(
+            s.contains("axlGetCorners(sdb)"),
+            "must query the setup database handle: {s}"
+        );
+    }
+
+    /// `axlGetCorners` returns `(handle (names…))` — taking the list itself
+    /// would hand the caller the integer handle as if it were a corner.
+    #[test]
+    fn list_corners_takes_the_names_not_the_handle() {
+        let s = ops().list_corners("fnxSession4");
+        assert!(s.contains("cadr(axlGetCorners(sdb))"), "{s}");
+    }
+
+    /// nil means both "no such session" and "no corners"; without the validity
+    /// check a typo reads back as a legitimately empty list.
+    #[test]
+    fn list_corners_rejects_an_unknown_session_instead_of_returning_empty() {
+        let s = ops().list_corners("fnxSession4");
+        assert!(s.contains(r#"axlIsValidAXLSession("fnxSession4")"#), "{s}");
+        assert!(
+            s.contains("maestro.list_sessions"),
+            "must say where to look: {s}"
+        );
+    }
+
+    #[test]
+    fn list_corners_escapes_its_session() {
+        let s = ops().list_corners(r#"fnx"4"#);
+        assert!(s.contains(r#""fnx\"4""#), "{s}");
+        assert!(!s.contains(r#""fnx"4""#), "raw quote must not survive: {s}");
+    }
+
+    #[test]
+    fn create_netlist_for_corner_format() {
+        let s = ops().create_netlist_for_corner("AC", "Nominal", "/tmp/out", "fnxSession4");
+        assert_eq!(
+            s,
+            r#"maeCreateNetlistForCorner("AC" "Nominal" "/tmp/out" ?session "fnxSession4")"#
+        );
+    }
+
+    #[test]
+    fn create_netlist_for_corner_escapes_quote_in_test() {
+        let s = ops().create_netlist_for_corner(r#"te"st"#, "Nominal", "/tmp/out", "fnxSession4");
+        assert!(s.contains(r#""te\"st""#), "{s}");
+        assert!(s.starts_with("maeCreateNetlistForCorner("), "{s}");
+        assert!(s.ends_with(")"), "{s}");
+    }
+
+    #[test]
+    fn create_netlist_for_corner_escapes_backslash_in_corner() {
+        let s = ops().create_netlist_for_corner("AC", r#"a\b"#, "/tmp/out", "fnxSession4");
+        assert!(s.contains(r#""a\\b""#), "{s}");
+    }
+
+    #[test]
+    fn create_netlist_for_corner_escapes_quote_in_output_dir() {
+        let s = ops().create_netlist_for_corner("AC", "Nominal", r#"/tmp/out "x""#, "fnxSession4");
+        assert!(s.contains(r#""/tmp/out \"x\"""#), "{s}");
+    }
+
+    #[test]
+    fn create_netlist_for_corner_escapes_quote_in_session() {
+        let s = ops().create_netlist_for_corner("AC", "Nominal", "/tmp/out", r#"fnx"4"#);
+        assert!(s.contains(r#"?session "fnx\"4""#), "{s}");
+    }
+
+    #[test]
+    fn create_netlist_for_corner_escapes_all_four_args_independently() {
+        let s = ops().create_netlist_for_corner(
+            r#"te"st"#,
+            r#"co\rner"#,
+            r#"/tmp/out "x""#,
+            r#"fnx"4"#,
+        );
+        assert!(s.contains(r#""te\"st""#), "{s}");
+        assert!(s.contains(r#""co\\rner""#), "{s}");
+        assert!(s.contains(r#""/tmp/out \"x\"""#), "{s}");
+        assert!(s.contains(r#""fnx\"4""#), "{s}");
+        assert_eq!(s.matches("maeCreateNetlistForCorner(").count(), 1);
+        assert!(s.trim_end().ends_with(')'));
+        assert_eq!(s.matches("?session").count(), 1);
+    }
+
+    #[test]
+    fn create_netlist_for_corner_includes_session_keyword() {
+        let s = ops().create_netlist_for_corner("AC", "Nominal", "/tmp/out", "fnxSession0");
+        let session_pos = s.find("?session").expect("?session keyword");
+        let paren_end = s.rfind(')').expect("closing paren");
+        assert!(
+            session_pos < paren_end,
+            "session keyword before closing paren: {s}"
+        );
+    }
+
+    #[test]
+    fn json_to_skill_alist_valid_input() {
+        let input = r#"{"start":"1","stop":"10G"}"#;
+        let out = json_to_skill_alist(input).unwrap();
+        assert!(out.contains("(\"start\" \"1\")"), "{out}");
+        assert!(out.contains("(\"stop\" \"10G\")"), "{out}");
+    }
+
+    #[test]
+    fn json_to_skill_alist_invalid_json_returns_err() {
+        assert!(json_to_skill_alist("not json").is_err());
+    }
+
+    #[test]
+    fn json_to_skill_alist_non_object_returns_err() {
+        assert!(json_to_skill_alist("[1,2,3]").is_err());
+    }
+
+    #[test]
+    fn get_output_value_without_corner() {
+        let s = ops().get_output_value("gain", "AC", None);
+        assert!(s.contains("maeGetOutputValue"), "{s}");
+        assert!(s.contains("\"gain\""), "{s}");
+        assert!(s.contains("\"AC\""), "{s}");
+        assert!(
+            !s.contains("?cornerName"),
+            "should not have cornerName when None: {s}"
+        );
+    }
+
+    #[test]
+    fn get_output_value_with_corner() {
+        let s = ops().get_output_value("gain", "AC", Some("Nominal"));
+        assert!(s.contains("maeGetOutputValue"), "{s}");
+        assert!(s.contains("?cornerName"), "should have cornerName: {s}");
+        assert!(s.contains("\"Nominal\""), "{s}");
+    }
+
+    #[test]
+    fn get_spec_status() {
+        let s = ops().get_spec_status("gain", "AC");
+        assert!(s.contains("maeGetSpecStatus"), "{s}");
+        assert!(s.contains("\"gain\""), "{s}");
+        assert!(s.contains("\"AC\""), "{s}");
+    }
+
+    #[test]
+    fn get_current_session() {
+        let s = ops().get_current_session();
+        assert!(s.contains("asiGetCurrentSession"), "{s}");
+        assert!(s.contains("sess~>name"), "{s}");
+    }
+
+    #[test]
+    fn get_result_outputs() {
+        let s = ops().get_result_outputs("AC");
+        assert!(s.contains("maeGetResultOutputs"), "{s}");
+        assert!(s.contains("\"AC\""), "{s}");
+        assert!(s.contains("foreach"), "{s}");
+    }
+
+    #[test]
+    fn set_design() {
+        let s = ops().set_design("sess1", "myLib", "myCell", "schematic", None);
+        assert_eq!(
+            s,
+            r#"maeSetDesignForTest("myLib" "myCell" "schematic" ?session "sess1")"#
+        );
+        assert!(
+            !s.contains("?libName"),
+            "keyword form is wrong on IC23.1: {s}"
+        );
+    }
+
+    #[test]
+    fn set_design_scopes_to_one_test_when_asked() {
+        let s = ops().set_design("sess1", "myLib", "myCell", "schematic", Some("AC"));
+        assert_eq!(
+            s,
+            r#"maeSetDesignForTest("myLib" "myCell" "schematic" ?test "AC" ?session "sess1")"#
+        );
+    }
+
+    #[test]
+    fn create_test_passes_the_design_in_the_same_call() {
+        let s = ops().create_test("sess1", "tb1", "myLib", "myCell", "schematic", "spectre");
+        assert_eq!(
+            s,
+            r#"maeCreateTest("tb1" ?lib "myLib" ?cell "myCell" ?view "schematic" ?simulator "spectre" ?session "sess1")"#
+        );
+    }
+
+    #[test]
+    fn create_test_escapes_names() {
+        let s = ops().create_test("s", r#"t"x"#, "l", "c", "schematic", "spectre");
+        assert!(s.contains(r#"t\"x"#), "{s}");
+    }
+
+    #[test]
+    fn save_setup() {
+        let s = ops().save_setup("sess1");
+        assert!(s.contains("maeSaveSetup"), "{s}");
+        assert!(s.contains("?session"), "{s}");
+    }
+
+    #[test]
+    fn save_setup_refuses_a_read_only_session() {
+        let s = ops().save_setup("sess1");
+        assert!(s.contains("axlIsSessionReadOnly"), "{s}");
+        assert!(s.contains("error("), "{s}");
+        assert!(
+            s.find("axlIsSessionReadOnly") < s.find("maeSaveSetup(?session"),
+            "the read-only check must run before the save: {s}"
+        );
+        assert!(s.contains("getd('axlIsSessionReadOnly)"), "{s}");
+    }
+
+    #[test]
+    fn cell_exists() {
+        let s = ops().cell_exists("myLib", "myCell");
+        assert!(s.contains("ddGetObj"), "{s}");
+        assert!(s.contains("\"myLib\""), "{s}");
+        assert!(s.contains("\"myCell\""), "{s}");
+        assert!(s.contains("when"), "{s}");
+    }
+
+    #[test]
+    fn results_dir() {
+        let s = ops().results_dir();
+        assert!(s.contains("asiGetResultsDir"), "{s}");
+    }
+
+    #[test]
+    fn detect_corner_from_path() {
+        let s = ops().detect_corner_from_path("/path/to/tt_netlist");
+        assert!(s.contains("rexMatchp"), "{s}");
+        assert!(s.contains("\"tt\""), "{s}");
+    }
+
+    #[test]
+    fn get_sim_status() {
+        let s = ops().get_sim_status("sess1");
+        assert!(s.contains("asiGetSession"), "{s}");
+        assert!(s.contains("~>status"), "{s}");
+    }
+
+    #[test]
+    fn run_with_dec_quotes_netpath_for_shell() {
+        let s = ops().run_with_dec("sess1", "ac", None, 11);
+
+        assert!(
+            s.contains("procedure(vcliShellQuote"),
+            "SKILL must define a local vcliShellQuote procedure: {s}"
+        );
+
+        assert!(
+            s.contains("netPathQuoted"),
+            "SKILL must assign a quoted netPath (netPathQuoted): {s}"
+        );
+
+        assert!(
+            s.contains("'\"'\"'"),
+            "vcliShellQuote must escape embedded apostrophes via '\\'\"'\"'' pattern: {s}"
+        );
+
+        assert!(
+            s.contains("ds netPathQuoted netPathQuoted"),
+            "sed sprintf args must use netPathQuoted, not bare netPath: {s}"
+        );
+
+        assert!(
+            !s.contains("ds netPath netPath"),
+            "raw 'ds netPath netPath' must not appear — use netPathQuoted: {s}"
+        );
+
+        assert!(
+            s.contains("\"grep '^ac ' %s\" netPathQuoted")
+                || (s.contains("\"grep '^ac ' %s\"") && s.contains("netPathQuoted")),
+            "grep sprintf args must use netPathQuoted, not bare netPath: {s}"
+        );
+
+        assert!(
+            !s.contains("\"grep '^ac ' %s\" netPath)"),
+            "bare netPath must not follow grep pattern — use netPathQuoted: {s}"
+        );
+    }
+}

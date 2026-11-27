@@ -1,0 +1,233 @@
+use crate::error::{Result, VirtuosoError};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Job {
+    pub id: String,
+    pub status: JobStatus,
+    pub netlist_path: String,
+    pub raw_dir: Option<String>,
+    pub pid: Option<u32>,
+    pub created: String,
+    pub finished: Option<String>,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    #[serde(default)]
+    pub remote_dir: Option<String>,
+}
+
+/// Report whether a local process still exists, via signal 0.
+///
+/// Unix-only: signal 0 performs existence/permission checking without
+/// delivering anything, which is the only non-destructive liveness probe
+/// available. Off Unix this reports the process as alive so [`Job::refresh`]
+/// falls through to its log-based completion check — the very path that
+/// already reaps zombies, whose PIDs keep answering a liveness probe after
+/// the process has exited.
+#[cfg(unix)]
+fn local_process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 delivers nothing; it only probes for the process.
+    (unsafe { libc::kill(pid as i32, 0) }) == 0
+}
+
+/// Non-Unix counterpart of [`local_process_alive`]. There is no equivalent
+/// probe, so assume the process is alive and let the log decide.
+#[cfg(not(unix))]
+fn local_process_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Terminate a whole process group: SIGTERM, then SIGKILL after a grace
+/// period.
+///
+/// Unix-only, and the negative PID is deliberate — `spectre` is spawned
+/// under a shell, so signalling the group is what actually reaps the tree.
+#[cfg(unix)]
+fn terminate_process_group(pid: u32) -> Result<()> {
+    // SAFETY: the PID came from a child we spawned; the negation targets
+    // the process group rather than a single process.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    Ok(())
+}
+
+/// Non-Unix counterpart of [`terminate_process_group`].
+///
+/// Refuses rather than approximates: there is no process-group signal, and
+/// killing only the group leader would orphan the `spectre` children that
+/// hold the simulation state. Failing loudly beats a job that reports
+/// "cancelled" while still burning CPU.
+#[cfg(not(unix))]
+fn terminate_process_group(pid: u32) -> Result<()> {
+    Err(VirtuosoError::Config(format!(
+        "cancelling a local spectre job is unsupported on this platform: \
+         no process-group signal is available; terminate pid {pid} yourself"
+    )))
+}
+
+impl Job {
+    fn dir() -> PathBuf {
+        let dir = crate::runtime_paths::cache_subdir(&["jobs"]);
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn path(id: &str) -> PathBuf {
+        Self::dir().join(format!("{id}.json"))
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| VirtuosoError::Execution(e.to_string()))?;
+        let path = Self::path(&self.id);
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json).map_err(|e| VirtuosoError::Execution(e.to_string()))?;
+        fs::rename(&tmp, &path).map_err(|e| VirtuosoError::Execution(e.to_string()))
+    }
+
+    pub fn load(id: &str) -> Result<Self> {
+        let path = Self::path(id);
+        let json = fs::read_to_string(&path)
+            .map_err(|_| VirtuosoError::NotFound(format!("job '{id}' not found")))?;
+        serde_json::from_str(&json)
+            .map_err(|e| VirtuosoError::Execution(format!("bad job file: {e}")))
+    }
+
+    pub fn list_all() -> Result<Vec<Self>> {
+        let dir = Self::dir();
+        let mut jobs = Vec::new();
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "json") {
+                    if let Ok(json) = fs::read_to_string(&path) {
+                        if let Ok(job) = serde_json::from_str::<Job>(&json) {
+                            jobs.push(job);
+                        }
+                    }
+                }
+            }
+        }
+        jobs.sort_by(|a, b| a.created.cmp(&b.created));
+        Ok(jobs)
+    }
+
+    /// Check if a running job's process is still alive; update status if not.
+    /// Works for both local (kill -0) and remote (ssh kill -0) jobs.
+    pub fn refresh(&mut self) -> Result<()> {
+        if self.status != JobStatus::Running {
+            return Ok(());
+        }
+        if let Some(pid) = self.pid {
+            let alive = if let Some(ref host) = self.remote_host {
+                std::process::Command::new("ssh")
+                    .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=3"])
+                    .arg(host)
+                    .arg(format!("kill -0 {pid}"))
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            } else {
+                local_process_alive(pid)
+            };
+
+            if !alive {
+                self.finish_from_log()?;
+            } else if self.remote_host.is_none() {
+                let log_dir = std::path::Path::new(&self.netlist_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."));
+                let log = log_dir.join("spectre.out");
+                if log.exists() {
+                    let content = fs::read_to_string(&log).unwrap_or_default();
+                    if content.contains("completes with 0 errors")
+                        || content.contains("completes with")
+                    {
+                        self.finish_from_log()?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Determine job outcome from spectre.out log file.
+    fn finish_from_log(&mut self) -> Result<()> {
+        let log_dir = std::path::Path::new(&self.netlist_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let log = log_dir.join("spectre.out");
+
+        let content =
+            if let (Some(ref host), Some(ref rdir)) = (&self.remote_host, &self.remote_dir) {
+                let out = std::process::Command::new("ssh")
+                    .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=3"])
+                    .arg(host)
+                    .arg(format!("cat {rdir}/spectre.out 2>/dev/null"))
+                    .output()
+                    .ok();
+                out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_default()
+            } else if log.exists() {
+                fs::read_to_string(&log).unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+        if content.contains("completes with 0 errors") {
+            self.status = JobStatus::Completed;
+        } else if content.is_empty() {
+            self.status = JobStatus::Failed;
+            self.error = Some("process exited, no log found".into());
+        } else {
+            self.status = JobStatus::Failed;
+            self.error = content
+                .lines()
+                .rev()
+                .find(|l| l.contains("Error") || l.contains("error"))
+                .map(|l| l.trim().to_string());
+        }
+        self.finished = Some(chrono::Local::now().to_rfc3339());
+        self.save()
+    }
+
+    pub fn cancel(&mut self) -> Result<()> {
+        if self.status != JobStatus::Running {
+            return Err(VirtuosoError::Execution(format!(
+                "job '{}' is not running (status: {:?})",
+                self.id, self.status
+            )));
+        }
+        if let Some(pid) = self.pid {
+            terminate_process_group(pid)?;
+        }
+        self.status = JobStatus::Cancelled;
+        self.finished = Some(chrono::Local::now().to_rfc3339());
+        self.save()
+    }
+
+    #[allow(dead_code)]
+    pub fn delete(id: &str) -> Result<()> {
+        let path = Self::path(id);
+        fs::remove_file(&path).map_err(|_| VirtuosoError::NotFound(format!("job '{id}' not found")))
+    }
+}
