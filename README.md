@@ -1,12 +1,5 @@
 # virtuoso-cli-integration
 
-**Experimental.** One Cadence Virtuoso session driven by two open-source AI
-bridges — [virtuoso-cli](https://github.com/deanyou/virtuoso-cli) (vcli, Rust)
-and [virtuoso-bridge-lite](https://github.com/Arcadia-1/virtuoso-bridge-lite)
-(Python) — combined into one self-contained repo, without them corrupting
-each other's control of the session. Built for both a human at the CLI and
-an AI agent over MCP.
-
 Status: automated checks (Rust builds/tests on Linux/macOS/Windows, comment
 budget, security audit, Python lock tests) run in GitHub Actions on every
 push - see the Actions tab for this revision's actual result. **Not yet run
@@ -109,5 +102,4 @@ Cadence, and `scripts/vai-acceptance` against a live session.
 
 ## Licenses
 
-MIT (both upstreams). See `LICENSE` (vcli), `python/LICENSE` (bridge-lite)
-and `NOTICE` for attribution.
+MIT 
